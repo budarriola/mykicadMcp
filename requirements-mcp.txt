@@ -1,0 +1,8 @@
+mcp>=1.0.0
+
+# Optional: enables the get_kicad_live_*/find_kicad_live_*/*_kicad_live_* tools,
+# which talk to a running KiCad instance over its IPC API instead of parsing
+# kiln.kicad_pcb on disk. The server starts fine without it - those tools are
+# simply left unregistered. Requires KiCad 9+ and Preferences > Plugins >
+# "Enable IPC API" turned on.
+kicad-python>=0.7.0
