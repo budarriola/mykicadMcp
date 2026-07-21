@@ -25,10 +25,40 @@ pattern (handlers import from whichever module owns the function).
 
 ---
 
+## Status snapshot — read this first (updated 2026-07-21)
+
+For whoever (human or AI) picks this up next:
+
+- **Landed & verified on the real board**: Phases 1, 2, 3 (named buses +
+  DIFF_PAIR/PARALLEL/RS485 structural detectors), 4, and 6 (deviation term
+  stubbed until Phase 5); M0 is fully done. 70 MCP tools registered. `tests/`
+  has a 35-test passing pytest suite (fixtures, golden parser tests, writer
+  round-trip, synthetic board/project generator, kicad-cli acceptance). Each
+  landed phase is collapsed to a short "LANDED" anchor section in place, kept
+  because later phases reference it. **No delegations in flight** — all
+  subagent work was reviewed and folded in before this snapshot.
+- **Next work, in order**: close M1 (milestone docs pass:
+  `docs/mcp-tools/10-netclasses-and-buses.md` for the 9 new tools, README +
+  CLAUDE.md tool count/group sync 61 → 70 — a Haiku-delegation per the
+  Implementation strategy section), then M2 (Phase 5 corridors, which also
+  unstubs Phase 6's deviation term per the spec kept in the Phase 6 section;
+  Phase 8 cap audit), then M3+ (the router).
+- **Nothing has been committed** in either repo as of this snapshot — review the
+  working tree before assuming git history matches this file.
+- Verify claims against the code (`kicad_pcb_tool.py`, `kicad_mcp_server.py`,
+  `tests/`) rather than trusting this snapshot if they disagree — and then fix
+  this file.
+
 ## How to work this plan (living document — keep it current)
 
 **This file is the source of truth for what's left to do, and must be edited as work
 lands — not left to drift.** On every unit of work:
+
+0. **Plan edits are owned by the coordinating session, never by implementation
+   subagents.** Delegations must tell the subagent not to touch this file; the
+   coordinator reviews each subagent report and applies the plan updates itself
+   (this is deliberate — it forces a review step between "agent says done" and
+   "plan says done").
 
 1. **When an item is completed, delete it from this plan** (the phase step, its row in
    the MCP tool summary table, and its entry in the build order). Do not leave a
@@ -66,7 +96,7 @@ Trace segment (1,609 present):
 )
 ```
 
-Via (311 present):
+Via (298 present):
 ```
 (via
     (at 56.75 127.75)
@@ -111,184 +141,78 @@ Net → IC membership comes from the **`.net` netlist** (already parsed by
 
 ---
 
-## Phase 1 — Trace/via geometry parser (foundation)
+## Phases 1 & 2 — LANDED 2026-07-21 (reference anchor; no work remains here)
 
-**New in `kicad_pcb_tool.py`:**
+Implemented in `kicad_pcb_tool.py` and registered in `kicad_mcp_server.py`:
+- `_parse_tracks` / `_parse_tracks_cached` (`_track_cache`, invalidated in
+  `_invalidate_board_cache`) — segments/vias/arcs, `.Cu`-scoped, per the shapes
+  formerly specced here.
+- `get_net_track_widths(project_path, net=None)` → tool
+  `get_kicad_net_track_widths` — the per-net width summary
+  (length-weighted `dominant_width`, `widths` map, `via_sizes`, `is_uniform`)
+  that later phases call the "Phase 1 width summary". Width-0 segments bucket
+  under `"inherit"` (KiCad "use netclass" semantics) with a
+  `zero_width_segment_count`.
+- `get_project_track_inventory(project_path)` → tool
+  `get_kicad_track_inventory` — the Phase-2 "previously used values" menu for
+  Phase 4's pick-from-list questions, incl. `existing_netclasses` from
+  `kiln.kicad_pro`, free/oversized via warnings, `free_via_count`.
 
-- `_parse_tracks(board_path) -> {"segments":[...], "vias":[...], "arcs":[...]}`
-  Walk the s-expr tree for `segment`, `via`, and `gr_arc`-style `arc` copper nodes.
-  Each segment: `{net, width, layer, start, end, length, uuid}` (length =
-  Euclidean start→end; arcs approximated by chord + flagged `is_arc`). Each via:
-  `{net, size, drill, layers, at, uuid}`.
-- `_parse_tracks_cached(board_path)` — same `(mtime, size)` cache pattern as
-  `_parse_board_components_cached`; add a `_track_cache` dict and invalidate it in
-  `_invalidate_board_cache`.
-
-**Public function + MCP tool:**
-
-`get_net_track_widths(project_path, net=None) -> {...}`  → tool
-`get_kicad_net_track_widths`
-
-Per net, aggregate its copper:
-```json
-{
-  "net": "/MainControler/MOSI",
-  "segment_count": 45,
-  "total_length_mm": 62.3,
-  "widths": { "0.2": 40, "0.3": 5 },       // width -> segment count
-  "dominant_width": 0.2,                     // length-weighted mode
-  "min_width": 0.2, "max_width": 0.3,
-  "layers": ["F.Cu", "B.Cu"],
-  "via_sizes": { "0.6/0.3": 3 },             // size/drill -> count
-  "is_uniform": false                        // more than one width present
-}
-```
-`net=None` returns every routed net (sorted by name); `net="X"` returns one.
-`is_uniform=false` is the signal that a net's routing disagrees with a single
-width — the hook for later schematic/net-class reconciliation.
-
-**Why length-weighted dominant width:** a net can have a few short stubs at a
-different width; the width that matters for "what is this net actually routed at"
-is the one carrying most of the copper length, not the most frequent tiny segment.
+Verified on kiln: 1,609 segments, 298 vias, 0 arcs, 154 routed nets; dominant
+width 0.3 mm (795 segs / 95 nets); vias 0.6/0.3 (×293) plus 5 oversized 12/7
+(3 free). Docs-page coverage for these two tools is still owed (see
+Documentation updates).
 
 ---
 
-## Phase 2 — Project width/via inventory (menu of "previously used" values)
+## Phase 3 — Bus detection & IC qualification — LANDED 2026-07-21 (reference anchor; no code work remains)
 
-`get_project_track_inventory(project_path) -> {...}`  → tool
-`get_kicad_track_inventory`
+Landed in `kicad_pcb_tool.py` + registered as tool `detect_kicad_buses`:
+`_BUS_SIGNATURES` (I2C, SPI, QSPI, I2S, UART, CAN, USB, SWD, JTAG with role
+alias sets), `detect_buses(project_path, ic_ref_prefixes=None)` (hierarchical-
+prefix grouping with shared-IC fallback, per-net `width_summary` from
+`get_net_track_widths`, candidate shape per the original spec incl.
+`suggested_class_name`), 3c IC qualification (`common_ics` intersection over
+U/IC/Q refs; all-but-one tolerance for fan-out; `qualified:false` + reason
+otherwise), and the netlist-staleness guard (`stale_netlist_warnings`, both
+directions vs. board pad nets). Read-only; never auto-applies — caller confirms
+each candidate with the user (`AskUserQuestion`) before Phase 4 creates
+anything. Verified on kiln: 3 qualified candidates — I2C `/MainControler/`
+(SDA/SCL, 0.2 mm, common_ics U4+U5), SPI `/MainControler/` (MOSI/MISO/CLK/
+CS0–CS3, 0.3 mm, hub U4), SPI `/SaftyProcessor/` (hub U6);
+`stale_netlist_warnings` empty (netlist current).
 
-Board-wide, copper-only:
-```json
-{
-  "track_widths": [ {"width": 0.2, "segment_count": 566, "length_mm": 1830, "nets": 34},
-                    {"width": 0.3, "segment_count": 795, ...}, ... ],
-  "via_sizes":    [ {"size": 0.6, "drill": 0.3, "count": 300},
-                    {"size": 12,  "drill": 7,  "count": 11, "warning": "free/oversized"} ],
-  "existing_netclasses": [ {"name":"Default","track_width":0.2,"via_diameter":0.6,...} ],
-  "free_via_count": 11
-}
-```
-This is the exact palette presented to the user in Phase 4 when asking which
-width/via to standardize a class on — *only values already in the design*, sorted by
-usage, so the answer is a pick-from-list, not free entry. `existing_netclasses` is
-read from `kiln.kicad_pro`.
+Structural detectors also landed 2026-07-21: `_find_diff_pairs`
+(`<base>_P/_N`, `+`/`-`, `P`/`N` — both polarities required) → `DIFF_PAIR`;
+`_find_parallel_buses` (≥4 nets, contiguous `0..n`, gap disqualifies) →
+`PARALLEL`; RS485/RS422 in `_BUS_SIGNATURES` (`A`/`B` required, `Z`/`Y`
+optional, `basename_only` to dodge A0..A15 collisions, and
+`suppress_unqualified` — dropped entirely without a common transceiver IC).
+Named signatures claim nets before structural detectors run, so USB D+/D-
+stays USB and QSPI IO0..IO3 stays QSPI (verified with synthetic netlists).
+On kiln: still exactly the 3 named candidates, zero structural candidates —
+correct for this board. Known honest limitation: KiCad auto-generated
+pin-derived names like `Net-(U6-T+)`/`Net-(U6-T-)` (thermocouple leads) end in
+parens, outside the three specified suffix forms, so such per-IC diff pairs go
+undetected; extend the suffix forms if that ever matters.
 
----
-
-## Phase 3 — Bus detection & IC qualification
-
-### 3a. Bus signal dictionary
-`_BUS_SIGNATURES` — token sets matched against the **net basename** (last `/`-segment,
-uppercased, stripped of a trailing index and separators). A bus type fires only when
-its **required** roles are all present among nets sharing a group key.
-
-| Bus  | Required role tokens | Optional |
-|------|----------------------|----------|
-| I2C  | SDA, SCL | — |
-| SPI  | (MOSI\|SDO\|COPI), (MISO\|SDI\|CIPO), (SCK\|SCLK\|CLK) | CS/SS/nCS/CSn (0..n) |
-| QSPI | SCK/SCLK, (IO0..IO3 \| DQ0..DQ3), CS | — |
-| I2S  | (WS\|LRCLK\|FS), (BCLK\|SCK\|BCK), (SD\|SDIN\|SDOUT\|DIN\|DOUT) | MCLK |
-| UART | (TX\|TXD), (RX\|RXD) | RTS, CTS, DTR |
-| CAN  | (CANH\|CAN_H), (CANL\|CAN_L) | — |
-| USB  | (D+\|DP\|DPLUS), (D-\|DM\|DMINUS) | VBUS, ID |
-| SWD  | SWDIO, SWCLK | nRST/RESET |
-| JTAG | TCK, TMS, TDI, TDO | nTRST |
-| RS485/RS422 | A, B (qualified by transceiver IC) | Z, Y |
-| Diff pair | `<base>_P`/`<base>_N`, `<base>+`/`<base>-`, `<base>P`/`<base>N` | — |
-| Parallel bus | `<base>0..<base>n` (≥4 contiguous, e.g. A0..A15 / D0..D7) | — |
-
-Ship 3a as data so new buses are one dict entry. Roles are regexes over the
-normalized basename; keep a small alias table (CLK↔SCLK↔SCK, CS↔SS↔NSS, etc.).
-
-### 3b. Candidate grouping
-`detect_buses(project_path) -> {...}`  → tool `detect_kicad_buses`
-
-1. Parse nets from `.net`. Normalize each net's basename and record its role hits.
-2. Group candidate nets by **shared hierarchical prefix** (the path before the
-   basename, e.g. `/MainControler/`) — signals on one bus almost always share a
-   sheet prefix. Also try grouping by shared connected-IC as a fallback for flat
-   designs.
-3. Within a group, if a bus type's required roles are all covered, emit a candidate.
-
-### 3c. IC qualification (the "same IC" requirement)
-For each candidate, intersect the **component refs** on every member net (from the
-netlist nodes), keeping only ICs (ref prefix `U`/`IC`/`Q`-transceiver; configurable).
-- **Qualified**: a common IC is on all/most member nets → strong candidate.
-  Record `common_ics`, and per-net which pins of that IC each touches.
-- **Weak**: required roles present but no shared IC (e.g. bus fans out to a
-  connector only) → still reported, flagged `qualified: false` with the reason.
-
-Candidate shape:
-```json
-{
-  "bus_type": "SPI",
-  "confidence": "high",
-  "group_prefix": "/MainControler/",
-  "nets": [ {"net":".../MOSI","role":"MOSI","width_summary":{...from Phase 1...}},
-            {"net":".../MISO","role":"MISO", ...}, ... ],
-  "common_ics": ["U2"],                 // shared across all member nets
-  "qualified": true,
-  "member_widths": {"0.2": 4},          // union of dominant widths across the bus
-  "suggested_class_name": "SPI_MainControler"
-}
-```
-**Never auto-apply.** `detect_buses` returns candidates only; the caller presents
-each to the user (`AskUserQuestion`) to confirm bus type, membership, and name
-before anything is created (Phase 4).
+Only non-code leftover: docs-page coverage for `detect_kicad_buses` (part of
+the M1 docs pass — see Documentation updates).
 
 ---
 
-## Phase 4 — Net class creation from PCB settings
+## Phase 4 — LANDED 2026-07-21 (reference anchor; no work remains here)
 
-### 4a. Propose settings from what's routed
-`propose_netclass_from_nets(project_path, nets, name) -> {...}`  → tool
-`propose_kicad_netclass`
-
-Given a confirmed net list (from a bus or hand-picked), pull each net's Phase-1
-width summary + via sizes and derive a proposed class:
-- `track_width`: length-weighted dominant width across all member nets.
-- `via_diameter`/`via_drill`: dominant via on those nets (fallback: Default class).
-- `clearance`: inherit from Default unless overridden.
-- Report `conflicts` when member nets are routed at differing widths, so the user
-  chooses rather than the tool silently averaging.
-
-Returns the proposed class **plus** the Phase-2 inventory menus so the caller can
-ask the user "use 0.2 (used on 566 segs) / 0.3 (795 segs) / other?" and
-"via 0.6/0.3 (×300)?". This is where the **AskUserQuestion** interaction happens —
-options pre-filled from real project usage.
-
-### 4b. Write the class
-`create_netclass(project_path, name, settings, net_patterns, write=False,
-allow_while_open=False) -> {...}`  → tool `create_kicad_netclass`
-
-Edits **`kiln.kicad_pro`** JSON:
-1. Append a class object to `net_settings.classes` (all keys KiCad expects — copy the
-   Default object's shape, override `name`/`track_width`/`via_*`/`clearance`).
-   Refuse on duplicate name.
-2. Add `net_settings.netclass_patterns` entries mapping each member net to the class.
-   Prefer one exact-name pattern per net (`^/MainControler/MOSI$`); optionally a
-   single collapsed regex when the user opts in.
-3. `write=False` (default) returns the full before/after diff of the JSON blocks and
-   the resulting class; `write=True` saves.
-4. Reuse `_check_not_locked_by_editor` — but note the lock is on the **board**; also
-   check the `.kicad_pro` isn't held open, and warn that KiCad reloads net classes
-   only on project reopen.
-
-> KiCad applies net classes to routed copper only when you re-run the router or
-> "Update from netclass"; creating the class changes the *rules*, not existing
-> track widths. Tool docstrings must say this so the user isn't surprised the
-> board looks unchanged.
-
-### 4c. Optional: reconciliation report (the "compare to schematic" payoff)
-`audit_netclass_conformance(project_path) -> {...}`  → tool
-`audit_kicad_netclass_conformance`
-
-For each net assigned to a class (via `netclass_patterns`), compare the class's
-`track_width`/`via` to the net's **actual** routed dominant width (Phase 1). Emit
-mismatches: "net X is in class SPI (0.2 mm) but 5 segments are routed at 0.3 mm."
-This is the concrete artifact that lets net-class intent be checked against the
-real PCB — the stated end goal.
+`propose_netclass_from_nets` / `create_netclass` / `audit_netclass_conformance`
+implemented in `kicad_pcb_tool.py`, registered as `propose_kicad_netclass`,
+`create_kicad_netclass` (writes `.kicad_pro`; dry-run diff default; refuses
+duplicate names; docstring warns classes don't retroactively resize copper and
+reload on project reopen), and `audit_kicad_netclass_conformance`. The
+AskUserQuestion width/via pick-from-inventory interaction happens in the
+session, per Flow A. Verified: byte-identical `.kicad_pro` serialization
+round-trip; SPI_MainControler proposal 0.3/0.6/0.3 clearance 0.2, zero
+conflicts; write=True round-trip on a temp copy; conformance clean for the 7
+SPI nets (128/154 nets mismatch Default — expected until classes are assigned).
 
 ---
 
@@ -407,22 +331,23 @@ in Phase 4.
 
 ---
 
-## Phase 6 — Trace cost model + PCB settings JSON
+## Phase 6 — LANDED 2026-07-21 except the M2 deviation unstub (schema below kept as reference)
 
-Goal: score each routed trace with a single **cost** number built from (a) its
-copper length, (b) how far it strays from its bus, and (c) its via count — with all
-weights and knobs read from a project **settings JSON** so the model is tunable
-without code changes. Read-only over the board; the only write is creating/seeding
-the settings file.
+`DEFAULT_PCB_SETTINGS` + `load_pcb_settings` (deep-merge over defaults,
+non-negative weight validation, file-vs-default key report) +
+`init_pcb_settings` (dry-run/overwrite-guarded seeding) + `get_trace_cost`
+(length/via/layer_span terms; **deviation stubbed `on_bus: false` until M2's
+Phase 5 lands**, per the build order) are implemented in `kicad_pcb_tool.py`
+and registered as `get_kicad_pcb_settings`, `init_kicad_pcb_settings`,
+`get_kicad_trace_cost`. Verified on kiln: 154 nets ranked, board total 5584.4
+(worst: GND_Main 520.1, GND_Safty 240.8, 12V_Main 211.9 — via-heavy
+power/ground nets, the Phase 7.5 plane motivation made measurable).
 
-### 6.1 The settings JSON (`pcb_settings.json`)
-
-Lives in the **project directory** next to `kiln.kicad_pro` (so it's per-project and
-versioned in git), resolved from the same directory `_resolve_project_path` already
-finds. Absent file → in-code defaults are used, so every tool works out of the box;
-the file only *overrides*. Centralizes tunables that today are scattered across the
-plan (Phase 5 clip band, Phase 3 IC-prefix rules) so there's one place to tune board
-policy.
+The `pcb_settings.json` schema below is **kept as reference** — Phases 5, 7,
+and 8 read their knobs (`corridor`, `layer_purpose`, `autorouter`, `plane`,
+`optimizer`, `schematic_checks`) from this file, and `DEFAULT_PCB_SETTINGS`
+mirrors it. The file lives in the project directory next to `kiln.kicad_pro`,
+committed; absent file → defaults.
 
 ```json
 {
@@ -527,80 +452,16 @@ policy.
 }
 ```
 
-- `load_pcb_settings(project_path)` — deep-merge file over defaults; validate
-  weights are non-negative numbers; return the effective config plus which keys came
-  from the file vs defaults.
-- `init_pcb_settings(project_path, write=False, allow_while_open=False)` — write the
-  fully-populated default file (dry-run first, refuse to clobber an existing one
-  unless `overwrite=True`). Plain JSON `json.dump(indent=2)`; it's our own file, not
-  KiCad's, so no s-expr surgery and no board-lock concern (but still don't stomp a
-  user-edited file silently).
-
-### 6.2 Cost computation
-
-`get_trace_cost(project_path, net=None) -> {...}` → tool `get_kicad_trace_cost`.
-
-Per net (reusing Phase 1 copper, Phase 5 bundle geometry, and `_parse_footprint_pads`
-for the hub→dest axis):
-
-- **length_mm** — total copper length of the net (sum of segment/arc lengths, per
-  Phase 1). `length_cost = w.length_mm * length_mm`.
-- **via_count** — vias on the net, each scaled by its type via `via_weights`.
-  `via_cost = w.via * Σ via_type_weight`.
-- **deviation** — only defined when the net belongs to a detected bus bundle
-  (Phase 5). Depending on `deviation.metric`:
-  - `mean_perp_distance` / `max_perp_distance`: mean/max perpendicular distance of
-    the net's segment midpoints from its bundle **centerline** → `deviation_cost =
-    w.deviation_mm * value`.
-  - `excess_length`: `ratio = actual_length / direct_distance(hub_pad→dest_pad) - 1`
-    → `excess_cost = w.excess_length * max(ratio, 0)`.
-  - Nets with no bundle use `non_bus_deviation` (default 0) and are flagged
-    `on_bus: false`, so the model degrades cleanly to length+vias for point-to-point
-    nets rather than guessing a reference.
-- **layer_span** — count of copper layers the net occupies beyond its first;
-  `span_cost = w.layer_span * (layers_used - 1)`. Prices multi-layer sprawl
-  (see 7.3c — jumps that return to the home layer add vias, not span).
-- **total** = sum of the enabled cost terms.
-
-`net=None` → ranked list of every routed net, worst-cost first, plus board totals and
-the `weights_used` block (so a result is self-describing / reproducible).
-
-Output shape:
-```json
-{
-  "net": "/MainControler/MOSI",
-  "on_bus": true,
-  "bundle": {"bus_type": "SPI", "destination_ic": "U2"},
-  "metrics": { "length_mm": 62.3, "direct_mm": 41.0, "excess_length_ratio": 0.52,
-               "via_count": 3, "via_types": {"through": 3},
-               "mean_deviation_mm": 0.8, "max_deviation_mm": 2.1 },
-  "cost":    { "length": 62.3, "vias": 15.0, "deviation": 1.6, "total": 78.9 },
-  "weights_used": { "length_mm": 1.0, "via": 5.0, "deviation_mm": 2.0, ... }
-}
-```
-
-### 6.3 Details & correctness
-- **Deviation needs a bundle**, which needs Phase 5 → the deviation terms depend
-  on Phases 1, 5 (and 3 for roles). Per the build order, Phase 6 ships in M1
-  *before* Phase 5 with deviation reported as `on_bus: false` for every net;
-  M2's Phase 5 unstubs it — the length/via terms are useful on day one. Shared bus nets are measured against the bundle centerline of
-  each destination they serve; report per-destination deviation, and roll up to the
-  net with the `metric`'s aggregate (max across destinations for `max_perp`, length-
-  weighted mean for `mean_perp`).
-- **Direct distance** for `excess_length` uses hub/dest **pad** positions
-  (`_parse_footprint_pads`), not net-name geometry, so it's the true physical
-  endpoints.
-- **Weights are policy, not truth** — every cost result echoes `weights_used`, and
-  the units are documented (mm, count) so scores are comparable only within one
-  settings version. Bumping `version` signals an incomparable re-weighting.
-- **All arithmetic pure stdlib**; reuses cached parses — no new board pass.
-- Read-only except `init_pcb_settings` (writes `pcb_settings.json` only).
-
-### 6.4 Flow
-`get_kicad_trace_cost` (net=None) surfaces the worst-routed nets (long, via-heavy, or
-straying from their bus) — a routing-quality triage list, and a natural companion to
-Phase 5's corridor areas and Phase 4's net-class decisions. Tune the trade-offs by
-editing `pcb_settings.json` (seed it with `init_kicad_pcb_settings`).
+**Deviation unstub spec (the one remaining Phase 6 item, done as part of M2's
+Phase 5):** when a net belongs to a detected bus bundle, add the deviation term
+per `deviation.metric` — `mean_perp_distance`/`max_perp_distance` = mean/max
+perpendicular distance of segment midpoints from the bundle **centerline**
+(`deviation_cost = w.deviation_mm * value`); `excess_length` = `w.excess_length
+* max(actual_length / direct_distance(hub_pad→dest_pad) - 1, 0)` with direct
+distance from real **pad** positions. Shared bus nets are measured against each
+destination bundle they serve and rolled up with the metric's aggregate (max
+for `max_perp`, length-weighted mean for `mean_perp`). Result gains `on_bus:
+true` + a `bundle` object; non-bundle nets keep today's behavior.
 
 ---
 
@@ -618,9 +479,9 @@ nets, reviews previews, and confirms writes.
 Companion to `pcb_settings.json`, with the opposite contract:
 - **`pcb_settings.json`** = shareable *policy* (weights, multipliers) → committed.
 - **`<board>.board_local.json`** (e.g. `kiln.board_local.json`, next to the board
-  file) = *state of this working board* → **gitignored**. The plan includes adding
-  `/*.board_local.json` to the kilnCtl repo's `.gitignore` (and a note in the
-  README that the file is disposable).
+  file) = *state of this working board* → **gitignored** (already in the kilnCtl
+  `.gitignore`, along with `/*.route_progress.jsonl`; still need the README note
+  that the file is disposable).
 
 Contents (all optional, tools create/extend it as they run):
 ```json
@@ -1350,16 +1211,7 @@ session (which also owns all user-facing verification questions):
 
 | Tool | Function | Writes? |
 |------|----------|---------|
-| `get_kicad_net_track_widths` | `get_net_track_widths` | no |
-| `get_kicad_track_inventory` | `get_project_track_inventory` | no |
-| `detect_kicad_buses` | `detect_buses` | no |
 | `measure_kicad_bus_corridor_area` | `measure_bus_corridor_areas` | no |
-| `get_kicad_trace_cost` | `get_trace_cost` | no |
-| `get_kicad_pcb_settings` | `load_pcb_settings` | no |
-| `init_kicad_pcb_settings` | `init_pcb_settings` | **yes (pcb_settings.json)** |
-| `propose_kicad_netclass` | `propose_netclass_from_nets` | no |
-| `create_kicad_netclass` | `create_netclass` | **yes (.kicad_pro)** |
-| `audit_kicad_netclass_conformance` | `audit_netclass_conformance` | no |
 | `get_kicad_ratsnest` | `get_ratsnest` | no |
 | `route_kicad_nets` | `route_nets` | **yes (board + board_local.json)** |
 | `unroute_kicad_nets` | `unroute_nets` | **yes (board + board_local.json)** |
@@ -1400,11 +1252,6 @@ like the existing entries.
 - Autorouter gets its own docs page `docs/mcp-tools/11-autorouter.md`: pipeline,
   cost model incl. layer-purpose multipliers, rip-up rules ("only autorouter-owned
   copper"), failure reporting, and the route→review→write workflow.
-- Add `/*.board_local.json` and `/*.route_progress.jsonl` to the kilnCtl repo's
-  `.gitignore` (with a comment, matching that file's existing style).
-- `requirements-mcp.txt`: add commented-out optional `numpy`/`cupy`/`torch`
-  entries in the `kicad-python` style, explaining what each tier accelerates
-  (7.8) and that nothing requires them.
 - Autorouter docs page also covers the viewer (`kicad_route_viewer.py`, the
   progress-event JSONL format, cancel flag) and the acceleration tiers + parity
   guarantee.
@@ -1475,7 +1322,11 @@ like the existing entries.
 - **KiCad format tolerance**: this repo has v9-era files edited under KiCad 10;
   parsers must skip unknown s-expr tokens instead of failing, and every writer
   emits only constructs already present in the target file (copy-the-native-shape
-  rule, as `create_kicad_plane` already does for fill settings).
+  rule, as `create_kicad_plane` already does for fill settings). Known hardening
+  gap (found by M0's kicad-cli tests): older boards reference nets by numeric
+  index (`(net 1 "name")`) where kiln uses name-only (`(net "name")`);
+  `_parse_tracks` reads `entry[1]` verbatim and would misread the index form as
+  the net name — harden if the tools ever target non-kiln boards.
 - **Coordinate formatting on emit**: new segments/vias/zone points use the same
   number formatting as `apply_layout_changes` (`_format_at_number`, ≤6 decimals,
   no trailing zeros) so diffs stay minimal and KiCad re-saves don't rewrite them.
@@ -1487,24 +1338,22 @@ early tools would sit unreleased behind the router. Each milestone below is
 independently shippable (tools registered, docs row added, plan items deleted per
 "How to work this plan") before the next begins.
 
-**M0 — Test infrastructure** (small, first, owned like any deliverable):
-1. `tests/` with pytest: golden-file tests for every parser against
-   `kiln.kicad_pcb` snapshots; a scratch-board fixture (copy kiln to tmp, run
-   writers there — no test ever touches the real board); round-trip harness
-   (write → reparse → KiCad-shape assertions).
-2. **Synthetic board generator** (required by 7.8's benchmarks, referenced
-   nowhere else until now — it's a real deliverable): parameterized
-   `.kicad_pcb` writer producing dense fanout fields, N-layer stacks, 10x/100x
-   kiln-scale ratsnest. Lives in `tests/`, reuses the emit helpers.
+**M0 — Test infrastructure — DONE 2026-07-21.** `tests/`: conftest fixtures
+(`kiln_project_path`, `scratch_board`), golden parser tests, writer round-trip
+harness (`create_group`/`delete_group`; extend to other writers as they gain
+tests), synthetic generator (N-layer stacks, net table, `scale=`, dense
+fanout-field mode), `write_synthetic_project` (board + companion
+`.kicad_pro`/`.net` — netlist-based tools incl. `detect_buses` run on
+synthetic-only projects), and `kicad-cli pcb drc` acceptance tests (KiCad
+10.0.4 loads generated boards; auto-skip if kicad-cli absent). 35 tests
+passing under `mykicadMcp\.venv`. Only non-automated bit: a literal pcbnew-GUI
+screenshot — the kicad-cli DRC load exercises the same board reader.
 
-**M1 — Net classes end-to-end (Flow A works):**
-3. Phase 1 track parser + `get_kicad_net_track_widths`.
-4. Phase 2 inventory.
-5. Phase 3 bus detection + IC qualification.
-6. Phase 6 settings JSON (`init/load_pcb_settings`) + `get_kicad_trace_cost`
-   (deviation terms stubbed `on_bus: false` until M2 lands Phase 5).
-7. Phase 4a/4b propose/create netclass (the `.kicad_pro` writer; dry-run first),
-   then 4c conformance audit.
+**M1 — Net classes end-to-end (Flow A works)** — all code landed 2026-07-21
+(Phases 1, 2, 3, 6-stubbed, 4; see their anchors). Remaining to close M1: only
+the milestone docs pass — `docs/mcp-tools/10-netclasses-and-buses.md` for the
+9 landed tools, README + CLAUDE.md tool count/group sync (61 → 70 tools),
+`pcb_settings.json` documented as committed policy.
 
 **M2 — Analysis suite:**
 8. Phase 5 corridor areas (unstubs Phase 6's deviation terms).

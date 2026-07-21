@@ -2,3 +2,9 @@
 /.vscode/
 /__pycache__/
 /kicad_mcp_server.log
+
+/tests/__pycache__/
+/tests/__pycache__/synthetic_board.cpython-314.pyc
+/tests/__pycache__/test_parsers_golden.cpython-314-pytest-9.1.1.pyc
+/tests/__pycache__/test_synthetic_board.cpython-314-pytest-9.1.1.pyc
+/tests/__pycache__/test_writer_roundtrip.cpython-314-pytest-9.1.1.pyc

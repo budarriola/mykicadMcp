@@ -38,9 +38,11 @@ try:
     apply_property_position_changes,
     apply_property_position_template,
     audit_capacitor_voltages,
+    audit_netclass_conformance,
     audit_schematic_integrity,
     classify_group_by_anchor_pin,
     create_group,
+    create_netclass,
     delete_group,
     diff_flip_template,
     diff_layout_by_role,
@@ -55,9 +57,14 @@ try:
     get_footprint_pads,
     get_hierarchical_group,
     get_net,
+    get_net_track_widths,
+    detect_buses,
     get_pin_position,
+    get_project_track_inventory,
     get_property_position,
     get_schematic_part,
+    get_trace_cost,
+    init_pcb_settings,
     inspect_project,
     list_components,
     list_groups,
@@ -65,11 +72,13 @@ try:
     list_nets,
     list_schematic_parts,
     list_sibling_instances,
+    load_pcb_settings,
     match_group_members_by_role,
     move_group,
     normalize_manufacturer_part_number_properties,
     nudge_to_clear,
     pin_distance,
+    propose_netclass_from_nets,
     search_component_by_reference,
     set_schematic_property,
     suggest_component_placement,
@@ -634,6 +643,197 @@ class KiCadMcpServer:
                     "required": ["project_path"],
                 },
                 "handler": self._tool_list_nets,
+            },
+            "get_kicad_net_track_widths": {
+                "description": (
+                    "Per-net aggregate of routed copper trace widths and via sizes, measured "
+                    "directly from the PCB's own segment/via/arc geometry (not netclass intent). "
+                    "Omit net_name to get every routed net (sorted by name); pass net_name for one "
+                    "net. is_uniform=false flags a net routed at more than one width."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "net_name": {"type": "string"},
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_get_net_track_widths,
+            },
+            "detect_kicad_buses": {
+                "description": (
+                    "Read-only bus detection over the schematic netlist (I2C, SPI, QSPI, I2S, UART, "
+                    "CAN, USB, SWD, JTAG). Groups nets by shared hierarchical prefix (e.g. "
+                    "/MainControler/), matches each group against a bus signal signature table, and "
+                    "for every match emits a candidate with per-net width_summary (from "
+                    "get_kicad_net_track_widths), common_ics (the IC shared across all member nets - "
+                    "the bus master/hub), qualified (true when a common IC spans the whole bus), and a "
+                    "suggested_class_name. Never writes or applies anything - candidates only, for the "
+                    "caller to confirm with the user before Phase 4 creates any net class. Also cross-"
+                    "checks netlist net names against the board's own pad nets and reports mismatches "
+                    "in stale_netlist_warnings (the .net export can lag the board)."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "ic_ref_prefixes": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Reference-designator prefixes treated as ICs for qualification. Default ['U', 'IC', 'Q'].",
+                        },
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_detect_buses,
+            },
+            "get_kicad_track_inventory": {
+                "description": (
+                    "Board-wide, copper-only inventory of every track width and via size actually "
+                    "used on the PCB, plus the netclasses already defined in the project file - the "
+                    "menu of previously-used values to offer a user instead of free-entry numbers. "
+                    "Flags free/oversized via buckets and reports free_via_count."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_get_track_inventory,
+            },
+            "get_kicad_pcb_settings": {
+                "description": (
+                    "Load pcb_settings.json from the project directory (next to <name>.kicad_pro) "
+                    "deep-merged over the in-code defaults (trace-cost weights, corridor/bus-detection/"
+                    "layer-purpose/autorouter/plane/schematic-check/optimizer knobs). A missing file is "
+                    "not an error - every tool that reads settings works on pure defaults out of the "
+                    "box. Returns the effective config plus keys_from_file / keys_from_defaults so a "
+                    "caller can tell what's customized vs. stock. Raises if a weight in trace_cost is "
+                    "negative or non-numeric."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_get_pcb_settings,
+            },
+            "init_kicad_pcb_settings": {
+                "description": (
+                    "Write the fully-populated default pcb_settings.json into the project directory. "
+                    "Plain JSON (json.dump(indent=2)) - our own file, not KiCad's. Defaults to write=false "
+                    "(dry run), returning the would-be file content without touching disk. write=true "
+                    "refuses to clobber an existing file unless overwrite=true."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "write": {"type": "boolean", "default": False},
+                        "overwrite": {"type": "boolean", "default": False, "description": "Allow replacing an existing pcb_settings.json."},
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_init_pcb_settings,
+            },
+            "get_kicad_trace_cost": {
+                "description": (
+                    "Score routed copper with the trace-cost model: length cost (copper length x "
+                    "weights.length_mm), via cost (via count x weights.via x via_weights.through - every "
+                    "via on this board is through-hole), and layer_span cost ((layers_used - 1) x "
+                    "weights.layer_span). Deviation terms are STUBBED until Phase 5 (bus-corridor "
+                    "geometry) lands - every net reports on_bus:false and a deviation cost of "
+                    "trace_cost.non_bus_deviation (default 0). Omit net to get every routed net ranked "
+                    "worst-cost-first plus board totals and the weights_used actually applied."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "net": {"type": "string", "description": "Return cost for just this net; omit for every routed net, ranked worst-first."},
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_get_trace_cost,
+            },
+            "propose_kicad_netclass": {
+                "description": (
+                    "Propose a net-class definition from a confirmed net list (a detect_kicad_buses "
+                    "candidate's members, or hand-picked nets): track_width is the length-weighted "
+                    "dominant width across member nets, via_diameter/via_drill is the most-used via size "
+                    "on those nets (falls back to the project's Default class), clearance is inherited "
+                    "from Default. Reports conflicts when member nets differ in routed width, so the "
+                    "user chooses rather than the tool silently averaging. Also returns the project-wide "
+                    "track/via inventory so a caller can offer previously-used values as menu options."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "nets": {"type": "array", "items": {"type": "string"}, "description": "Exact net names, e.g. [\"/MainControler/MOSI\", \"/MainControler/MISO\"]."},
+                        "name": {"type": "string", "description": "Proposed net class name, e.g. \"SPI_MainControler\"."},
+                    },
+                    "required": ["project_path", "nets", "name"],
+                },
+                "handler": self._tool_propose_netclass,
+            },
+            "create_kicad_netclass": {
+                "description": (
+                    "Create a KiCad net class by editing <project>.kicad_pro JSON: appends a class to "
+                    "net_settings.classes (copying the Default class's full key shape, overriding name/"
+                    "track_width/via_diameter/via_drill/clearance from settings), and adds one exact, "
+                    "regex-escaped, anchored pattern (^<net>$) per net in net_patterns to "
+                    "net_settings.netclass_patterns. Refuses if the class name already exists. Defaults "
+                    "to write=false (dry run) returning a before/after diff of the affected JSON blocks; "
+                    "write=true saves with KiCad's own indent=2/sort_keys formatting. IMPORTANT: KiCad "
+                    "only reloads net classes when the project is reopened, and creating a class changes "
+                    "only the rules - it does not resize any already-routed copper."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "name": {"type": "string"},
+                        "settings": {
+                            "type": "object",
+                            "description": "Overrides for the new class: track_width, via_diameter, via_drill, clearance (mm). Unset keys copy Default's value.",
+                            "properties": {
+                                "track_width": {"type": "number"},
+                                "via_diameter": {"type": "number"},
+                                "via_drill": {"type": "number"},
+                                "clearance": {"type": "number"},
+                            },
+                        },
+                        "net_patterns": {"type": "array", "items": {"type": "string"}, "description": "Exact net names to assign to this class, one anchored pattern per net."},
+                        "write": {"type": "boolean", "default": False},
+                        "allow_while_open": {"type": "boolean", "default": False, "description": "Skip the check that refuses to write while KiCad has the board or project open."},
+                    },
+                    "required": ["project_path", "name", "settings", "net_patterns"],
+                },
+                "handler": self._tool_create_netclass,
+            },
+            "audit_kicad_netclass_conformance": {
+                "description": (
+                    "For every routed net, resolve its assigned net class via <project>.kicad_pro's "
+                    "netclass_patterns (first regex match wins, same precedence as KiCad; unmatched nets "
+                    "fall back to Default), then compare that class's track_width/via_diameter/via_drill "
+                    "against the net's actual routed dominant values (get_kicad_net_track_widths). "
+                    "Reports per-net mismatches, e.g. 'net is in class SPI (0.2 mm) but routed at 0.3 "
+                    "mm.' Read-only."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_audit_netclass_conformance,
             },
             "search_kicad_component": {
                 "description": "Search for a component by reference designator and return its line numbers in the PCB file. Use this to efficiently locate component sections without reading the entire file.",
@@ -1298,6 +1498,44 @@ class KiCadMcpServer:
 
     def _tool_get_net(self, args: dict[str, Any]) -> dict[str, Any]:
         return get_net(args["project_path"], args["net_name"])
+
+    def _tool_get_net_track_widths(self, args: dict[str, Any]) -> dict[str, Any]:
+        return get_net_track_widths(args["project_path"], args.get("net_name"))
+
+    def _tool_detect_buses(self, args: dict[str, Any]) -> dict[str, Any]:
+        return detect_buses(args["project_path"], args.get("ic_ref_prefixes"))
+
+    def _tool_get_track_inventory(self, args: dict[str, Any]) -> dict[str, Any]:
+        return get_project_track_inventory(args["project_path"])
+
+    def _tool_get_pcb_settings(self, args: dict[str, Any]) -> dict[str, Any]:
+        return load_pcb_settings(args["project_path"])
+
+    def _tool_init_pcb_settings(self, args: dict[str, Any]) -> dict[str, Any]:
+        return init_pcb_settings(
+            args["project_path"],
+            write=bool(args.get("write", False)),
+            overwrite=bool(args.get("overwrite", False)),
+        )
+
+    def _tool_get_trace_cost(self, args: dict[str, Any]) -> dict[str, Any]:
+        return get_trace_cost(args["project_path"], args.get("net"))
+
+    def _tool_propose_netclass(self, args: dict[str, Any]) -> dict[str, Any]:
+        return propose_netclass_from_nets(args["project_path"], list(args["nets"]), args["name"])
+
+    def _tool_create_netclass(self, args: dict[str, Any]) -> dict[str, Any]:
+        return create_netclass(
+            args["project_path"],
+            args["name"],
+            dict(args.get("settings") or {}),
+            list(args["net_patterns"]),
+            write=bool(args.get("write", False)),
+            allow_while_open=bool(args.get("allow_while_open", False)),
+        )
+
+    def _tool_audit_netclass_conformance(self, args: dict[str, Any]) -> dict[str, Any]:
+        return audit_netclass_conformance(args["project_path"])
 
     def _tool_find_components_by_net(self, args: dict[str, Any]) -> dict[str, Any]:
         return find_components_by_net(args["project_path"], args["net_name"])

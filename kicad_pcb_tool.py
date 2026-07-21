@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import re
@@ -140,11 +141,13 @@ def _read_text(path: Path) -> str:
 _board_component_cache: dict[str, tuple[float, int, list[dict[str, Any]]]] = {}
 _net_cache: dict[str, tuple[float, int, list[dict[str, Any]]]] = {}
 _pad_cache: dict[str, tuple[float, int, dict[str, dict[str, Any]]]] = {}
+_track_cache: dict[str, tuple[float, int, dict[str, list[dict[str, Any]]]]] = {}
 
 
 def _invalidate_board_cache(board_path: Path) -> None:
     _board_component_cache.pop(str(board_path), None)
     _pad_cache.pop(str(board_path), None)
+    _track_cache.pop(str(board_path), None)
 
 
 def _kicad_lock_path(board_path: Path) -> Path:
@@ -362,6 +365,134 @@ def _parse_footprint_pads_cached(board_path: Path) -> dict[str, dict[str, Any]]:
     pads = _parse_footprint_pads(board_path)
     _pad_cache[key] = (stat.st_mtime, stat.st_size, pads)
     return pads
+
+
+def _parse_tracks(board_path: Path) -> dict[str, list[dict[str, Any]]]:
+    """Parse copper geometry - `(segment ...)`, `(via ...)`, `(arc ...)` - directly
+    from the s-expr tree. Width parsing MUST be scoped to these node types only:
+    `(width ...)` also appears on silkscreen `gr_line`/footprint graphics, which a
+    flat regex would wrongly count as copper. Every segment/arc is additionally
+    asserted to sit on a `*.Cu` layer, and every via is asserted to span at least
+    one `*.Cu` layer, before being accepted.
+
+    Arc length is the straight-line start->end chord, not the true arc length -
+    documented approximation (flagged `is_arc: True`); the board currently has no
+    copper arcs, only edge-cuts/graphic arcs, which are excluded by the layer check.
+
+    Vias with `net == ""` are free/unconnected (stitching, mounting) vias - callers
+    that build per-net stats must skip them explicitly; this parser returns them
+    as-is so board-wide inventories can still count/flag them.
+    """
+    board_text = _read_text(board_path)
+    root = SexprParser(board_text).parse()
+    segments: list[dict[str, Any]] = []
+    vias: list[dict[str, Any]] = []
+    arcs: list[dict[str, Any]] = []
+
+    def _point(entry: list[Any]) -> dict[str, float] | None:
+        values = [float(t) for t in entry[1:] if isinstance(t, str) and _is_number(t)]
+        if len(values) >= 2:
+            return {"x": values[0], "y": values[1]}
+        return None
+
+    def walk(node: Any) -> None:
+        if isinstance(node, list):
+            tag0 = node[0] if node else None
+            if tag0 in ("segment", "arc"):
+                start = end = None
+                width = 0.0
+                layer = ""
+                net = ""
+                node_uuid = ""
+                for entry in node[1:]:
+                    if not (isinstance(entry, list) and entry):
+                        continue
+                    tag = entry[0]
+                    if tag == "start":
+                        start = _point(entry)
+                    elif tag == "end":
+                        end = _point(entry)
+                    elif tag == "width" and len(entry) >= 2 and isinstance(entry[1], str) and _is_number(entry[1]):
+                        width = float(entry[1])
+                    elif tag == "layer" and len(entry) >= 2 and isinstance(entry[1], str):
+                        layer = entry[1]
+                    elif tag == "net" and len(entry) >= 2 and isinstance(entry[1], str):
+                        net = entry[1]
+                    elif tag == "uuid" and len(entry) >= 2 and isinstance(entry[1], str):
+                        node_uuid = entry[1]
+                if layer.endswith(".Cu") and start is not None and end is not None:
+                    length = math.hypot(end["x"] - start["x"], end["y"] - start["y"])
+                    record = {
+                        "net": net,
+                        "width": width,
+                        "layer": layer,
+                        "start": start,
+                        "end": end,
+                        "length": round(length, 6),
+                        "uuid": node_uuid,
+                    }
+                    if tag0 == "arc":
+                        record["is_arc"] = True
+                        arcs.append(record)
+                    else:
+                        segments.append(record)
+            elif tag0 == "via":
+                at = None
+                size = 0.0
+                drill = 0.0
+                via_layers: list[str] = []
+                net = ""
+                node_uuid = ""
+                for entry in node[1:]:
+                    if not (isinstance(entry, list) and entry):
+                        continue
+                    tag = entry[0]
+                    if tag == "at":
+                        at = _point(entry)
+                    elif tag == "size" and len(entry) >= 2 and isinstance(entry[1], str) and _is_number(entry[1]):
+                        size = float(entry[1])
+                    elif tag == "drill" and len(entry) >= 2 and isinstance(entry[1], str) and _is_number(entry[1]):
+                        drill = float(entry[1])
+                    elif tag == "layers":
+                        via_layers = [str(x) for x in entry[1:] if isinstance(x, str)]
+                    elif tag == "net" and len(entry) >= 2 and isinstance(entry[1], str):
+                        net = entry[1]
+                    elif tag == "uuid" and len(entry) >= 2 and isinstance(entry[1], str):
+                        node_uuid = entry[1]
+                if at is not None and any(layer_name.endswith(".Cu") for layer_name in via_layers):
+                    vias.append(
+                        {
+                            "net": net,
+                            "size": size,
+                            "drill": drill,
+                            "layers": via_layers,
+                            "at": at,
+                            "uuid": node_uuid,
+                        }
+                    )
+            for child in node:
+                walk(child)
+
+    walk(root)
+    return {"segments": segments, "vias": vias, "arcs": arcs}
+
+
+def _parse_tracks_cached(board_path: Path) -> dict[str, list[dict[str, Any]]]:
+    stat = board_path.stat()
+    key = str(board_path)
+    cached = _track_cache.get(key)
+    if cached is not None and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+        return cached[2]
+    tracks = _parse_tracks(board_path)
+    _track_cache[key] = (stat.st_mtime, stat.st_size, tracks)
+    return tracks
+
+
+def _format_mm(value: float) -> str:
+    """Render a mm value the way the plan's example keys look ("0.2", "12"), not
+    Python's default float repr - trims trailing zeros/decimal point."""
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    return text if text else "0"
 
 
 def _parse_nets(netlist_path: Path) -> list[dict[str, Any]]:
@@ -2397,6 +2528,645 @@ def list_nets(project_path: str | Path) -> list[dict[str, Any]]:
     return _parse_nets_cached(netlist_path)
 
 
+def get_net_track_widths(project_path: str | Path, net: str | None = None) -> dict[str, Any]:
+    """Per-net aggregate of routed copper (segments + arcs) and vias, from the
+    board file's own geometry - not the netclass/schematic intent. `net=None`
+    returns every routed net (sorted by name); `net="X"` returns just that net.
+
+    Empty-net ("") copper is excluded - those are free/unconnected vias, not a
+    real net. A segment/arc `width` of 0 means "inherit from netclass" in KiCad,
+    not a literal 0 mm trace - such copper is counted in `segment_count`/
+    `total_length_mm` but bucketed under the `"inherit"` key in `widths` (and
+    excluded from `dominant_width`/`min_width`/`max_width`, which describe only
+    explicit widths) with `zero_width_segment_count` reporting how much of that
+    net has no explicit width.
+    """
+    board_path, _, _ = _resolve_project_path(project_path)
+    tracks = _parse_tracks_cached(board_path)
+    copper = tracks["segments"] + tracks["arcs"]
+
+    per_net: dict[str, dict[str, Any]] = {}
+
+    def bucket_for(net_name: str) -> dict[str, Any]:
+        return per_net.setdefault(
+            net_name,
+            {
+                "net": net_name,
+                "segment_count": 0,
+                "total_length_mm": 0.0,
+                "widths": {},
+                "layers": set(),
+                "via_sizes": {},
+                "_width_length": {},
+                "_zero_width_count": 0,
+            },
+        )
+
+    for seg in copper:
+        net_name = seg["net"]
+        if not net_name:
+            continue
+        entry = bucket_for(net_name)
+        entry["segment_count"] += 1
+        entry["total_length_mm"] += seg["length"]
+        entry["layers"].add(seg["layer"])
+        width = seg["width"]
+        if width <= 0:
+            entry["_zero_width_count"] += 1
+            key = "inherit"
+        else:
+            key = _format_mm(width)
+            entry["_width_length"][width] = entry["_width_length"].get(width, 0.0) + seg["length"]
+        entry["widths"][key] = entry["widths"].get(key, 0) + 1
+
+    for via in tracks["vias"]:
+        net_name = via["net"]
+        if not net_name:
+            continue
+        entry = bucket_for(net_name)
+        key = f"{_format_mm(via['size'])}/{_format_mm(via['drill'])}"
+        entry["via_sizes"][key] = entry["via_sizes"].get(key, 0) + 1
+
+    results: dict[str, dict[str, Any]] = {}
+    for net_name, entry in per_net.items():
+        width_length = entry.pop("_width_length")
+        zero_count = entry.pop("_zero_width_count")
+        if width_length:
+            dominant_width = max(width_length.items(), key=lambda kv: kv[1])[0]
+            min_width = min(width_length)
+            max_width = max(width_length)
+        else:
+            dominant_width = None
+            min_width = None
+            max_width = None
+        entry["dominant_width"] = dominant_width
+        entry["min_width"] = min_width
+        entry["max_width"] = max_width
+        entry["layers"] = sorted(entry["layers"])
+        entry["total_length_mm"] = round(entry["total_length_mm"], 3)
+        entry["is_uniform"] = len(entry["widths"]) <= 1
+        if zero_count:
+            entry["zero_width_segment_count"] = zero_count
+        results[net_name] = entry
+
+    if net is not None:
+        if net not in results:
+            raise KeyError(f"Net {net!r} has no routed copper on the board")
+        return results[net]
+
+    return {"net_count": len(results), "nets": [results[name] for name in sorted(results)]}
+
+
+_BUS_SIGNATURES: dict[str, dict[str, Any]] = {
+    # Each bus type: "required" roles must ALL have >=1 matching net in a group
+    # for the bus to fire; "optional" roles are attached if present (e.g. CS
+    # lines) but don't gate detection. Alias sets are checked against both the
+    # net's full normalized basename and its basename with a trailing index
+    # stripped (so CS0/CS1/... and CS all match the "CS" role).
+    "I2C": {"required": {"SDA": {"SDA"}, "SCL": {"SCL"}}, "optional": {}},
+    "SPI": {
+        "required": {
+            "MOSI": {"MOSI", "SDO", "COPI"},
+            "MISO": {"MISO", "SDI", "CIPO"},
+            "CLK": {"SCK", "SCLK", "CLK"},
+        },
+        "optional": {"CS": {"CS", "SS", "NSS", "NCS", "CSN", "SSN"}},
+    },
+    "QSPI": {
+        "required": {
+            "CLK": {"SCK", "SCLK"},
+            # IO/DQ roles carry their index, so match on the FULL basename here.
+            "IO": {"IO0", "IO1", "IO2", "IO3", "DQ0", "DQ1", "DQ2", "DQ3"},
+            "CS": {"CS", "SS", "NSS", "NCS"},
+        },
+        "optional": {},
+    },
+    "I2S": {
+        "required": {
+            "WS": {"WS", "LRCLK", "FS"},
+            "BCLK": {"BCLK", "SCK", "BCK"},
+            "SD": {"SD", "SDIN", "SDOUT", "DIN", "DOUT"},
+        },
+        "optional": {"MCLK": {"MCLK"}},
+    },
+    "UART": {
+        "required": {"TX": {"TX", "TXD"}, "RX": {"RX", "RXD"}},
+        "optional": {"RTS": {"RTS"}, "CTS": {"CTS"}, "DTR": {"DTR"}},
+    },
+    "CAN": {
+        "required": {"CANH": {"CANH", "CAN_H"}, "CANL": {"CANL", "CAN_L"}},
+        "optional": {},
+    },
+    "USB": {
+        "required": {"DP": {"DP", "D+", "DPLUS"}, "DM": {"DM", "D-", "DMINUS"}},
+        "optional": {"VBUS": {"VBUS"}, "ID": {"ID"}},
+    },
+    "SWD": {
+        "required": {"SWDIO": {"SWDIO"}, "SWCLK": {"SWCLK"}},
+        "optional": {"NRST": {"NRST", "RESET", "RST"}},
+    },
+    "JTAG": {
+        "required": {"TCK": {"TCK"}, "TMS": {"TMS"}, "TDI": {"TDI"}, "TDO": {"TDO"}},
+        "optional": {"NTRST": {"NTRST"}},
+    },
+    # RS485/RS422: single-letter A/B (optional Z/Y) roles are wildly
+    # false-positive-prone on any board (any net literally named "A"/"B"
+    # matches), so this signature is NOT reported like the others - see
+    # `suppress_unqualified` below and its use in `detect_buses`. `basename_only`
+    # means the role match is against the net's exact basename only, never the
+    # index-stripped form, so it doesn't collide with parallel-bus roles like
+    # address line "A0".."A15" (whose base_no_index is also "A").
+    "RS485": {
+        "required": {"A": {"A", "RS485_A", "RS485A", "RS485+"}, "B": {"B", "RS485_B", "RS485B", "RS485-"}},
+        "optional": {"Z": {"Z", "RS485_Z"}, "Y": {"Y", "RS485_Y"}},
+        "basename_only": True,
+        "suppress_unqualified": True,
+    },
+}
+
+# Structural (non-role) detectors, applied per hierarchical group in addition to
+# the signature table above. Parallel-bus index detection reuses the
+# `base_no_index`/`index` already computed per net by `_split_trailing_index`
+# (below) rather than a second regex - `_NET_INDEX_RE` there is the same shape
+# a dedicated "parallel index" regex would be.
+_DIFF_PAIR_RE = re.compile(r"^(?P<base>.+?)[_]?[PN]$")
+
+_NET_INDEX_RE = re.compile(r"^(.*?)[_\-]?(\d+)$")
+
+
+def _normalize_net_basename(net_name: str) -> str:
+    """Last `/`-segment of a hierarchical net name, uppercased. Net-name casing
+    is inconsistent across the board (`/MainControler/SDA`, `GND_Main`) so role
+    matching normalizes to uppercase, but callers must keep using the original
+    `net_name` for anything that writes or patterns against the netlist."""
+    base = net_name.rsplit("/", 1)[-1] if net_name else net_name
+    return base.strip().upper()
+
+
+def _net_group_prefix(net_name: str) -> str:
+    """Hierarchical path before the basename, e.g. '/MainControler/MOSI' ->
+    '/MainControler/'. Nets with no '/' get the flat-design sentinel ''."""
+    if "/" not in net_name:
+        return ""
+    return net_name.rsplit("/", 1)[0] + "/"
+
+
+def _split_trailing_index(basename: str) -> tuple[str, int | None]:
+    match = _NET_INDEX_RE.match(basename)
+    if match and match.group(1):
+        return match.group(1), int(match.group(2))
+    return basename, None
+
+
+def _role_matches(basename: str, base_no_index: str, alias_set: set[str]) -> bool:
+    return basename in alias_set or base_no_index in alias_set
+
+
+def _ic_like_ref(ref: str, ic_prefixes: tuple[str, ...]) -> bool:
+    ref = ref.strip().upper()
+    return any(ref.startswith(prefix) for prefix in ic_prefixes)
+
+
+def _bus_qualification(
+    member_nets: list[dict[str, Any]],
+    net_map: dict[str, list[dict[str, str]]],
+    ic_prefixes: tuple[str, ...],
+) -> dict[str, Any]:
+    """3c: intersect component refs across every member net, keeping only
+    IC-like refs. A common IC on all (or all-but-one, for a fanned-out net
+    like a shared CS bank) member nets makes the candidate `qualified`."""
+    ref_sets: list[set[str]] = []
+    for member in member_nets:
+        nodes = net_map.get(member["net"], [])
+        refs = {n.get("ref", "").strip().upper() for n in nodes if _ic_like_ref(n.get("ref", ""), ic_prefixes)}
+        if refs:
+            ref_sets.append(refs)
+
+    if not ref_sets:
+        return {"common_ics": [], "qualified": False, "reason": "no IC-like refs on any member net"}
+
+    intersection = set.intersection(*ref_sets) if ref_sets else set()
+    if intersection:
+        return {"common_ics": sorted(intersection), "qualified": True, "reason": None}
+
+    # Weak: no IC touches every member net - check "all but one" (fan-out where
+    # one net, e.g. a lone CS, skips the common IC because it's on a connector).
+    counts: dict[str, int] = {}
+    for refs in ref_sets:
+        for ref in refs:
+            counts[ref] = counts.get(ref, 0) + 1
+    if counts:
+        best_ref, best_count = max(counts.items(), key=lambda kv: kv[1])
+        if best_count >= max(1, len(ref_sets) - 1) and len(ref_sets) > 1:
+            return {
+                "common_ics": [best_ref],
+                "qualified": False,
+                "reason": f"{best_ref} touches {best_count}/{len(ref_sets)} member nets, not all - reported as weak",
+            }
+    return {
+        "common_ics": [],
+        "qualified": False,
+        "reason": "required roles present but no IC is common across member nets (bus fans out to a connector or similar)",
+    }
+
+
+def _find_diff_pairs(
+    group_nets: list[dict[str, Any]],
+    claimed_nets: set[str],
+) -> list[dict[str, Any]]:
+    """Structural (non-signature) diff-pair detector for one hierarchical group:
+    a base qualifies once BOTH polarities of `<base>_P`/`<base>_N`, `<base>+`/
+    `<base>-`, or `<base>P`/`<base>N` are present among this group's nets. Nets
+    already claimed by a named `_BUS_SIGNATURES` match in the same group are
+    skipped (`claimed_nets`) so e.g. USB D+/D- stays USB, not also DIFF_PAIR.
+    Requiring both polarities to be present is what keeps this from firing on
+    every net that happens to end in P or N.
+    """
+    pairs: dict[str, dict[str, dict[str, Any]]] = {}
+    for info in group_nets:
+        if info["net"] in claimed_nets:
+            continue
+        basename = info["basename"]
+        if basename.endswith("+") and len(basename) > 1:
+            pairs.setdefault(basename[:-1], {})["P"] = info
+            continue
+        if basename.endswith("-") and len(basename) > 1:
+            pairs.setdefault(basename[:-1], {})["N"] = info
+            continue
+        match = _DIFF_PAIR_RE.match(basename)
+        if match and match.group("base"):
+            pairs.setdefault(match.group("base"), {})[basename[-1]] = info
+
+    results: list[dict[str, Any]] = []
+    for base, roles in pairs.items():
+        if base and "P" in roles and "N" in roles and roles["P"]["net"] != roles["N"]["net"]:
+            results.append({"base": base, "P": roles["P"], "N": roles["N"]})
+    return results
+
+
+def _find_parallel_buses(
+    group_nets: list[dict[str, Any]],
+    claimed_nets: set[str],
+) -> list[dict[str, Any]]:
+    """Structural (non-signature) parallel-bus detector for one hierarchical
+    group: a base qualifies when its group carries >=4 nets sharing that base
+    with contiguous numeric suffixes 0..n (D0..D7, A0..A15 - `base_no_index`/
+    `index` already computed per net by `_split_trailing_index`). A gap in the
+    sequence disqualifies the whole base rather than reporting a partial run.
+    Nets already claimed (named bus signature or a diff pair) in the same group
+    are skipped so e.g. QSPI IO0..IO3 stays QSPI, not also PARALLEL.
+    """
+    by_base: dict[str, dict[int, dict[str, Any]]] = {}
+    for info in group_nets:
+        if info["net"] in claimed_nets or info["index"] is None:
+            continue
+        by_base.setdefault(info["base_no_index"], {})[info["index"]] = info
+
+    results: list[dict[str, Any]] = []
+    for base, indexed in by_base.items():
+        if not base or 0 not in indexed or len(indexed) < 4:
+            continue
+        indices = sorted(indexed.keys())
+        if indices != list(range(len(indices))):
+            continue  # gap in the sequence - not a contiguous 0..n run
+        results.append({"base": base, "indices": indices, "members": [indexed[i] for i in indices]})
+    return results
+
+
+def detect_buses(
+    project_path: str | Path,
+    ic_ref_prefixes: list[str] | None = None,
+) -> dict[str, Any]:
+    """Read-only bus detection over the schematic netlist (Phase 3). Groups nets
+    by shared hierarchical prefix (falling back to shared-connected-IC grouping
+    for prefix-less/flat nets), matches each group against `_BUS_SIGNATURES`,
+    and for every match that has all required roles emits a candidate with
+    Phase-1 `get_net_track_widths` width data and Phase-3c IC qualification.
+
+    NEVER writes or applies anything - candidates only, for a caller to confirm
+    with the user before Phase 4 creates any net class.
+
+    Netlist staleness: the `.net` file is a schematic export and can lag the
+    board. Net names are cross-checked against the board's own pad nets (the
+    ground truth); mismatches are reported in `stale_netlist_warnings` rather
+    than refusing the run.
+    """
+    board_path, _, netlist_path = _resolve_project_path(project_path)
+    ic_prefixes = tuple(p.strip().upper() for p in (ic_ref_prefixes or ["U", "IC", "Q"]))
+
+    nets = _parse_nets_cached(netlist_path)
+    _, net_map = _build_net_maps(nets)
+
+    # Netlist staleness guard: compare netlist net names against the board's
+    # own pad nets (ground truth, independent of the schematic export).
+    footprints = _parse_footprint_pads_cached(board_path)
+    board_net_names: set[str] = set()
+    for fp in footprints.values():
+        for pad in fp.get("pads", []):
+            pad_net = pad.get("net", "")
+            if pad_net:
+                board_net_names.add(pad_net)
+    netlist_net_names = {n.get("name", "") for n in nets if n.get("name")}
+    stale_netlist_warnings: list[str] = []
+    only_in_netlist = sorted(netlist_net_names - board_net_names)
+    only_on_board = sorted(board_net_names - netlist_net_names)
+    if only_in_netlist:
+        stale_netlist_warnings.append(
+            f"{len(only_in_netlist)} net(s) in the .net export have no matching pad net on the board "
+            f"(netlist may be stale - re-export from the schematic): {only_in_netlist[:20]}"
+        )
+    if only_on_board:
+        stale_netlist_warnings.append(
+            f"{len(only_on_board)} net(s) on the board's pads are absent from the .net export: {only_on_board[:20]}"
+        )
+
+    # Precompute per-net normalized basename/index/prefix.
+    net_info: list[dict[str, Any]] = []
+    for net in nets:
+        name = net.get("name", "")
+        if not name:
+            continue
+        basename = _normalize_net_basename(name)
+        base_no_index, index = _split_trailing_index(basename)
+        net_info.append(
+            {
+                "net": name,
+                "basename": basename,
+                "base_no_index": base_no_index,
+                "index": index,
+                "prefix": _net_group_prefix(name),
+            }
+        )
+
+    # Group by hierarchical prefix; nets with no '/' (prefix == "") fall back to
+    # shared-connected-IC grouping below.
+    groups: dict[str, list[dict[str, Any]]] = {}
+    flat_nets: list[dict[str, Any]] = []
+    for info in net_info:
+        if info["prefix"]:
+            groups.setdefault(info["prefix"], []).append(info)
+        else:
+            flat_nets.append(info)
+
+    if flat_nets:
+        # Fallback: bucket flat nets by the IC ref(s) they share.
+        nets_by_ref: dict[str, list[dict[str, Any]]] = {}
+        for info in flat_nets:
+            for node in net_map.get(info["net"], []):
+                ref = node.get("ref", "")
+                if _ic_like_ref(ref, ic_prefixes):
+                    nets_by_ref.setdefault(ref.strip().upper(), []).append(info)
+        for ref, members in nets_by_ref.items():
+            if len(members) >= 2:
+                groups.setdefault(f"IC:{ref}/", []).extend(members)
+
+    width_data = get_net_track_widths(project_path)
+    width_by_net = {entry["net"]: entry for entry in width_data.get("nets", [])}
+
+    candidates: list[dict[str, Any]] = []
+    for prefix, group_nets in groups.items():
+        sheet_name = prefix.strip("/").split("/")[-1] if prefix and not prefix.startswith("IC:") else prefix.replace("IC:", "").strip("/")
+        for bus_type, signature in _BUS_SIGNATURES.items():
+            # `basename_only` (RS485) disables the index-stripped fallback so a
+            # single-letter role can't accidentally absorb an indexed parallel-
+            # bus net (e.g. address line "A0" whose base_no_index is also "A").
+            basename_only = bool(signature.get("basename_only"))
+            matched_roles: dict[str, list[tuple[dict[str, Any], str]]] = {}
+            for role_name, alias_set in signature["required"].items():
+                role_hits = []
+                for info in group_nets:
+                    base_for_match = info["basename"] if basename_only else info["base_no_index"]
+                    if _role_matches(info["basename"], base_for_match, alias_set):
+                        tag = role_name if info["index"] is None or role_name == "IO" else f"{role_name}{info['index']}"
+                        role_hits.append((info, tag))
+                if role_hits:
+                    matched_roles[role_name] = role_hits
+            if len(matched_roles) < len(signature["required"]):
+                continue  # not all required roles present in this group
+
+            member_entries: list[dict[str, Any]] = []
+            seen_nets: set[str] = set()
+            for role_name in signature["required"]:
+                for info, tag in matched_roles[role_name]:
+                    if info["net"] in seen_nets:
+                        continue
+                    seen_nets.add(info["net"])
+                    member_entries.append({"net": info["net"], "role": tag, "width_summary": width_by_net.get(info["net"])})
+
+            for role_name, alias_set in signature.get("optional", {}).items():
+                for info in group_nets:
+                    if info["net"] in seen_nets:
+                        continue
+                    base_for_match = info["basename"] if basename_only else info["base_no_index"]
+                    if _role_matches(info["basename"], base_for_match, alias_set):
+                        tag = role_name if info["index"] is None else f"{role_name}{info['index']}"
+                        seen_nets.add(info["net"])
+                        member_entries.append({"net": info["net"], "role": tag, "width_summary": width_by_net.get(info["net"])})
+
+            qualification = _bus_qualification(member_entries, net_map, ic_prefixes)
+
+            if signature.get("suppress_unqualified") and not qualification["qualified"]:
+                # RS485/RS422: A/B (and Z/Y) are too generic to report without a
+                # confirmed common transceiver IC - suppress rather than emit a
+                # "low confidence" candidate that is really just noise.
+                continue
+
+            member_widths: dict[str, int] = {}
+            for member in member_entries:
+                summary = member.get("width_summary")
+                if summary and summary.get("dominant_width"):
+                    member_widths[summary["dominant_width"]] = member_widths.get(summary["dominant_width"], 0) + 1
+
+            required_role_count = len(signature["required"])
+            optional_hit_count = len(member_entries) - sum(len(v) for v in matched_roles.values())
+            confidence = "high" if qualification["qualified"] else ("medium" if optional_hit_count > 0 else "low")
+
+            candidates.append(
+                {
+                    "bus_type": bus_type,
+                    "confidence": confidence,
+                    "group_prefix": prefix,
+                    "nets": member_entries,
+                    "common_ics": qualification["common_ics"],
+                    "qualified": qualification["qualified"],
+                    "qualification_reason": qualification["reason"],
+                    "member_widths": member_widths,
+                    "suggested_class_name": f"{bus_type}_{sheet_name}" if sheet_name else bus_type,
+                    "required_roles_matched": sorted(matched_roles.keys()),
+                    "required_roles_needed": required_role_count,
+                }
+            )
+
+        # Structural detectors (no role table): diff pairs and parallel buses.
+        # Both skip nets already claimed by a named-signature candidate above in
+        # this same group (e.g. USB D+/D- stays USB, QSPI IO0..IO3 stays QSPI).
+        group_claimed_nets: set[str] = {
+            member["net"] for cand in candidates if cand["group_prefix"] == prefix for member in cand["nets"]
+        }
+
+        for diff_pair in _find_diff_pairs(group_nets, group_claimed_nets):
+            member_entries = [
+                {"net": diff_pair["P"]["net"], "role": "P", "width_summary": width_by_net.get(diff_pair["P"]["net"])},
+                {"net": diff_pair["N"]["net"], "role": "N", "width_summary": width_by_net.get(diff_pair["N"]["net"])},
+            ]
+            qualification = _bus_qualification(member_entries, net_map, ic_prefixes)
+            member_widths = {}
+            for member in member_entries:
+                summary = member.get("width_summary")
+                if summary and summary.get("dominant_width"):
+                    member_widths[summary["dominant_width"]] = member_widths.get(summary["dominant_width"], 0) + 1
+            base = diff_pair["base"]
+            candidates.append(
+                {
+                    "bus_type": "DIFF_PAIR",
+                    "confidence": "high" if qualification["qualified"] else "low",
+                    "group_prefix": prefix,
+                    "nets": member_entries,
+                    "common_ics": qualification["common_ics"],
+                    "qualified": qualification["qualified"],
+                    "qualification_reason": qualification["reason"],
+                    "member_widths": member_widths,
+                    "suggested_class_name": f"DIFF_PAIR_{base}_{sheet_name}" if sheet_name else f"DIFF_PAIR_{base}",
+                    "required_roles_matched": ["N", "P"],
+                    "required_roles_needed": 2,
+                }
+            )
+            group_claimed_nets.update(m["net"] for m in member_entries)
+
+        for parallel_bus in _find_parallel_buses(group_nets, group_claimed_nets):
+            member_entries = [
+                {"net": m["net"], "role": str(m["index"]), "width_summary": width_by_net.get(m["net"])}
+                for m in parallel_bus["members"]
+            ]
+            qualification = _bus_qualification(member_entries, net_map, ic_prefixes)
+            member_widths = {}
+            for member in member_entries:
+                summary = member.get("width_summary")
+                if summary and summary.get("dominant_width"):
+                    member_widths[summary["dominant_width"]] = member_widths.get(summary["dominant_width"], 0) + 1
+            base = parallel_bus["base"]
+            candidates.append(
+                {
+                    "bus_type": "PARALLEL",
+                    "confidence": "high" if qualification["qualified"] else "low",
+                    "group_prefix": prefix,
+                    "nets": member_entries,
+                    "common_ics": qualification["common_ics"],
+                    "qualified": qualification["qualified"],
+                    "qualification_reason": qualification["reason"],
+                    "member_widths": member_widths,
+                    "suggested_class_name": f"PARALLEL_{base}_{sheet_name}" if sheet_name else f"PARALLEL_{base}",
+                    "required_roles_matched": [str(i) for i in parallel_bus["indices"]],
+                    "required_roles_needed": len(parallel_bus["indices"]),
+                }
+            )
+            group_claimed_nets.update(m["net"] for m in member_entries)
+
+    return {
+        "project_path": str(project_path),
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "stale_netlist_warnings": stale_netlist_warnings,
+        "ic_ref_prefixes_used": list(ic_prefixes),
+    }
+
+
+def get_project_track_inventory(project_path: str | Path) -> dict[str, Any]:
+    """Board-wide, copper-only inventory of every track width and via size in use,
+    plus the netclasses already defined in `<project>.kicad_pro` - the exact
+    "menu of previously used values" a caller should present to a user instead of
+    free-entry width/via numbers. `free_via_count` is vias with `net == ""`
+    (unconnected stitching/mounting vias); a via-size bucket is flagged
+    `"free/oversized"` when every via at that size/drill is a free via.
+    """
+    board_path, project_file, _ = _resolve_project_path(project_path)
+    tracks = _parse_tracks_cached(board_path)
+    copper = tracks["segments"] + tracks["arcs"]
+
+    width_stats: dict[float, dict[str, Any]] = {}
+    zero_width_count = 0
+    for seg in copper:
+        width = seg["width"]
+        if width <= 0:
+            zero_width_count += 1
+            continue
+        bucket = width_stats.setdefault(
+            width, {"width": width, "segment_count": 0, "length_mm": 0.0, "_nets": set()}
+        )
+        bucket["segment_count"] += 1
+        bucket["length_mm"] += seg["length"]
+        if seg["net"]:
+            bucket["_nets"].add(seg["net"])
+
+    track_widths = []
+    for bucket in width_stats.values():
+        track_widths.append(
+            {
+                "width": bucket["width"],
+                "segment_count": bucket["segment_count"],
+                "length_mm": round(bucket["length_mm"], 3),
+                "nets": len(bucket["_nets"]),
+            }
+        )
+    track_widths.sort(key=lambda entry: entry["segment_count"], reverse=True)
+
+    via_groups: dict[tuple[float, float], dict[str, Any]] = {}
+    free_via_count = 0
+    for via in tracks["vias"]:
+        is_free = via["net"] == ""
+        if is_free:
+            free_via_count += 1
+        key = (via["size"], via["drill"])
+        group = via_groups.setdefault(key, {"size": via["size"], "drill": via["drill"], "count": 0, "_free": 0})
+        group["count"] += 1
+        if is_free:
+            group["_free"] += 1
+
+    via_sizes = []
+    for group in via_groups.values():
+        entry = {"size": group["size"], "drill": group["drill"], "count": group["count"]}
+        via_sizes.append(entry)
+    via_sizes.sort(key=lambda entry: entry["count"], reverse=True)
+
+    existing_netclasses: list[dict[str, Any]] = []
+    if project_file.exists():
+        try:
+            pro_data = json.loads(project_file.read_text(encoding="utf-8"))
+            existing_netclasses = pro_data.get("net_settings", {}).get("classes", [])
+        except (json.JSONDecodeError, OSError):
+            existing_netclasses = []
+
+    # Flag a via bucket "free/oversized" if it contains any free (net=="") via -
+    # a size otherwise unused by real routing is a stitching/mounting artifact
+    # worth calling out even when a few connected vias happen to share that size
+    # - or if it's well above the Default netclass via diameter (a literal
+    # oversized via), whichever signal fires first.
+    default_via_diameter = next(
+        (float(c["via_diameter"]) for c in existing_netclasses if c.get("name") == "Default" and _is_number(str(c.get("via_diameter", "")))),
+        None,
+    )
+    for entry in via_sizes:
+        group = via_groups[(entry["size"], entry["drill"])]
+        is_free_bucket = group["_free"] > 0
+        is_oversized = default_via_diameter is not None and entry["size"] > default_via_diameter * 3
+        if is_free_bucket or is_oversized:
+            entry["warning"] = "free/oversized"
+
+    result: dict[str, Any] = {
+        "track_widths": track_widths,
+        "via_sizes": via_sizes,
+        "existing_netclasses": existing_netclasses,
+        "free_via_count": free_via_count,
+    }
+    if zero_width_count:
+        result["zero_width_segment_count"] = zero_width_count
+        result["note"] = (
+            "Segments/arcs with width 0 inherit their width from the assigned "
+            "netclass and are excluded from track_widths."
+        )
+    return result
+
+
 def get_component_info(board_path: str | Path) -> dict[str, Any]:
     return inspect_project(board_path)
 
@@ -3227,6 +3997,629 @@ def set_schematic_property(
             handle.write(new_text)
         _invalidate_schematic_cache(sch_path)
     return {"write": write, "change": change}
+
+
+DEFAULT_PCB_SETTINGS: dict[str, Any] = {
+    "version": 1,
+    "trace_cost": {
+        "weights": {
+            "length_mm": 1.0,
+            "via": 5.0,
+            "deviation_mm": 2.0,
+            "excess_length": 10.0,
+            "layer_span": 8.0,
+        },
+        "deviation": {
+            "metric": "mean_perp_distance",
+            "reference": "bus_centerline",
+        },
+        "via_weights": {"through": 1.0, "microvia": 0.5, "blind_buried": 1.5},
+        "non_bus_deviation": 0.0,
+    },
+    "corridor": {"clip_band_mult": 3.0},
+    "bus_detection": {"ic_ref_prefixes": ["U", "IC"], "extra_signatures": {}},
+    "layer_purpose": {
+        "signal": {"signal": 1.0, "mixed": 1.2, "power": 4.0, "jumper": 2.0},
+        "power": {"signal": 2.0, "mixed": 1.2, "power": 1.0, "jumper": 3.0},
+        "power_net_patterns": ["^GND", r"^\+?\d+\.?\d*[Vv]", "VCC", "VDD", "12[Vv]", r"3\.3[Vv]", "5[Vv]"],
+    },
+    "autorouter": {
+        "grid_mm": 0.2,
+        "global_grid_mm": 2.0,
+        "search_window_margin_mm": 8.0,
+        "clearance_fallback_mm": 0.2,
+        "cost": {
+            "step": 1.0,
+            "via": 25.0,
+            "direction_change": 2.0,
+            "congestion": 8.0,
+            "off_corridor": 4.0,
+            "off_direction": 2.0,
+            "away_from_home_per_mm": 0.5,
+        },
+        "layer_directions": "auto",
+        "max_ripup_iterations": 5,
+        "allowed_layers": [],
+        "acceleration": "auto",
+        "gpu": {"memory_budget_mb": 0, "batch": "auto", "oom_fallback": True},
+        "cpu": {"workers": 0, "ram_budget_mb": 0, "replicas": "auto", "replica_sync": "chunk_end"},
+        "progress": {"events": True, "open_viewer": False, "color_theme": "auto"},
+    },
+    "plane": {
+        "plane_step": 0.05,
+        "attachment_via": 8.0,
+        "island_base": 40.0,
+        "orphan_island": 1000.0,
+        "island_min_attachments_warn": 2,
+        "create_plane": 15.0,
+        "modify_plane": 5.0,
+    },
+    "schematic_checks": {
+        "cap_voltage": {
+            "derating_min_ratio": 2.0,
+            "gnd_tokens": ["GND", "AGND", "DGND", "PGND", "VSS"],
+            "net_voltages": {},
+            "default_cap_rating": None,
+        }
+    },
+    "optimizer": {
+        "max_iterations": 20,
+        "time_budget_s": 300,
+        "worst_k": 5,
+        "unrouted_penalty": 500.0,
+        "accept": "greedy",
+        "sa_initial_temp": 50.0,
+        "sa_cooling": 0.9,
+        "convergence_delta": 0.5,
+        "seed": 1,
+        "ai_decisions": {
+            "enabled": True,
+            "min_score_spread": 5.0,
+            "max_pauses_per_run": 12,
+            "decision_types": [
+                "bundle_layer",
+                "plane_proposal",
+                "conflict_yield",
+                "stitching_budget",
+                "sa_large_move",
+                "give_up_net",
+            ],
+        },
+    },
+}
+
+
+def _pcb_settings_path(project_path: str | Path) -> Path:
+    board_path, _, _ = _resolve_project_path(project_path)
+    return board_path.parent / "pcb_settings.json"
+
+
+def _deep_merge_settings(defaults: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge `overrides` over `defaults`, dict-by-dict; any
+    non-dict value (including lists) in `overrides` replaces the default
+    wholesale rather than being element-merged."""
+    result = copy.deepcopy(defaults)
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge_settings(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def _validate_pcb_settings_weights(config: dict[str, Any]) -> None:
+    """Every weight in `trace_cost` (base weights and `via_weights`) must be a
+    non-negative number - a negative weight would make the cost model reward
+    the very thing it's supposed to penalize, and a non-numeric weight breaks
+    every downstream arithmetic op silently instead of failing loudly here."""
+    trace_cost = config.get("trace_cost", {})
+    weights = trace_cost.get("weights", {})
+    for key, value in weights.items():
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"trace_cost.weights.{key} must be a non-negative number, got {value!r}")
+    via_weights = trace_cost.get("via_weights", {})
+    for key, value in via_weights.items():
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"trace_cost.via_weights.{key} must be a non-negative number, got {value!r}")
+    non_bus_deviation = trace_cost.get("non_bus_deviation", 0.0)
+    if not isinstance(non_bus_deviation, (int, float)) or isinstance(non_bus_deviation, bool) or non_bus_deviation < 0:
+        raise ValueError(f"trace_cost.non_bus_deviation must be a non-negative number, got {non_bus_deviation!r}")
+
+
+def load_pcb_settings(project_path: str | Path) -> dict[str, Any]:
+    """Load `pcb_settings.json` from the project directory (next to
+    `<name>.kicad_pro`) and deep-merge it over the in-code defaults (Phase
+    6.1's schema - trace-cost weights, corridor/bus-detection/layer-purpose/
+    autorouter/plane/schematic-check/optimizer knobs). A missing file is not
+    an error: every tool that reads settings works out of the box on pure
+    defaults. `trace_cost` weights are validated non-negative after the
+    merge; a bad file raises rather than silently producing nonsense costs.
+
+    Returns the effective config plus which top-level keys came from the file
+    (even a partial override) vs. untouched defaults, so a caller can tell
+    "this project has customized X" from "X is stock"."""
+    settings_path = _pcb_settings_path(project_path)
+    file_data: dict[str, Any] = {}
+    loaded_from_file = False
+    if settings_path.exists():
+        try:
+            file_data = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ValueError(f"Failed to parse {settings_path}: {exc}") from exc
+        if not isinstance(file_data, dict):
+            raise ValueError(f"{settings_path} must contain a JSON object at the top level")
+        loaded_from_file = True
+
+    merged = _deep_merge_settings(DEFAULT_PCB_SETTINGS, file_data)
+    _validate_pcb_settings_weights(merged)
+
+    keys_from_file = sorted(file_data.keys())
+    keys_from_defaults = sorted(k for k in DEFAULT_PCB_SETTINGS.keys() if k not in file_data)
+
+    return {
+        "settings_path": str(settings_path),
+        "loaded_from_file": loaded_from_file,
+        "config": merged,
+        "keys_from_file": keys_from_file,
+        "keys_from_defaults": keys_from_defaults,
+    }
+
+
+def init_pcb_settings(project_path: str | Path, write: bool = False, overwrite: bool = False) -> dict[str, Any]:
+    """Write the fully-populated default `pcb_settings.json` (Phase 6.1's
+    schema, verbatim) into the project directory. Plain JSON
+    (`json.dump(indent=2)`) - it's our own file, not KiCad's, so no s-expr
+    surgery and no board-lock concern.
+
+    Defaults to a dry run (write=False) that returns the would-be file
+    content without touching disk. `write=True` refuses to clobber an
+    existing file unless `overwrite=True` - seeding is meant to give a
+    project its first settings file, not silently discard one a user has
+    already tuned.
+    """
+    settings_path = _pcb_settings_path(project_path)
+    content = json.dumps(DEFAULT_PCB_SETTINGS, indent=2) + "\n"
+    already_exists = settings_path.exists()
+
+    result: dict[str, Any] = {
+        "settings_path": str(settings_path),
+        "write": write,
+        "already_exists": already_exists,
+        "content": content,
+        "written": False,
+    }
+    if write:
+        if already_exists and not overwrite:
+            raise FileExistsError(
+                f"{settings_path} already exists; pass overwrite=True to replace it "
+                "(dry-run content is available in `content` if you want to compare first)."
+            )
+        with settings_path.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+        result["written"] = True
+    return result
+
+
+def get_trace_cost(project_path: str | Path, net: str | None = None) -> dict[str, Any]:
+    """Score routed copper with the Phase 6.2 cost model: length cost (copper
+    length x `weights.length_mm`), via cost (via count x `weights.via` x the
+    via's `via_weights` type multiplier - every via on this board is
+    through-hole, so `via_weights.through` applies uniformly), and layer_span
+    cost ((layers_used - 1) x `weights.layer_span`).
+
+    Deviation terms are STUBBED in this build (Phase 5 - bus-corridor
+    geometry - hasn't landed yet): every net reports `on_bus: false`, `bundle:
+    null`, and a deviation cost equal to `trace_cost.non_bus_deviation`
+    (default 0.0), exactly per the plan's Phase 6.3 fallback so the model
+    degrades cleanly to length+vias+span for every net until Phase 5 unstubs
+    it net-by-net.
+
+    `net=None` returns every routed net ranked worst-cost-first, plus board
+    totals and the `weights_used` block actually applied (so a result is
+    self-describing/reproducible even as `pcb_settings.json` changes).
+    """
+    settings = load_pcb_settings(project_path)["config"]
+    trace_cost_cfg = settings["trace_cost"]
+    weights = trace_cost_cfg["weights"]
+    via_weights = trace_cost_cfg["via_weights"]
+    non_bus_deviation = float(trace_cost_cfg.get("non_bus_deviation", 0.0))
+    through_via_weight = float(via_weights.get("through", 1.0))
+
+    width_data = get_net_track_widths(project_path)
+    entries = width_data["nets"]
+
+    def build(entry: dict[str, Any]) -> dict[str, Any]:
+        via_count = sum(entry.get("via_sizes", {}).values())
+        length_mm = float(entry.get("total_length_mm", 0.0))
+        layers_used = len(entry.get("layers", []) or [])
+
+        length_cost = weights["length_mm"] * length_mm
+        via_cost = weights["via"] * via_count * through_via_weight
+        span_cost = weights["layer_span"] * max(0, layers_used - 1)
+        deviation_cost = non_bus_deviation
+        total = length_cost + via_cost + span_cost + deviation_cost
+
+        return {
+            "net": entry["net"],
+            "on_bus": False,
+            "bundle": None,
+            "metrics": {
+                "length_mm": round(length_mm, 3),
+                "via_count": via_count,
+                "via_types": {"through": via_count} if via_count else {},
+                "layers_used": layers_used,
+            },
+            "cost": {
+                "length": round(length_cost, 3),
+                "vias": round(via_cost, 3),
+                "deviation": round(deviation_cost, 3),
+                "layer_span": round(span_cost, 3),
+                "total": round(total, 3),
+            },
+        }
+
+    weights_used = {
+        "length_mm": weights["length_mm"],
+        "via": weights["via"],
+        "deviation_mm": weights["deviation_mm"],
+        "excess_length": weights["excess_length"],
+        "layer_span": weights["layer_span"],
+        "via_weights": dict(via_weights),
+        "non_bus_deviation": non_bus_deviation,
+    }
+
+    if net is not None:
+        match = next((e for e in entries if e["net"] == net), None)
+        if match is None:
+            raise KeyError(f"Net {net!r} has no routed copper on the board")
+        result = build(match)
+        result["weights_used"] = weights_used
+        return result
+
+    ranked = [build(e) for e in entries]
+    ranked.sort(key=lambda r: r["cost"]["total"], reverse=True)
+    board_totals = {
+        "length": round(sum(r["cost"]["length"] for r in ranked), 3),
+        "vias": round(sum(r["cost"]["vias"] for r in ranked), 3),
+        "deviation": round(sum(r["cost"]["deviation"] for r in ranked), 3),
+        "layer_span": round(sum(r["cost"]["layer_span"] for r in ranked), 3),
+        "total": round(sum(r["cost"]["total"] for r in ranked), 3),
+    }
+    return {
+        "net_count": len(ranked),
+        "nets": ranked,
+        "board_totals": board_totals,
+        "weights_used": weights_used,
+    }
+
+
+def _default_netclass(project_file: Path) -> dict[str, Any] | None:
+    if not project_file.exists():
+        return None
+    try:
+        pro_data = json.loads(project_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    classes = pro_data.get("net_settings", {}).get("classes", [])
+    return next((c for c in classes if c.get("name") == "Default"), None)
+
+
+def propose_netclass_from_nets(project_path: str | Path, nets: list[str], name: str) -> dict[str, Any]:
+    """Propose a net-class definition (Phase 4a) from a confirmed net list (a
+    bus candidate's members, or a hand-picked set) by pulling each net's
+    Phase-1 width summary and deriving:
+    - `track_width`: length-weighted dominant width across all member nets
+      (each net's own dominant width weighted by that net's total routed
+      length, so a long net's width dominates a short stub's).
+    - `via_diameter`/`via_drill`: the most-used via size/drill across member
+      nets; falls back to the project's `Default` netclass if no member net
+      has any vias.
+    - `clearance`: inherited from `Default` (this tool never invents one).
+
+    Reports `conflicts` - member nets whose own dominant width differs from
+    the proposed `track_width` - so the caller surfaces a choice to the user
+    instead of silently averaging away real routing differences. Also
+    includes the Phase-2 project-wide inventory so a caller can offer
+    previously-used widths/vias as menu options (`AskUserQuestion`) rather
+    than free-entry numbers.
+
+    Nets with no routed copper are reported in `missing_nets` and excluded
+    from the width/via aggregation (they simply have nothing to contribute).
+    """
+    board_path, project_file, _ = _resolve_project_path(project_path)
+
+    width_by_net: dict[str, dict[str, Any]] = {}
+    missing_nets: list[str] = []
+    for member in nets:
+        try:
+            width_by_net[member] = get_net_track_widths(project_path, member)
+        except KeyError:
+            missing_nets.append(member)
+
+    width_length_totals: dict[str, float] = {}
+    via_counts: dict[str, int] = {}
+    member_dominant_widths: dict[str, str | None] = {}
+    for member, summary in width_by_net.items():
+        dominant_width = summary.get("dominant_width")
+        member_dominant_widths[member] = dominant_width
+        if dominant_width is not None:
+            length = float(summary.get("total_length_mm", 0.0))
+            width_length_totals[dominant_width] = width_length_totals.get(dominant_width, 0.0) + length
+        for via_key, count in (summary.get("via_sizes") or {}).items():
+            via_counts[via_key] = via_counts.get(via_key, 0) + count
+
+    proposed_width_key = None
+    if width_length_totals:
+        proposed_width_key = max(width_length_totals.items(), key=lambda kv: kv[1])[0]
+
+    proposed_via_key = None
+    if via_counts:
+        proposed_via_key = max(via_counts.items(), key=lambda kv: kv[1])[0]
+
+    default_class = _default_netclass(project_file)
+
+    track_width: float | None
+    if proposed_width_key is not None:
+        track_width = float(proposed_width_key)
+    elif default_class is not None and _is_number(str(default_class.get("track_width", ""))):
+        track_width = float(default_class["track_width"])
+    else:
+        track_width = None
+
+    if proposed_via_key is not None:
+        via_size_str, via_drill_str = proposed_via_key.split("/", 1)
+        via_diameter, via_drill = float(via_size_str), float(via_drill_str)
+    elif default_class is not None:
+        via_diameter = float(default_class.get("via_diameter", 0.0)) if _is_number(str(default_class.get("via_diameter", ""))) else None
+        via_drill = float(default_class.get("via_drill", 0.0)) if _is_number(str(default_class.get("via_drill", ""))) else None
+    else:
+        via_diameter = via_drill = None
+
+    clearance = float(default_class["clearance"]) if default_class is not None and _is_number(str(default_class.get("clearance", ""))) else None
+
+    conflicts = [
+        {"net": member, "dominant_width": dominant_width}
+        for member, dominant_width in member_dominant_widths.items()
+        if dominant_width is not None and proposed_width_key is not None and dominant_width != proposed_width_key
+    ]
+
+    inventory = get_project_track_inventory(project_path)
+
+    return {
+        "name": name,
+        "nets": nets,
+        "missing_nets": missing_nets,
+        "proposed_settings": {
+            "track_width": track_width,
+            "via_diameter": via_diameter,
+            "via_drill": via_drill,
+            "clearance": clearance,
+        },
+        "conflicts": conflicts,
+        "member_dominant_widths": member_dominant_widths,
+        "via_counts_by_size": via_counts,
+        "default_class_used_as_fallback": default_class is not None and (proposed_width_key is None or proposed_via_key is None),
+        "inventory": inventory,
+    }
+
+
+def create_netclass(
+    project_path: str | Path,
+    name: str,
+    settings: dict[str, Any],
+    net_patterns: list[str],
+    write: bool = False,
+    allow_while_open: bool = False,
+) -> dict[str, Any]:
+    """Create a KiCad net class (Phase 4b) by editing `<project>.kicad_pro`
+    JSON: appends a class object to `net_settings.classes` (copying the
+    `Default` class's full key shape, then overriding `name`/`track_width`/
+    `via_diameter`/`via_drill`/`clearance` from `settings` - every other key
+    Default carries, e.g. `bus_width`/`diff_pair_*`/`microvia_*`/colors, is
+    preserved verbatim so the new class looks native to KiCad), and adds one
+    exact, regex-escaped, anchored pattern (`^<net>$`) per net in
+    `net_patterns` to `net_settings.netclass_patterns`. Refuses if a class
+    named `name` already exists (idempotent by refusal, never appends a
+    duplicate).
+
+    Defaults to a dry run (write=False) that returns a before/after diff of
+    the affected `classes`/`netclass_patterns` JSON blocks plus the new class
+    object, without touching disk. `write=True` saves with
+    `json.dump(..., indent=2, sort_keys=True)` - verified byte-for-byte
+    against a full round-trip of this project's own `.kicad_pro` (KiCad
+    itself serializes net-settings objects with alphabetically-sorted keys),
+    so the diff stays minimal on KiCad's next own save.
+
+    IMPORTANT: KiCad only reloads net classes when the project is reopened -
+    this write does not affect anything in a currently-open KiCad session
+    until it reopens the project. It also only changes the *rules*: existing
+    routed copper keeps whatever width/vias it already has until the net is
+    re-routed or "Update Tracks/Vias from Netclass" is run in KiCad; creating
+    a class does not retroactively resize any trace.
+
+    Checks both the board file's and the project file's KiCad editor lock
+    (`~<name>.lck`) before writing - the board's own lock is the well-known
+    one, but a caller with the project open for net-class editing should not
+    be silently overwritten either.
+    """
+    board_path, project_file, _ = _resolve_project_path(project_path)
+    if not project_file.exists():
+        raise FileNotFoundError(f"Project file not found: {project_file}")
+
+    pro_data = json.loads(project_file.read_text(encoding="utf-8"))
+    net_settings = pro_data.setdefault("net_settings", {})
+    classes = net_settings.setdefault("classes", [])
+    patterns = net_settings.setdefault("netclass_patterns", [])
+
+    if any(c.get("name") == name for c in classes):
+        raise ValueError(f"Netclass {name!r} already exists in {project_file.name} - refusing to append a duplicate")
+
+    default_class = next((c for c in classes if c.get("name") == "Default"), None)
+    if default_class is None:
+        raise ValueError(f"No 'Default' netclass found in {project_file.name}'s net_settings.classes to copy shape from")
+
+    new_class = copy.deepcopy(default_class)
+    new_class["name"] = name
+    for key in ("track_width", "via_diameter", "via_drill", "clearance"):
+        if key in settings and settings[key] is not None:
+            new_class[key] = settings[key]
+
+    new_patterns = [{"pattern": f"^{re.escape(member)}$", "netclass": name} for member in net_patterns]
+
+    before = {
+        "net_settings.classes": copy.deepcopy(classes),
+        "net_settings.netclass_patterns": copy.deepcopy(patterns),
+    }
+    updated_classes = classes + [new_class]
+    updated_patterns = patterns + new_patterns
+    after = {
+        "net_settings.classes": updated_classes,
+        "net_settings.netclass_patterns": updated_patterns,
+    }
+
+    result: dict[str, Any] = {
+        "project_file": str(project_file),
+        "write": write,
+        "written": False,
+        "name": name,
+        "new_class": new_class,
+        "new_patterns": new_patterns,
+        "diff": {"before": before, "after": after},
+    }
+
+    if write:
+        _check_not_locked_by_editor(board_path, allow_while_open)
+        _check_not_locked_by_editor(project_file, allow_while_open)
+        net_settings["classes"] = updated_classes
+        net_settings["netclass_patterns"] = updated_patterns
+        new_text = json.dumps(pro_data, indent=2, sort_keys=True) + "\n"
+        with project_file.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(new_text)
+        result["written"] = True
+
+    return result
+
+
+def audit_netclass_conformance(project_path: str | Path) -> dict[str, Any]:
+    """Reconciliation report (Phase 4c): for each routed net, resolve which
+    net class it's assigned to via `<project>.kicad_pro`'s
+    `net_settings.netclass_patterns` (regex patterns, first match wins - the
+    same precedence KiCad itself uses), falling back to `Default` for any net
+    matched by no pattern. Compares that class's `track_width`/
+    `via_diameter`/`via_drill` against the net's *actual* routed dominant
+    values (Phase 1's `get_net_track_widths`) and reports a `mismatches` list
+    per net, e.g. "net is in class SPI (0.2 mm) but routed at 0.3 mm."
+
+    Read-only. A pattern referencing a netclass name absent from
+    `net_settings.classes` is reported as a row-level `error` instead of a
+    silent skip - a dangling pattern is itself a project-file defect worth
+    surfacing.
+    """
+    board_path, project_file, _ = _resolve_project_path(project_path)
+    pro_data: dict[str, Any] = {}
+    if project_file.exists():
+        try:
+            pro_data = json.loads(project_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pro_data = {}
+
+    net_settings = pro_data.get("net_settings", {})
+    classes_by_name = {c.get("name"): c for c in net_settings.get("classes", [])}
+    compiled_patterns: list[tuple[re.Pattern[str], str]] = []
+    for entry in net_settings.get("netclass_patterns", []) or []:
+        pattern_text = entry.get("pattern", "")
+        netclass_name = entry.get("netclass", "")
+        try:
+            compiled_patterns.append((re.compile(pattern_text), netclass_name))
+        except re.error:
+            continue
+
+    width_data = get_net_track_widths(project_path)
+
+    rows: list[dict[str, Any]] = []
+    mismatch_count = 0
+    for entry in width_data["nets"]:
+        net_name = entry["net"]
+        assigned_class_name = "Default"
+        for regex, netclass_name in compiled_patterns:
+            if regex.search(net_name):
+                assigned_class_name = netclass_name
+                break
+
+        class_def = classes_by_name.get(assigned_class_name)
+        if class_def is None:
+            rows.append(
+                {
+                    "net": net_name,
+                    "assigned_class": assigned_class_name,
+                    "error": (
+                        f"netclass {assigned_class_name!r} is referenced by netclass_patterns but not "
+                        "defined in net_settings.classes"
+                    ),
+                    "conforms": False,
+                }
+            )
+            mismatch_count += 1
+            continue
+
+        actual_width: float | None = None
+        dominant_width = entry.get("dominant_width")
+        if dominant_width not in (None, "inherit") and _is_number(str(dominant_width)):
+            actual_width = float(dominant_width)
+
+        actual_via_diameter: float | None = None
+        actual_via_drill: float | None = None
+        via_sizes = entry.get("via_sizes") or {}
+        if via_sizes:
+            best_via_key = max(via_sizes.items(), key=lambda kv: kv[1])[0]
+            via_size_str, via_drill_str = best_via_key.split("/", 1)
+            actual_via_diameter = float(via_size_str)
+            actual_via_drill = float(via_drill_str)
+
+        class_width = float(class_def.get("track_width", 0)) if _is_number(str(class_def.get("track_width", ""))) else None
+        class_via_diameter = float(class_def.get("via_diameter", 0)) if _is_number(str(class_def.get("via_diameter", ""))) else None
+        class_via_drill = float(class_def.get("via_drill", 0)) if _is_number(str(class_def.get("via_drill", ""))) else None
+
+        mismatches: list[str] = []
+        if actual_width is not None and class_width is not None and abs(actual_width - class_width) > 1e-6:
+            mismatches.append(
+                f"track_width: class {assigned_class_name!r} specifies {class_width} mm but "
+                f"{entry.get('segment_count', 0)} segment(s) are routed at {actual_width} mm"
+            )
+        if actual_via_diameter is not None and class_via_diameter is not None and abs(actual_via_diameter - class_via_diameter) > 1e-6:
+            mismatches.append(
+                f"via_diameter: class {assigned_class_name!r} specifies {class_via_diameter} mm but "
+                f"the net's dominant via is {actual_via_diameter} mm"
+            )
+        if actual_via_drill is not None and class_via_drill is not None and abs(actual_via_drill - class_via_drill) > 1e-6:
+            mismatches.append(
+                f"via_drill: class {assigned_class_name!r} specifies {class_via_drill} mm but "
+                f"the net's dominant via drill is {actual_via_drill} mm"
+            )
+
+        if mismatches:
+            mismatch_count += 1
+        rows.append(
+            {
+                "net": net_name,
+                "assigned_class": assigned_class_name,
+                "class_track_width": class_width,
+                "actual_dominant_width": actual_width,
+                "class_via_diameter": class_via_diameter,
+                "actual_via_diameter": actual_via_diameter,
+                "class_via_drill": class_via_drill,
+                "actual_via_drill": actual_via_drill,
+                "mismatches": mismatches,
+                "conforms": not mismatches,
+            }
+        )
+
+    return {
+        "project_file": str(project_file),
+        "net_count": len(rows),
+        "mismatch_count": mismatch_count,
+        "rows": rows,
+    }
 
 
 def main() -> None:

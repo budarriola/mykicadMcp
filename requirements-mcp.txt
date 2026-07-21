@@ -6,3 +6,13 @@ mcp>=1.0.0
 # simply left unregistered. Requires KiCad 9+ and Preferences > Plugins >
 # "Enable IPC API" turned on.
 kicad-python>=0.7.0
+
+# Optional: autorouter acceleration tiers (NETCLASS_PLAN Phase 7.8). Everything
+# runs on the pure-stdlib cpu tier without any of these; installing one only
+# makes routing/optimization faster, never changes results (parity-gated).
+# numpy  - vectorized rasterization, clearance checks, and wavefront relaxation
+# cupy   - GPU (CUDA) batch wavefront relaxation on top of the numpy code path
+# torch  - GPU alternative to cupy (CUDA, or DirectML on Windows)
+#numpy>=1.24
+#cupy-cuda12x>=12.0
+#torch>=2.0
