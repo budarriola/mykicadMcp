@@ -7,6 +7,7 @@ import json
 import math
 import re
 import uuid as _uuid
+from datetime import date as _date
 from pathlib import Path
 from typing import Any
 
@@ -142,12 +143,14 @@ _board_component_cache: dict[str, tuple[float, int, list[dict[str, Any]]]] = {}
 _net_cache: dict[str, tuple[float, int, list[dict[str, Any]]]] = {}
 _pad_cache: dict[str, tuple[float, int, dict[str, dict[str, Any]]]] = {}
 _track_cache: dict[str, tuple[float, int, dict[str, list[dict[str, Any]]]]] = {}
+_board_layers_cache: dict[str, tuple[float, int, list[dict[str, Any]]]] = {}
 
 
 def _invalidate_board_cache(board_path: Path) -> None:
     _board_component_cache.pop(str(board_path), None)
     _pad_cache.pop(str(board_path), None)
     _track_cache.pop(str(board_path), None)
+    _board_layers_cache.pop(str(board_path), None)
 
 
 def _kicad_lock_path(board_path: Path) -> Path:
@@ -311,10 +314,15 @@ def _parse_footprint_pads(board_path: Path) -> dict[str, dict[str, Any]]:
                         reference = str(entry[2])
                     elif tag == "pad":
                         pad_number = entry[1] if len(entry) > 1 and isinstance(entry[1], str) else ""
+                        # (pad "<num>" <type> <shape> ...): entry[2] is the pad type
+                        # (smd | thru_hole | np_thru_hole | connect) - needed by the
+                        # router to know a through-hole pad spans every copper layer.
+                        pad_type = entry[2] if len(entry) > 2 and isinstance(entry[2], str) else ""
                         pad_local = {"x": 0.0, "y": 0.0, "rotation": 0.0}
                         pad_net = ""
                         pad_layers: list[str] = []
                         pad_pintype = ""
+                        pad_size = {"x": 0.0, "y": 0.0}
                         for pentry in entry[1:]:
                             if not (isinstance(pentry, list) and pentry):
                                 continue
@@ -323,6 +331,10 @@ def _parse_footprint_pads(board_path: Path) -> dict[str, dict[str, Any]]:
                                 pvalues = [float(t) for t in pentry[1:] if isinstance(t, str) and _is_number(t)]
                                 if len(pvalues) >= 2:
                                     pad_local = {"x": pvalues[0], "y": pvalues[1], "rotation": pvalues[2] if len(pvalues) >= 3 else 0.0}
+                            elif ptag == "size":
+                                svalues = [float(t) for t in pentry[1:] if isinstance(t, str) and _is_number(t)]
+                                if len(svalues) >= 2:
+                                    pad_size = {"x": svalues[0], "y": svalues[1]}
                             elif ptag == "net" and len(pentry) >= 2:
                                 pad_net = str(pentry[-1])
                             elif ptag == "layers":
@@ -333,8 +345,10 @@ def _parse_footprint_pads(board_path: Path) -> dict[str, dict[str, Any]]:
                             {
                                 "number": pad_number,
                                 "net": pad_net,
+                                "type": pad_type,
                                 "pintype": pad_pintype,
                                 "layers": pad_layers,
+                                "size": pad_size,
                                 "local_position": pad_local,
                             }
                         )
@@ -2850,6 +2864,13 @@ def detect_buses(
     board. Net names are cross-checked against the board's own pad nets (the
     ground truth); mismatches are reported in `stale_netlist_warnings` rather
     than refusing the run.
+
+    Confirmed-bus reuse (Phase 7.1): candidates matching a `confirmed_buses`
+    entry in `<board>.board_local.json` (same bus_type + identical net set,
+    written earlier via `record_confirmed_bus`) are marked `confirmed: true`
+    with their `confirmed_on` date (and `confirmed_name` when recorded), so a
+    caller only needs to present unconfirmed candidates to the user. Reading
+    that state file keeps this function read-only.
     """
     board_path, _, netlist_path = _resolve_project_path(project_path)
     ic_prefixes = tuple(p.strip().upper() for p in (ic_ref_prefixes or ["U", "IC", "Q"]))
@@ -3062,10 +3083,32 @@ def detect_buses(
             )
             group_claimed_nets.update(m["net"] for m in member_entries)
 
+    # Phase 7.1: reuse cached user confirmations from the board-local JSON so
+    # re-runs mark already-confirmed buses and only NEW candidates need the
+    # user's attention. Matching is exact (bus_type + identical net set) - a
+    # changed membership is a different bus and must be re-confirmed. Any
+    # problem reading the state file degrades to "nothing confirmed".
+    confirmed_lookup: dict[tuple[str, frozenset[str]], dict[str, Any]] = {}
+    try:
+        for entry in load_board_local(project_path)["data"].get("confirmed_buses", []):
+            if isinstance(entry, dict) and entry.get("nets"):
+                key = (str(entry.get("bus_type", "")), frozenset(str(n) for n in entry["nets"]))
+                confirmed_lookup[key] = entry
+    except Exception:  # pragma: no cover - defensive; unreadable state file
+        confirmed_lookup = {}
+    for cand in candidates:
+        entry = confirmed_lookup.get((cand["bus_type"], frozenset(m["net"] for m in cand["nets"])))
+        cand["confirmed"] = entry is not None
+        if entry is not None:
+            cand["confirmed_on"] = entry.get("confirmed_on")
+            if entry.get("name"):
+                cand["confirmed_name"] = entry["name"]
+
     return {
         "project_path": str(project_path),
         "candidate_count": len(candidates),
         "candidates": candidates,
+        "confirmed_count": sum(1 for c in candidates if c["confirmed"]),
         "stale_netlist_warnings": stale_netlist_warnings,
         "ic_ref_prefixes_used": list(ic_prefixes),
     }
@@ -3164,6 +3207,473 @@ def get_project_track_inventory(project_path: str | Path) -> dict[str, Any]:
             "Segments/arcs with width 0 inherit their width from the assigned "
             "netclass and are excluded from track_widths."
         )
+    return result
+
+
+# --- Phase 5: inter-trace ("area between the traces") corridor measurement ---
+
+
+def _convex_hull_area(points: list[tuple[float, float]]) -> float:
+    """Area of the convex hull of `points` (Andrew's monotone chain + shoelace).
+    Pure stdlib. Returns 0.0 for fewer than 3 distinct points (no area)."""
+    pts = sorted(set((round(px, 6), round(py, 6)) for px, py in points))
+    if len(pts) < 3:
+        return 0.0
+
+    def cross(o: tuple[float, float], a: tuple[float, float], b: tuple[float, float]) -> float:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: list[tuple[float, float]] = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper: list[tuple[float, float]] = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    hull = lower[:-1] + upper[:-1]
+    if len(hull) < 3:
+        return 0.0
+    area = 0.0
+    n = len(hull)
+    for i in range(n):
+        x1, y1 = hull[i]
+        x2, y2 = hull[(i + 1) % n]
+        area += x1 * y2 - x2 * y1
+    return abs(area) / 2.0
+
+
+def _perp_distance_to_axis(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
+    """Perpendicular distance of point (px,py) from the infinite line through
+    (ax,ay)->(bx,by). Degenerate (zero-length) axis falls back to point distance."""
+    dx = bx - ax
+    dy = by - ay
+    length = math.hypot(dx, dy)
+    if length < 1e-9:
+        return math.hypot(px - ax, py - ay)
+    return abs((px - ax) * dy - (py - ay) * dx) / length
+
+
+def _ic_set_for_net(net_name: str, net_map: dict[str, list[dict[str, str]]], ic_prefixes: tuple[str, ...]) -> set[str]:
+    return {n.get("ref", "").strip().upper() for n in net_map.get(net_name, []) if _ic_like_ref(n.get("ref", ""), ic_prefixes)}
+
+
+def _resolve_bus_spec(bus: Any, nets: Any, hub_ic: Any, bus_type: Any) -> dict[str, Any]:
+    """Normalize either a detect_buses candidate object (`bus`) or explicit
+    `nets`/`hub_ic` into {nets: [str], hub_hint, common_ics, bus_type, roles}."""
+    if bus is not None:
+        if not isinstance(bus, dict):
+            raise ValueError("bus must be a detect_buses candidate object (dict)")
+        raw = bus.get("nets", [])
+        net_names = [(n["net"] if isinstance(n, dict) else str(n)) for n in raw]
+        return {
+            "nets": net_names,
+            "hub_hint": hub_ic,
+            "common_ics": [str(c).strip().upper() for c in bus.get("common_ics", []) or []],
+            "bus_type": bus_type or bus.get("bus_type"),
+        }
+    if nets is None:
+        raise ValueError("provide either `bus` (a detect_buses candidate) or `nets` (a list of net names)")
+    net_names = [(n["net"] if isinstance(n, dict) else str(n)) for n in nets]
+    return {
+        "nets": net_names,
+        "hub_hint": hub_ic,
+        "common_ics": [],
+        "bus_type": bus_type,
+    }
+
+
+def _compute_bus_bundles(
+    project_path: str | Path,
+    bus: Any = None,
+    nets: Any = None,
+    hub_ic: Any = None,
+    bus_type: Any = None,
+    clip_band_mult: float | None = None,
+    station_step: float | None = None,
+    ic_ref_prefixes: list[str] | None = None,
+) -> dict[str, Any]:
+    """Core of Phase 5. Builds the anchor-and-corridor per-destination-IC bundles
+    and returns rich internal geometry (axis, centerline offset, per-net projected
+    segments) that both `measure_bus_corridor_areas` (public JSON) and
+    `get_trace_cost` (deviation term) consume. See `measure_bus_corridor_areas`
+    for the design/output description. Read-only."""
+    board_path, _, netlist_path = _resolve_project_path(project_path)
+    ic_prefixes = tuple(p.strip().upper() for p in (ic_ref_prefixes or ["U", "IC", "Q"]))
+
+    spec = _resolve_bus_spec(bus, nets, hub_ic, bus_type)
+    bus_nets = spec["nets"]
+    warnings: list[str] = []
+
+    settings = load_pcb_settings(project_path)["config"]
+    band_mult = float(clip_band_mult) if clip_band_mult is not None else float(settings.get("corridor", {}).get("clip_band_mult", 3.0))
+
+    netlist = _parse_nets_cached(netlist_path)
+    refs_map, net_map = _build_net_maps(netlist)
+    # Board-wide net participation per ref (the master/hub touches the most nets)
+    # - used only to break hub-selection ties among equally-common ICs.
+    design_net_count: dict[str, int] = {}
+    for ref, entries in refs_map.items():
+        design_net_count[ref.strip().upper()] = design_net_count.get(ref.strip().upper(), 0) + len({e["net"] for e in entries})
+
+    # Per-net IC membership and dominant width.
+    width_data = get_net_track_widths(project_path)
+    width_by_net = {e["net"]: e for e in width_data.get("nets", [])}
+    dom_widths: dict[float, int] = {}
+    for net_name in bus_nets:
+        dw = (width_by_net.get(net_name) or {}).get("dominant_width")
+        if dw:
+            dom_widths[dw] = dom_widths.get(dw, 0) + 1
+    dominant_width = max(dom_widths.items(), key=lambda kv: kv[1])[0] if dom_widths else 0.2
+    band = band_mult * dominant_width
+
+    net_ics = {net_name: _ic_set_for_net(net_name, net_map, ic_prefixes) for net_name in bus_nets}
+
+    # --- Hub selection (Step A) ---
+    hub = None
+    if spec["hub_hint"]:
+        hub = str(spec["hub_hint"]).strip().upper()
+    else:
+        candidate_ics = spec["common_ics"]
+        if not candidate_ics:
+            # intersection of IC sets over member nets
+            ic_sets = [s for s in net_ics.values() if s]
+            candidate_ics = sorted(set.intersection(*ic_sets)) if ic_sets else []
+        if candidate_ics:
+            # pick the IC on the most member nets; tie-broken by the ref that
+            # touches the most nets board-wide (the master/MCU), then by name.
+            def hub_key(ic: str) -> tuple[int, int, str]:
+                member_hits = sum(1 for s in net_ics.values() if ic in s)
+                return (-member_hits, -design_net_count.get(ic, 0), ic)
+            hub = min(candidate_ics, key=hub_key)
+
+    all_ics: set[str] = set()
+    for s in net_ics.values():
+        all_ics |= s
+    destinations = sorted(all_ics - ({hub} if hub else set()))
+
+    # Segments grouped by net (copper only; empty-net excluded), from the cache.
+    tracks = _parse_tracks_cached(board_path)
+    segs_by_net: dict[str, list[dict[str, Any]]] = {}
+    for seg in tracks["segments"] + tracks["arcs"]:
+        if seg["net"] in net_ics:
+            segs_by_net.setdefault(seg["net"], []).append(seg)
+
+    # union hull over all bus copper (all layers pooled), for the reference envelope.
+    union_points: list[tuple[float, float]] = []
+    for seg_list in segs_by_net.values():
+        for seg in seg_list:
+            union_points.append((seg["start"]["x"], seg["start"]["y"]))
+            union_points.append((seg["end"]["x"], seg["end"]["y"]))
+    union_hull_area = _convex_hull_area(union_points)
+
+    # Degenerate: no hub, or no destination IC on the board -> one un-grouped hull.
+    if hub is None or not destinations:
+        if hub is None:
+            warnings.append("no hub IC common to the bus nets; reporting one un-grouped hull (grouped:false)")
+        else:
+            warnings.append(f"hub {hub} has no destination IC on any bus net; reporting one un-grouped hull (grouped:false)")
+        return {
+            "bus_type": spec["bus_type"],
+            "hub_ic": hub,
+            "bundles": [],
+            "sum_of_bundle_areas_mm2": 0.0,
+            "union_hull_area_mm2": round(union_hull_area, 4),
+            "unassigned_segment_count": sum(len(v) for v in segs_by_net.values()),
+            "grouped": False,
+            "warnings": warnings,
+            "clip_band_mm": round(band, 4),
+        }
+
+    # Pad anchors (Step B).
+    footprints = _parse_footprint_pads_cached(board_path)
+    pads_by_ref: dict[str, list[dict[str, Any]]] = {}
+    for fp in footprints.values():
+        ref = fp.get("reference", "").strip().upper()
+        if ref:
+            pads_by_ref.setdefault(ref, []).extend(fp.get("pads", []))
+
+    def centroid_on_nets(ref: str, allowed_nets: set[str]) -> tuple[float, float] | None:
+        xs, ys = [], []
+        for pad in pads_by_ref.get(ref, []):
+            if pad.get("net") in allowed_nets:
+                xs.append(pad["position"]["x"])
+                ys.append(pad["position"]["y"])
+        if not xs:
+            return None
+        return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+    bus_net_set = set(bus_nets)
+    hub_pt = centroid_on_nets(hub, bus_net_set)
+
+    # Per-net role and bundle membership.
+    roles: dict[str, str] = {}
+    bundle_nets: dict[str, list[str]] = {D: [] for D in destinations}
+    for net_name in bus_nets:
+        dests_on_net = net_ics[net_name] - {hub}
+        if not dests_on_net:
+            roles[net_name] = "hub_only"
+        elif len(dests_on_net) == 1:
+            roles[net_name] = "dedicated"
+        else:
+            roles[net_name] = "shared"
+        for D in dests_on_net:
+            if D in bundle_nets:
+                bundle_nets[D].append(net_name)
+
+    dest_pt: dict[str, tuple[float, float] | None] = {}
+    for D in destinations:
+        dest_pt[D] = centroid_on_nets(D, set(bundle_nets[D]))
+
+    single_destination = len(destinations) == 1
+
+    # --- Step C: assign/clip copper to bundles ---
+    def midpoint(seg: dict[str, Any]) -> tuple[float, float]:
+        return ((seg["start"]["x"] + seg["end"]["x"]) / 2.0, (seg["start"]["y"] + seg["end"]["y"]) / 2.0)
+
+    assigned: dict[str, list[tuple[str, dict[str, Any]]]] = {D: [] for D in destinations}
+    unassigned_count = 0
+
+    # Precompute each bundle's axis unit vector for projection/perp tests.
+    axis_geom: dict[str, tuple[float, float, float, float, float]] = {}  # D -> (hx,hy,ux,uy,len)
+    for D in destinations:
+        dp = dest_pt.get(D)
+        if hub_pt is not None and dp is not None:
+            axl = math.hypot(dp[0] - hub_pt[0], dp[1] - hub_pt[1])
+            if axl > 1e-9:
+                axis_geom[D] = (hub_pt[0], hub_pt[1], (dp[0] - hub_pt[0]) / axl, (dp[1] - hub_pt[1]) / axl, axl)
+
+    # Dedicated + (single-destination) copper is assigned wholesale (seeds).
+    dedicated_by_dest: dict[str, list[dict[str, Any]]] = {D: [] for D in destinations}
+    shared_queue: list[tuple[str, dict[str, Any]]] = []
+    for net_name, seg_list in segs_by_net.items():
+        role = roles.get(net_name, "hub_only")
+        if role == "hub_only":
+            unassigned_count += len(seg_list)
+            continue
+        if role == "dedicated" or single_destination:
+            D = next(iter(net_ics[net_name] - {hub})) if role == "dedicated" else destinations[0]
+            if D in assigned:
+                for seg in seg_list:
+                    assigned[D].append((net_name, seg))
+                    dedicated_by_dest[D].append(seg)
+            else:
+                unassigned_count += len(seg_list)
+            continue
+        for seg in seg_list:
+            shared_queue.append((net_name, seg))
+
+    # Shared copper: assign each segment to the destination bundle whose axis its
+    # midpoint runs closest to (perpendicular distance), gated so it only joins a
+    # bundle where it physically runs with it - either its projection lies within
+    # the hub->dest span (extended by the pitch band), OR it sits within `band` of
+    # that bundle's dedicated copper. Segments matching no bundle are `unassigned`
+    # (the fan-out/transition copper), so nothing is silently dropped. (This is a
+    # per-segment nearest-axis + span/band gate rather than the plan's iterative
+    # "band of an already-assigned trace" propagation: contiguous-segment
+    # propagation pulled whole shared traces into a single bundle and defeated the
+    # per-destination clip on bowed real traces - see report.)
+    for net_name, seg in shared_queue:
+        mx, my = midpoint(seg)
+        best_D = None
+        best_perp = float("inf")
+        for D in bundle_nets:
+            if net_name not in bundle_nets[D] or D not in axis_geom:
+                continue
+            hx, hy, ux, uy, axl = axis_geom[D]
+            t = (mx - hx) * ux + (my - hy) * uy
+            perp = _perp_distance_to_axis(mx, my, hx, hy, hx + ux * axl, hy + uy * axl)
+            in_span = -band <= t <= axl + band
+            near_dedicated = any(
+                aseg["layer"] == seg["layer"]
+                and math.hypot(mx - midpoint(aseg)[0], my - midpoint(aseg)[1]) <= band
+                for aseg in dedicated_by_dest[D]
+            )
+            if (in_span or near_dedicated) and perp < best_perp:
+                best_perp = perp
+                best_D = D
+        if best_D is not None:
+            assigned[best_D].append((net_name, seg))
+        else:
+            unassigned_count += 1
+
+    # --- Step D: corridor + hull area per bundle ---
+    bundles_out: list[dict[str, Any]] = []
+    sum_bundle_area = 0.0
+    for D in destinations:
+        members = assigned[D]
+        dp = dest_pt.get(D)
+        distinct_nets = sorted({n for n, _ in members})
+        layers = sorted({seg["layer"] for _, seg in members})
+        if hub_pt is None or dp is None:
+            axis_len = 0.0
+        else:
+            axis_len = math.hypot(dp[0] - hub_pt[0], dp[1] - hub_pt[1])
+
+        corridor_area = 0.0
+        hull_area = 0.0
+        centerline_s = 0.0
+        net_segs: dict[str, list[dict[str, float]]] = {}
+
+        if hub_pt is not None and dp is not None and axis_len > 1e-9:
+            ux = (dp[0] - hub_pt[0]) / axis_len
+            uy = (dp[1] - hub_pt[1]) / axis_len
+            vx, vy = -uy, ux
+            # station step: fine enough but bounded to keep it cheap on long axes.
+            step = station_step if station_step else (dominant_width or 0.2)
+            if step <= 0:
+                step = 0.2
+            if axis_len / step > 2000:
+                step = axis_len / 2000.0
+
+            # project every assigned segment; accumulate per-net midpoint stats.
+            proj_by_layer: dict[str, list[tuple[str, float, float, float, float]]] = {}
+            all_s: list[tuple[float, float]] = []  # (s, length) for centerline
+            for net_name, seg in members:
+                p1, p2 = seg["start"], seg["end"]
+                t1 = (p1["x"] - hub_pt[0]) * ux + (p1["y"] - hub_pt[1]) * uy
+                s1 = (p1["x"] - hub_pt[0]) * vx + (p1["y"] - hub_pt[1]) * vy
+                t2 = (p2["x"] - hub_pt[0]) * ux + (p2["y"] - hub_pt[1]) * uy
+                s2 = (p2["x"] - hub_pt[0]) * vx + (p2["y"] - hub_pt[1]) * vy
+                proj_by_layer.setdefault(seg["layer"], []).append((net_name, t1, s1, t2, s2))
+                mid_s = (s1 + s2) / 2.0
+                seg_len = seg["length"]
+                all_s.append((mid_s, seg_len))
+                net_segs.setdefault(net_name, []).append({"s": mid_s, "length": seg_len})
+
+            total_len = sum(l for _, l in all_s)
+            centerline_s = (sum(s * l for s, l in all_s) / total_len) if total_len > 0 else 0.0
+
+            raw_points = [(seg["start"]["x"], seg["start"]["y"]) for _, seg in members]
+            raw_points += [(seg["end"]["x"], seg["end"]["y"]) for _, seg in members]
+            hull_area = _convex_hull_area(raw_points)
+
+            # corridor area: midpoint-rule stations along the axis, perpendicular
+            # spread across >=2 DISTINCT bundle nets at each station.
+            if len(distinct_nets) >= 2:
+                nslabs = max(1, int(math.ceil(axis_len / step)))
+                for layer_proj in proj_by_layer.values():
+                    for i in range(nslabs):
+                        ti = (i + 0.5) * step
+                        by_net_s: dict[str, list[float]] = {}
+                        for net_name, t1, s1, t2, s2 in layer_proj:
+                            lo, hi = (t1, t2) if t1 <= t2 else (t2, t1)
+                            if lo - 1e-9 <= ti <= hi + 1e-9:
+                                if abs(t2 - t1) < 1e-9:
+                                    sv = (s1 + s2) / 2.0
+                                else:
+                                    frac = (ti - t1) / (t2 - t1)
+                                    sv = s1 + frac * (s2 - s1)
+                                by_net_s.setdefault(net_name, []).append(sv)
+                        if len(by_net_s) >= 2:
+                            flat = [v for vs in by_net_s.values() for v in vs]
+                            corridor_area += (max(flat) - min(flat)) * step
+
+        trace_count = len(distinct_nets)
+        mean_spacing = (corridor_area / axis_len / (trace_count - 1)) if (axis_len > 0 and trace_count > 1 and corridor_area > 0) else 0.0
+        bend_ratio = round(hull_area / corridor_area, 4) if corridor_area > 1e-9 else None
+        sum_bundle_area += corridor_area
+
+        bundles_out.append(
+            {
+                "destination_ic": D,
+                "nets": [{"net": n, "role": roles.get(n, "shared")} for n in distinct_nets],
+                "trace_count": trace_count,
+                "axis": {
+                    "from": [round(hub_pt[0], 4), round(hub_pt[1], 4)] if hub_pt else None,
+                    "to": [round(dp[0], 4), round(dp[1], 4)] if dp else None,
+                },
+                "length_mm": round(axis_len, 4),
+                "corridor_area_mm2": round(corridor_area, 4),
+                "hull_area_mm2": round(hull_area, 4),
+                "bend_ratio": bend_ratio,
+                "mean_spacing_mm": round(mean_spacing, 4),
+                "layers": layers,
+                # internal geometry for the Phase 6 deviation term (stripped by
+                # measure_bus_corridor_areas before returning public JSON):
+                "_hub_pt": hub_pt,
+                "_dest_pt": dp,
+                "_centerline_s": centerline_s,
+                "_net_segs": net_segs,
+                "_axis_len": axis_len,
+            }
+        )
+
+    if union_hull_area and sum_bundle_area > union_hull_area * 1.001:
+        warnings.append(
+            "sum_of_bundle_areas exceeds union_hull (shared copper is counted once per bundle it serves - this is expected, not an error)"
+        )
+    multi_layer = sorted({seg["layer"] for v in segs_by_net.values() for seg in v})
+    if len(multi_layer) > 1:
+        warnings.append(f"bus copper spans {len(multi_layer)} layers {multi_layer}; corridor computed per layer then summed")
+
+    return {
+        "bus_type": spec["bus_type"],
+        "hub_ic": hub,
+        "bundles": bundles_out,
+        "sum_of_bundle_areas_mm2": round(sum_bundle_area, 4),
+        "union_hull_area_mm2": round(union_hull_area, 4),
+        "unassigned_segment_count": unassigned_count,
+        "grouped": True,
+        "warnings": warnings,
+        "clip_band_mm": round(band, 4),
+    }
+
+
+def measure_bus_corridor_areas(
+    project_path: str | Path,
+    bus: Any = None,
+    nets: Any = None,
+    hub_ic: Any = None,
+    bus_type: Any = None,
+    clip_band_mult: float | None = None,
+    station_step: float | None = None,
+    ic_ref_prefixes: list[str] | None = None,
+) -> dict[str, Any]:
+    """Phase 5: measure the routing-corridor area a bus bundle's traces enclose -
+    the "area between the traces" - PER destination IC, so a bus that fans out to
+    several ICs is measured as the sub-bundles that actually run together, not as
+    one inflated envelope.
+
+    Input is EITHER a `detect_buses` candidate object (`bus=`) or an explicit net
+    list (`nets=[...]`, optionally `hub_ic=`). Design ("anchor-and-corridor"):
+      - Roles (reuse Phase 3c): `hub_ic` is the IC common to all bus nets;
+        `destinations` are the other ICs; each bus net is `dedicated` (touches
+        only {hub, D}) or `shared` (hub + >=2 destinations).
+      - Anchors (reuse `_parse_footprint_pads`): hub/destination pad centroids on
+        the bus nets give each bundle an axis hub->dest to clip against.
+      - Clip (Step C): each shared net's copper is assigned to the nearest
+        destination axis, within a band (`clip_band_mult` x dominant trace width,
+        default from `corridor.clip_band_mult`) of an already-assigned trace of
+        that bundle; segments matching no bundle are reported as `unassigned`.
+      - Area (Step D): `corridor_area` = station-resampled perpendicular spread
+        along the axis (the literal inter-trace corridor, bend-insensitive);
+        `hull_area` = convex hull of the bundle's clipped copper (sanity bound,
+        always >= corridor); `bend_ratio` = hull/corridor. Computed per copper
+        layer then summed. A bundle needs >=2 distinct nets for a nonzero area.
+
+    Reports both `sum_of_bundle_areas_mm2` (shared copper counted once per bundle
+    it serves) and `union_hull_area_mm2` (whole-bus envelope) so shared-copper
+    double counting is explicit. Degenerate cases: single destination -> one
+    bundle, no clipping; no hub / no destination IC -> one un-grouped hull with
+    `grouped:false`. Pure stdlib geometry; read-only - nothing is written."""
+    result = _compute_bus_bundles(
+        project_path,
+        bus=bus,
+        nets=nets,
+        hub_ic=hub_ic,
+        bus_type=bus_type,
+        clip_band_mult=clip_band_mult,
+        station_step=station_step,
+        ic_ref_prefixes=ic_ref_prefixes,
+    )
+    # Strip the internal geometry keys (used only by get_trace_cost's deviation term).
+    for bundle in result.get("bundles", []):
+        for key in ("_hub_pt", "_dest_pt", "_centerline_s", "_net_segs", "_axis_len"):
+            bundle.pop(key, None)
+    result["project_path"] = str(project_path)
     return result
 
 
@@ -3595,6 +4105,92 @@ def _coerce_voltage(voltage: str | float | None) -> float | None:
         return None
 
 
+# Digit-V-digit convention (3V3 -> 3.3, 1V8 -> 1.8) tried before the plain
+# `_VOLTAGE_RE`-shaped alternative at each scan position, in one combined
+# regex, so a single "3V3" token is captured once by the more specific
+# branch instead of also partially matching the generic branch ("3V" -> 3.0)
+# and manufacturing a spurious second, lower candidate / false ambiguity.
+_NET_VOLTAGE_TOKEN_RE = re.compile(r"(\d+)[vV](\d+)|(\d+(?:\.\d+)?)\s*[vV](?![a-zA-Z])")
+
+
+def _infer_net_voltage(
+    net_name: str,
+    net_voltages: dict[str, Any] | None = None,
+    gnd_tokens: list[str] | None = None,
+) -> dict[str, Any]:
+    """Infer a net's voltage from its name (Phase 8.1). A standalone helper -
+    deliberately NOT buried inside the capacitor audit below - because later
+    phases (e.g. plane/zone voltage-mismatch warnings) are expected to reuse
+    it: `power_net_patterns` (Phase 7.2) says *whether* a net is power, this
+    says *what voltage*.
+
+    Applied to the net's basename (last '/'-segment, uppercased - the same
+    normalization `_normalize_net_basename` uses for role matching elsewhere
+    in this module). Precedence, first match wins:
+      1. `net_voltages` explicit override (exact, case-insensitive match) -
+         for names that carry no number at all (VBUS, AREF).
+      2. GND rule: basename contains any `gnd_tokens` token (case-insensitive
+         substring) -> 0.0 V. Covers GND_Main, GND_Safty, AGND... Beats a
+         label match on the same name (see 4 below).
+      3. Labeled voltage: `_VOLTAGE_RE` (12V_Main -> 12.0, 3.3v_Safty -> 3.3,
+         +5V -> 5.0) plus the 3V3/1V8 digit-V-digit convention. Multiple
+         distinct voltage tokens in one name -> the largest wins and
+         `ambiguous_label` is flagged.
+      4. Otherwise -> unlabeled (voltage None, source "none").
+
+    A net matching both a GND token and a voltage label (`GND_5V_RTN`) has
+    GND win per (2), but the row is still flagged `ambiguous_label` so the
+    collision stays visible instead of silently picking a side.
+
+    Returns `{"net", "basename", "voltage": float | None,
+    "source": "override" | "gnd" | "label" | "none", "ambiguous_label": bool}`
+    so a wrong guess is visible, never silent.
+    """
+    net_voltages = net_voltages or {}
+    gnd_tokens = gnd_tokens or []
+    basename = _normalize_net_basename(net_name)
+
+    overrides = {str(key).strip().upper(): value for key, value in net_voltages.items()}
+    if basename in overrides:
+        return {
+            "net": net_name,
+            "basename": basename,
+            "voltage": _coerce_voltage(overrides[basename]),
+            "source": "override",
+            "ambiguous_label": False,
+        }
+
+    is_gnd = any(str(token).strip().upper() in basename for token in gnd_tokens if str(token).strip())
+
+    candidates: list[float] = []
+    for match in _NET_VOLTAGE_TOKEN_RE.finditer(basename):
+        if match.group(1) is not None:
+            candidates.append(float(f"{match.group(1)}.{match.group(2)}"))
+        else:
+            candidates.append(float(match.group(3)))
+    label_voltage = max(candidates) if candidates else None
+
+    if is_gnd:
+        return {
+            "net": net_name,
+            "basename": basename,
+            "voltage": 0.0,
+            "source": "gnd",
+            "ambiguous_label": label_voltage is not None,
+        }
+
+    if label_voltage is not None:
+        return {
+            "net": net_name,
+            "basename": basename,
+            "voltage": label_voltage,
+            "source": "label",
+            "ambiguous_label": len(set(candidates)) > 1,
+        }
+
+    return {"net": net_name, "basename": basename, "voltage": None, "source": "none", "ambiguous_label": False}
+
+
 def audit_capacitor_voltages(project_path: str | Path, default_voltage: str | float | None = None) -> dict[str, Any]:
     """Check every unique capacitor value in the schematic for a voltage rating
     written into its Value field (e.g. "47uF 16V" vs. plain "0.1uf") - the
@@ -3654,6 +4250,234 @@ def audit_capacitor_voltages(project_path: str | Path, default_voltage: str | fl
         "with_voltage_count": len(with_voltage),
         "missing_voltage": missing_voltage,
         "with_voltage": with_voltage,
+    }
+
+
+_CAP_VERDICT_ORDER = [
+    "under_rated",
+    "unknown_rating",
+    "under_derated",
+    "ok",
+    "one_net_unlabeled",
+    "no_labeled_nets",
+    "unsupported_pins",
+]
+
+
+def audit_capacitor_net_voltages(project_path: str | Path) -> dict[str, Any]:
+    """Phase 8: net-aware capacitor voltage check. Extends
+    `audit_capacitor_voltages` (which only checks that a rating is *written*
+    into the Value field) by reading the netlist to find the two nets each
+    capacitor instance (`C<n>` reference convention, same as
+    `audit_capacitor_voltages`/`list_schematic_parts`) actually sits across,
+    inferring each net's voltage from its name (`_infer_net_voltage`, 8.1),
+    and comparing the capacitor's rated voltage against the *applied*
+    differential voltage |V(net_a) - V(net_b)| - the cap between a 12V and a
+    3.3V rail sees 8.7V, not 12V; a decoupler 12V_Main<->GND_Main sees 12V.
+
+    Knobs come from `pcb_settings.json`'s `schematic_checks.cap_voltage`
+    (`derating_min_ratio`, `gnd_tokens`, `net_voltages`, `default_cap_rating`)
+    via `load_pcb_settings` - Phase 6.1's schema, Phase 8.1/8.2 of
+    NETCLASS_PLAN.md.
+
+    Capacitor instances are read directly off the flattened schematic symbol
+    list (the same data `list_schematic_parts` groups by Value+Footprint),
+    filtered to the `C<n>` reference convention and with DNP instances
+    excluded - per-instance rather than per-group, because net topology is a
+    per-instance property: two capacitors that share a Value+Footprint can
+    still sit on completely different net pairs.
+
+    Per (non-DNP) capacitor instance:
+      - `unsupported_pins` - the netlist doesn't show exactly 2 pins for this
+        reference (arrays/4-terminal caps, or a reference missing from the
+        netlist altogether) - skipped from scoring.
+      - Both nets resolve to a voltage -> `applied_v` = |Va - Vb|, `rated_v`
+        from `_extract_voltage` on Value else `default_cap_rating`:
+          - `unknown_rating` - no rating anywhere (the cap worth chasing
+            first - listed right after hard failures),
+          - `under_rated`  - rated_v < applied_v (hard fail),
+          - `under_derated` - rated_v < derating_min_ratio * applied_v (works,
+            but violates derating policy),
+          - `ok` - rated_v >= derating_min_ratio * applied_v.
+      - Exactly one net resolves -> `one_net_unlabeled`, informational, with
+        `assumed_applied_v` = the resolved side vs. 0V (the common
+        rail<->signal decoupler case, labeled as an assumption).
+      - Neither net resolves -> `no_labeled_nets`, skipped from scoring but
+        counted.
+    A net matching both a GND token and a voltage label (`GND_5V_RTN`) flags
+    the row `ambiguous_label` (see `_infer_net_voltage`).
+
+    Read-only. Netlist staleness: the `.net` file is a schematic export and
+    can lag the board, so netlist net names are cross-checked against the
+    board's own pad nets (ground truth) and mismatches are reported in
+    `stale_netlist_warnings` - the same guard `detect_buses` uses - rather
+    than silently mis-scoring caps against a stale rail name.
+
+    Rows are sorted worst-first (`under_rated`, `unknown_rating`,
+    `under_derated`, `ok`, `one_net_unlabeled`, `no_labeled_nets`,
+    `unsupported_pins`), each reference, value, rated_v, both nets with their
+    inferred voltage + source, applied_v, required_min (= ratio x applied),
+    and verdict - plus summary counts and the settings actually used
+    (self-describing, like Phase 6's `weights_used`).
+    """
+    board_path, _, netlist_path = _resolve_project_path(project_path)
+    directory = _resolve_schematic_dir(project_path)
+
+    settings_result = load_pcb_settings(project_path)
+    cap_cfg = settings_result["config"]["schematic_checks"]["cap_voltage"]
+    ratio = float(cap_cfg.get("derating_min_ratio", 2.0))
+    gnd_tokens = list(cap_cfg.get("gnd_tokens", []))
+    net_voltages = dict(cap_cfg.get("net_voltages", {}))
+    default_cap_rating = cap_cfg.get("default_cap_rating")
+    default_rating_numeric = _coerce_voltage(default_cap_rating)
+
+    nets = _parse_nets_cached(netlist_path)
+    ref_to_nets, _ = _build_net_maps(nets)
+
+    # Netlist staleness guard (same pattern as detect_buses): cross-check
+    # netlist net names against the board's own pad nets (ground truth,
+    # independent of the schematic export) and warn on mismatch rather than
+    # refusing the run.
+    footprints = _parse_footprint_pads_cached(board_path)
+    board_net_names: set[str] = set()
+    for fp in footprints.values():
+        for pad in fp.get("pads", []):
+            pad_net = pad.get("net", "")
+            if pad_net:
+                board_net_names.add(pad_net)
+    netlist_net_names = {n.get("name", "") for n in nets if n.get("name")}
+    stale_netlist_warnings: list[str] = []
+    only_in_netlist = sorted(netlist_net_names - board_net_names)
+    only_on_board = sorted(board_net_names - netlist_net_names)
+    if only_in_netlist:
+        stale_netlist_warnings.append(
+            f"{len(only_in_netlist)} net(s) in the .net export have no matching pad net on the board "
+            f"(netlist may be stale - re-export from the schematic): {only_in_netlist[:20]}"
+        )
+    if only_on_board:
+        stale_netlist_warnings.append(
+            f"{len(only_on_board)} net(s) on the board's pads are absent from the .net export: {only_on_board[:20]}"
+        )
+
+    components = [
+        c
+        for c in _flatten_schematic_components(directory)
+        if not c["lib_id"].startswith("power:")
+        and not c["reference"].startswith("#")
+        and _CAPACITOR_REF_RE.match(c["reference"])
+        and not c["dnp"]
+    ]
+    components.sort(key=lambda c: _reference_sort_key(c["reference"]))
+
+    def _net_row(net_name: str) -> dict[str, Any]:
+        info = _infer_net_voltage(net_name, net_voltages, gnd_tokens)
+        return {
+            "name": net_name,
+            "voltage": info["voltage"],
+            "source": info["source"],
+            "ambiguous_label": info["ambiguous_label"],
+        }
+
+    rows: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+
+    for component in components:
+        ref = component["reference"]
+        value = component["value"]
+        nodes = ref_to_nets.get(ref, [])
+
+        extracted = _extract_voltage(value)
+        if extracted is not None:
+            rated_v_numeric = extracted[1]
+            rated_v_source = "value"
+        elif default_rating_numeric is not None:
+            rated_v_numeric = default_rating_numeric
+            rated_v_source = "default"
+        else:
+            rated_v_numeric = None
+            rated_v_source = "unknown"
+
+        if len(nodes) != 2:
+            verdict = "unsupported_pins"
+            row = {
+                "reference": ref,
+                "value": value,
+                "rated_v": rated_v_numeric,
+                "rated_v_source": rated_v_source,
+                "nets": [_net_row(node.get("net", "")) for node in nodes],
+                "applied_v": None,
+                "required_min": None,
+                "ambiguous_label": False,
+                "verdict": verdict,
+                "note": f"expected 2 netlist pins for a capacitor, found {len(nodes)}",
+            }
+            rows.append(row)
+            counts[verdict] = counts.get(verdict, 0) + 1
+            continue
+
+        net_a = _net_row(nodes[0].get("net", ""))
+        net_b = _net_row(nodes[1].get("net", ""))
+        ambiguous_label = bool(net_a["ambiguous_label"] or net_b["ambiguous_label"])
+        va, vb = net_a["voltage"], net_b["voltage"]
+
+        row = {
+            "reference": ref,
+            "value": value,
+            "rated_v": rated_v_numeric,
+            "rated_v_source": rated_v_source,
+            "nets": [net_a, net_b],
+            "ambiguous_label": ambiguous_label,
+        }
+
+        if va is not None and vb is not None:
+            applied_v = abs(va - vb)
+            required_min = ratio * applied_v
+            row["applied_v"] = applied_v
+            row["required_min"] = required_min
+            if rated_v_numeric is None:
+                verdict = "unknown_rating"
+            elif rated_v_numeric < applied_v:
+                verdict = "under_rated"
+            elif rated_v_numeric < required_min:
+                verdict = "under_derated"
+            else:
+                verdict = "ok"
+        elif va is not None or vb is not None:
+            resolved = va if va is not None else vb
+            row["applied_v"] = None
+            row["required_min"] = None
+            row["assumed_applied_v"] = resolved
+            verdict = "one_net_unlabeled"
+        else:
+            row["applied_v"] = None
+            row["required_min"] = None
+            verdict = "no_labeled_nets"
+
+        row["verdict"] = verdict
+        rows.append(row)
+        counts[verdict] = counts.get(verdict, 0) + 1
+
+    order_index = {verdict: i for i, verdict in enumerate(_CAP_VERDICT_ORDER)}
+    rows.sort(key=lambda r: (order_index.get(r["verdict"], len(_CAP_VERDICT_ORDER)), _reference_sort_key(r["reference"])))
+
+    summary = {verdict: counts.get(verdict, 0) for verdict in _CAP_VERDICT_ORDER}
+    summary["total"] = len(rows)
+
+    return {
+        "schematic_dir": str(directory),
+        "netlist_path": str(netlist_path),
+        "capacitor_count": len(rows),
+        "summary": summary,
+        "settings_used": {
+            "settings_path": settings_result["settings_path"],
+            "loaded_from_file": settings_result["loaded_from_file"],
+            "derating_min_ratio": ratio,
+            "gnd_tokens": gnd_tokens,
+            "net_voltages": net_voltages,
+            "default_cap_rating": default_cap_rating,
+        },
+        "stale_netlist_warnings": stale_netlist_warnings,
+        "capacitors": rows,
     }
 
 
@@ -4086,6 +4910,31 @@ DEFAULT_PCB_SETTINGS: dict[str, Any] = {
             ],
         },
     },
+    "high_speed": {
+        "bus_frequencies_mhz": {
+            "SPI": 20,
+            "QSPI": 80,
+            "I2C": 0.4,
+            "I2S": 12,
+            "UART": 1,
+            "CAN": 1,
+            "USB": 480,
+            "MIPI": 1000,
+            "DDR": 800,
+            "SWD": 4,
+            "JTAG": 10,
+            "CLK": 25,
+        },
+        "velocity_fraction": 0.5,
+        "rise_fraction": 0.05,
+        "critical_length_overrides_mm": {},
+        "critical_fraction": 0.9,
+        "length_weight_mult": 4.0,
+    },
+    "switch_node": {
+        "min_inductor_mm": 2.0,
+        "length_weight_mult": 8.0,
+    },
 }
 
 
@@ -4200,6 +5049,471 @@ def init_pcb_settings(project_path: str | Path, write: bool = False, overwrite: 
     return result
 
 
+# --- Phase 7.1: board-local state JSON (<board>.board_local.json) -----------
+#
+# Companion to pcb_settings.json with the opposite contract: pcb_settings.json
+# is shareable POLICY (weights, multipliers) and is committed; the board-local
+# file is the STATE of this working board (autorouter-owned copper uuids,
+# keepouts, per-net overrides, cached user bus confirmations, last route
+# session) and is gitignored - disposable, machine-local.
+
+
+def _board_local_path(project_path: str | Path) -> Path:
+    board_path, _, _ = _resolve_project_path(project_path)
+    return board_path.with_name(f"{board_path.stem}.board_local.json")
+
+
+def load_board_local(project_path: str | Path) -> dict[str, Any]:
+    """Load `<board_stem>.board_local.json` from next to the board file,
+    mirroring `load_pcb_settings` but deep-merged over `{}` - there are no
+    in-code defaults for per-board state, so the effective data is simply the
+    file's contents (deep-copied). A missing file is not an error: every
+    caller works from an empty state out of the box.
+
+    Schema-tolerant by design: the known keys are `version`,
+    `autorouter_owned` ({segments, vias} uuid lists), `keepouts`,
+    `net_overrides`, `confirmed_buses`, `last_route_session` - but unknown
+    keys are preserved verbatim so newer/older tool versions can share the
+    file without destroying each other's state.
+    """
+    state_path = _board_local_path(project_path)
+    file_data: dict[str, Any] = {}
+    loaded_from_file = False
+    if state_path.exists():
+        try:
+            file_data = json.loads(state_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ValueError(f"Failed to parse {state_path}: {exc}") from exc
+        if not isinstance(file_data, dict):
+            raise ValueError(f"{state_path} must contain a JSON object at the top level")
+        loaded_from_file = True
+
+    return {
+        "board_local_path": str(state_path),
+        "loaded_from_file": loaded_from_file,
+        "data": _deep_merge_settings({}, file_data),
+    }
+
+
+def save_board_local(project_path: str | Path, data: dict[str, Any]) -> dict[str, Any]:
+    """Write `data` verbatim to `<board_stem>.board_local.json` (plain JSON,
+    indent=2, LF newlines - our own file, not KiCad's, so no s-expr surgery
+    and no board-lock concern). Callers that update a single key should
+    load-modify-save so unknown keys written by other tools survive.
+    """
+    if not isinstance(data, dict):
+        raise ValueError(f"board-local data must be a dict, got {type(data).__name__}")
+    state_path = _board_local_path(project_path)
+    content = json.dumps(data, indent=2) + "\n"
+    with state_path.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(content)
+    return {"board_local_path": str(state_path), "written": True}
+
+
+def record_confirmed_bus(project_path: str | Path, candidate: dict[str, Any], name: str | None = None) -> dict[str, Any]:
+    """Cache a user-confirmed bus in the board-local JSON's `confirmed_buses`
+    list so `detect_buses` re-runs mark it `confirmed:true` and only present
+    genuinely NEW candidates for confirmation. `candidate` is a
+    `detect_buses` candidate object (its `nets` entries may be member dicts
+    or plain net-name strings). An existing entry with the same bus_type and
+    net set is replaced (re-confirming updates the name/date), never
+    duplicated.
+    """
+    member_nets: list[str] = []
+    for member in candidate.get("nets", []):
+        member_nets.append(member["net"] if isinstance(member, dict) else str(member))
+    if not member_nets:
+        raise ValueError("candidate has no nets to confirm")
+    bus_type = str(candidate.get("bus_type", "")) or "BUS"
+    common_ics = candidate.get("common_ics") or []
+    entry = {
+        "bus_type": bus_type,
+        "nets": sorted(member_nets),
+        "hub_ic": common_ics[0] if common_ics else None,
+        "name": name or candidate.get("suggested_class_name") or bus_type,
+        "confirmed_on": _date.today().isoformat(),
+    }
+
+    state = load_board_local(project_path)
+    data = state["data"]
+    data.setdefault("version", 1)
+    confirmed: list[Any] = data.setdefault("confirmed_buses", [])
+    net_set = frozenset(entry["nets"])
+    replaced = False
+    for i, existing in enumerate(confirmed):
+        if (
+            isinstance(existing, dict)
+            and str(existing.get("bus_type", "")) == bus_type
+            and frozenset(str(n) for n in existing.get("nets", [])) == net_set
+        ):
+            confirmed[i] = entry
+            replaced = True
+            break
+    if not replaced:
+        confirmed.append(entry)
+    save_board_local(project_path, data)
+    return {
+        "board_local_path": state["board_local_path"],
+        "entry": entry,
+        "replaced_existing": replaced,
+        "confirmed_bus_count": len(confirmed),
+    }
+
+
+# --- Phase 7.2: layer purposes from the board file --------------------------
+
+
+def _parse_board_layers(board_path: str | Path) -> list[dict[str, Any]]:
+    """Parse the board's own top-level `(layers ...)` block into the copper
+    stack: one `{name, ordinal, type, user_name}` per copper (`*.Cu`) layer,
+    in file order (which is KiCad's physical stack order, front to back -
+    the ordinals themselves are NOT stack-ordered in KiCad 9/10 files).
+    `type` is KiCad's own designation: signal | power | mixed | jumper (a
+    `user`-typed copper layer would be reported too, but gets no cost
+    treatment anywhere - unknown/user types are a router no-go, not a cost).
+    """
+    text = _read_text(Path(board_path))
+    open_idx = text.find("(layers")
+    if open_idx == -1:
+        return []
+    close_idx = _find_matching_paren(text, open_idx)
+    block = SexprParser(text[open_idx : close_idx + 1]).parse()
+
+    layers: list[dict[str, Any]] = []
+    for entry in block[1:] if isinstance(block, list) else []:
+        if not isinstance(entry, list) or len(entry) < 3:
+            continue
+        try:
+            ordinal = int(str(entry[0]))
+        except ValueError:
+            continue
+        layer_name = str(entry[1])
+        if not layer_name.endswith(".Cu"):
+            continue
+        layers.append(
+            {
+                "name": layer_name,
+                "ordinal": ordinal,
+                "type": str(entry[2]),
+                "user_name": str(entry[3]) if len(entry) >= 4 else None,
+            }
+        )
+    return layers
+
+
+def _parse_board_layers_cached(board_path: Path) -> list[dict[str, Any]]:
+    stat = board_path.stat()
+    key = str(board_path)
+    cached = _board_layers_cache.get(key)
+    if cached is not None and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+        return cached[2]
+    layers = _parse_board_layers(board_path)
+    _board_layers_cache[key] = (stat.st_mtime, stat.st_size, layers)
+    return layers
+
+
+def get_board_layers(project_path: str | Path) -> dict[str, Any]:
+    """Public wrapper over `_parse_board_layers_cached` for the MCP tool:
+    the board's copper stack with each layer's KiCad-designated purpose."""
+    board_path, _, _ = _resolve_project_path(project_path)
+    layers = _parse_board_layers_cached(board_path)
+    type_counts: dict[str, int] = {}
+    for layer in layers:
+        type_counts[layer["type"]] = type_counts.get(layer["type"], 0) + 1
+    return {
+        "board_path": str(board_path),
+        "copper_layer_count": len(layers),
+        "layers": layers,
+        "type_counts": type_counts,
+    }
+
+
+def _net_kind(
+    net_name: str,
+    netclass: str | None = None,
+    power_net_patterns: list[str] | None = None,
+) -> str:
+    """Classify a net as "power" or "signal" for layer-purpose costing.
+
+    "power" when the net's name matches any regex in
+    `layer_purpose.power_net_patterns` (from pcb_settings; defaults used when
+    None is passed) - patterns are tried against both the full hierarchical
+    name and its last path segment, so anchored patterns like `^GND` still
+    catch `/Power/GND` - or when the net's netclass name itself indicates a
+    supply class (power/pwr/gnd/ground/supply, case-insensitive).
+    """
+    patterns = (
+        power_net_patterns
+        if power_net_patterns is not None
+        else DEFAULT_PCB_SETTINGS["layer_purpose"]["power_net_patterns"]
+    )
+    basename = net_name.rsplit("/", 1)[-1]
+    for pattern in patterns:
+        try:
+            rx = re.compile(str(pattern))
+        except re.error:
+            continue
+        if rx.search(net_name) or rx.search(basename):
+            return "power"
+    if netclass and re.search(r"power|pwr|gnd|ground|supply", netclass, re.IGNORECASE):
+        return "power"
+    return "signal"
+
+
+def classify_critical_nets(project_path: str | Path) -> dict[str, Any]:
+    """Phase 9: High-speed and critical-net classification.
+
+    Classifies nets as critical based on three sources:
+    1. **Bus/net-name high-speed table**: Bus types from `detect_buses` (SPI,
+       QSPI, etc.) and name tokens (CLK, MCLK, etc.) map to a typical frequency
+       via `high_speed.bus_frequencies_mhz` settings.
+    2. **XTAL nets**: Nets touching a crystal/resonator (ref Y*/X* or
+       footprint/lib name containing crystal/resonator/osc tokens) are always
+       critical with the highest length weight.
+    3. **Switching-supply inductors**: An L* component whose footprint courtyard
+       exceeds `switch_node.min_inductor_mm` on both axes with one terminal net
+       reaching an IC pin -> that terminal net is a switch node with an 8x length
+       weight multiplier.
+
+    For each critical net, computes:
+    - `critical: true` marker
+    - `reason`: one of "bus_frequency", "xtal", or "switch_node"
+    - `frequency_mhz`: the classified frequency
+    - `l_crit_mm`: critical length = v * t_rise / 6 (physics formula)
+    - `straight_line_mm`: distance between net's connection points
+    - `stack_up_gate`: whether straight_line >= 0.9 * l_crit
+    - `multiplier`: per-net length-weight multiplier for `get_trace_cost`
+
+    Returns a dict with:
+    - `critical_nets`: list of classification records (one per critical net)
+    - `l_crit_table`: resolved L_crit values per bus type
+    - `settings_snapshot`: high_speed + switch_node config used
+    """
+    settings = load_pcb_settings(project_path)["config"]
+    high_speed_cfg = settings.get("high_speed", {})
+    switch_node_cfg = settings.get("switch_node", {})
+
+    bus_frequencies_mhz = high_speed_cfg.get("bus_frequencies_mhz", {})
+    velocity_fraction = float(high_speed_cfg.get("velocity_fraction", 0.5))
+    rise_fraction = float(high_speed_cfg.get("rise_fraction", 0.05))
+    critical_length_overrides_mm = high_speed_cfg.get("critical_length_overrides_mm", {})
+    critical_fraction = float(high_speed_cfg.get("critical_fraction", 0.9))
+    hs_length_weight = float(high_speed_cfg.get("length_weight_mult", 4.0))
+
+    min_inductor_mm = float(switch_node_cfg.get("min_inductor_mm", 2.0))
+    switch_length_weight = float(switch_node_cfg.get("length_weight_mult", 8.0))
+
+    # Speed of light in vacuum [mm/ns]
+    C_LIGHT_MM_PER_NS = 299.792
+    # Compute v = c * velocity_fraction [mm/ns]
+    velocity = C_LIGHT_MM_PER_NS * velocity_fraction
+
+    board_path, _, netlist_path = _resolve_project_path(project_path)
+
+    # Parse board components and nets
+    components = _parse_board_components_cached(board_path)
+    nets = _parse_nets_cached(netlist_path)
+    footprints = _parse_footprint_pads_cached(board_path)
+    _, net_map = _build_net_maps(nets)
+
+    # Build a map: component reference -> component info
+    comp_by_ref = {c.get("reference", ""): c for c in components}
+
+    # Compute L_crit values per bus type (physics formula)
+    # L_crit = v * t_rise / 6, where t_rise = rise_fraction / f
+    # -> L_crit = v * (rise_fraction / f) / 6
+    l_crit_table: dict[str, float] = {}
+    for bus_type, freq_mhz in bus_frequencies_mhz.items():
+        if bus_type in critical_length_overrides_mm:
+            l_crit_table[bus_type] = float(critical_length_overrides_mm[bus_type])
+        elif freq_mhz > 0:
+            t_rise = rise_fraction / freq_mhz  # in microseconds
+            l_crit = velocity * (t_rise * 1000) / 6  # convert to ns, compute in mm
+            l_crit_table[bus_type] = round(l_crit, 3)
+        else:
+            l_crit_table[bus_type] = 0.0
+
+    # Detect buses to find high-speed bus nets
+    try:
+        detected_buses = detect_buses(project_path)
+    except Exception:
+        detected_buses = {"candidates": []}
+
+    # Build set of nets on high-speed buses
+    bus_nets_by_type: dict[str, set[str]] = {}
+    for cand in detected_buses.get("candidates", []):
+        if not cand.get("qualified"):
+            continue
+        bus_type = cand.get("bus_type", "")
+        if bus_type in bus_frequencies_mhz:
+            members = cand.get("members", [])
+            for member in members:
+                net_name = member.get("net", "")
+                if net_name:
+                    bus_nets_by_type.setdefault(bus_type, set()).add(net_name)
+
+    # Detect XTAL nets: component refs Y*/X* or footprint names with xtal/resonator/osc tokens
+    xtal_nets: set[str] = set()
+    xtal_tokens = {"XTAL", "CRYSTAL", "RESONATOR", "OSC"}
+    for comp in components:
+        ref = comp.get("reference", "").upper()
+        footprint = comp.get("footprint", "").upper()
+        if ref.startswith(("Y", "X")) or any(token in footprint for token in xtal_tokens):
+            # Get all nets connected to this component
+            nets_for_comp = net_map.get(ref, [])
+            for node in nets_for_comp:
+                net_name = node.get("net", "")
+                if net_name:
+                    xtal_nets.add(net_name)
+
+    # Detect switch nodes: inductors whose footprint size >= min_inductor_mm on both axes
+    # and which have one terminal net touching an IC pin
+    switch_node_nets: set[str] = set()
+    for comp in components:
+        ref = comp.get("reference", "").upper()
+        if not ref.startswith("L"):
+            continue
+        # Get footprint from component's uuid
+        fp_uuid = comp.get("uuid", "")
+        if not fp_uuid:
+            continue
+        fp = footprints.get(fp_uuid)
+        if not fp:
+            continue
+
+        # Check footprint courtyard size: both x and y must be >= min_inductor_mm
+        # For now, use pad positions as a proxy for footprint size
+        pads = fp.get("pads", [])
+        if len(pads) < 2:
+            continue
+
+        # Compute bounding box from pad positions
+        if pads:
+            xs = [p.get("position", {}).get("x", 0) for p in pads]
+            ys = [p.get("position", {}).get("y", 0) for p in pads]
+            bbox_width = max(xs) - min(xs) if xs else 0
+            bbox_height = max(ys) - min(ys) if ys else 0
+
+            # Both axes must exceed min_inductor_mm
+            if bbox_width >= min_inductor_mm and bbox_height >= min_inductor_mm:
+                # Check if any pad's net connects to an IC pin
+                for pad in pads:
+                    pad_net = pad.get("net", "")
+                    if pad_net and pad_net in net_map:
+                        # Check if this net touches any IC pins
+                        for node in net_map[pad_net]:
+                            node_ref = node.get("ref", "").upper()
+                            if node_ref.startswith(("U", "IC", "Q")):
+                                switch_node_nets.add(pad_net)
+
+    # Build classification records
+    critical_records: list[dict[str, Any]] = []
+    seen_nets: set[str] = set()
+
+    # Add bus nets
+    for bus_type, nets_set in bus_nets_by_type.items():
+        freq_mhz = bus_frequencies_mhz.get(bus_type, 0)
+        l_crit = l_crit_table.get(bus_type, 0.0)
+        for net_name in nets_set:
+            if net_name not in seen_nets:
+                # Estimate straight-line distance (placeholder for now)
+                straight_line = _estimate_net_straight_line(net_name, net_map, comp_by_ref)
+                stack_up_gate = straight_line >= (critical_fraction * l_crit) if l_crit > 0 else False
+                critical_records.append({
+                    "net": net_name,
+                    "critical": True,
+                    "reason": "bus_frequency",
+                    "frequency_mhz": freq_mhz,
+                    "l_crit_mm": l_crit,
+                    "straight_line_mm": straight_line,
+                    "stack_up_gate": stack_up_gate,
+                    "multiplier": hs_length_weight,
+                })
+                seen_nets.add(net_name)
+
+    # Add XTAL nets
+    for net_name in xtal_nets:
+        if net_name not in seen_nets:
+            freq_mhz = bus_frequencies_mhz.get("CLK", 25)
+            l_crit = l_crit_table.get("CLK", 0.0)
+            straight_line = _estimate_net_straight_line(net_name, net_map, comp_by_ref)
+            stack_up_gate = straight_line >= (critical_fraction * l_crit) if l_crit > 0 else False
+            critical_records.append({
+                "net": net_name,
+                "critical": True,
+                "reason": "xtal",
+                "frequency_mhz": freq_mhz,
+                "l_crit_mm": l_crit,
+                "straight_line_mm": straight_line,
+                "stack_up_gate": stack_up_gate,
+                "multiplier": switch_length_weight,  # XTAL uses highest weight
+            })
+            seen_nets.add(net_name)
+
+    # Add switch nodes
+    for net_name in switch_node_nets:
+        if net_name not in seen_nets:
+            critical_records.append({
+                "net": net_name,
+                "critical": True,
+                "reason": "switch_node",
+                "frequency_mhz": 0,  # Not frequency-based
+                "l_crit_mm": 0.0,
+                "straight_line_mm": 0.0,
+                "stack_up_gate": False,
+                "multiplier": switch_length_weight,
+            })
+            seen_nets.add(net_name)
+
+    return {
+        "critical_nets": critical_records,
+        "l_crit_table": l_crit_table,
+        "settings_snapshot": {
+            "high_speed": dict(high_speed_cfg),
+            "switch_node": dict(switch_node_cfg),
+        },
+    }
+
+
+def _estimate_net_straight_line(
+    net_name: str,
+    net_map: dict[str, list[dict[str, str]]],
+    comp_by_ref: dict[str, dict[str, Any]],
+) -> float:
+    """Estimate the straight-line distance between connection points of a net.
+
+    Uses the positions of components connected to this net. If only one or zero
+    components connected, returns 0. If multiple, returns distance between the
+    two most-distant connection points.
+    """
+    nodes = net_map.get(net_name, [])
+    positions: list[tuple[float, float]] = []
+
+    for node in nodes:
+        ref = node.get("ref", "")
+        if ref:
+            comp = comp_by_ref.get(ref)
+            if comp:
+                pos = comp.get("position", {})
+                x = pos.get("x", 0.0)
+                y = pos.get("y", 0.0)
+                positions.append((x, y))
+
+    if len(positions) < 2:
+        return 0.0
+
+    # Find max distance between any two positions
+    max_dist = 0.0
+    for i in range(len(positions)):
+        for j in range(i + 1, len(positions)):
+            x1, y1 = positions[i]
+            x2, y2 = positions[j]
+            dist = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+            max_dist = max(max_dist, dist)
+
+    return round(max_dist, 3)
+
+
 def get_trace_cost(project_path: str | Path, net: str | None = None) -> dict[str, Any]:
     """Score routed copper with the Phase 6.2 cost model: length cost (copper
     length x `weights.length_mm`), via cost (via count x `weights.via` x the
@@ -4207,12 +5521,31 @@ def get_trace_cost(project_path: str | Path, net: str | None = None) -> dict[str
     through-hole, so `via_weights.through` applies uniformly), and layer_span
     cost ((layers_used - 1) x `weights.layer_span`).
 
-    Deviation terms are STUBBED in this build (Phase 5 - bus-corridor
-    geometry - hasn't landed yet): every net reports `on_bus: false`, `bundle:
-    null`, and a deviation cost equal to `trace_cost.non_bus_deviation`
-    (default 0.0), exactly per the plan's Phase 6.3 fallback so the model
-    degrades cleanly to length+vias+span for every net until Phase 5 unstubs
-    it net-by-net.
+    Deviation term (Phase 5 unstub): when a net belongs to a detected, qualified
+    bus bundle (via `detect_buses` + `measure_bus_corridor_areas`), the deviation
+    cost is added per `trace_cost.deviation.metric`:
+      - `mean_perp_distance` / `max_perp_distance` = mean/max perpendicular
+        distance of the net's segment midpoints from the bundle centerline
+        (`deviation.reference`: `bus_centerline` = the bundle's mean offset, or
+        `straight_line` = the hub->dest pad axis); cost = `weights.deviation_mm`
+        x value.
+      - `excess_length` = `weights.excess_length` x max(actual_length /
+        direct(hub->dest pad axis) - 1, 0).
+    A net on several bundles (a shared SCK/MOSI) is measured against each and
+    rolled up with the metric's aggregate (max for max_perp/excess_length,
+    length-weighted mean for mean_perp). Such nets report `on_bus:true` plus a
+    `bundle` object; non-bundle nets keep the stub behavior (`on_bus:false`,
+    `bundle:null`, deviation = `trace_cost.non_bus_deviation`, default 0.0).
+
+    Layer-purpose penalty (Phase 7.2): each net gets a `net_kind` ("power"
+    when its name matches `layer_purpose.power_net_patterns`, else "signal"),
+    its copper length is broken down per layer, and `layer_penalty` = sum over
+    layers of length_on_layer x (`layer_purpose[net_kind][layer_type]` - 1) x
+    `weights.length_mm` - the EXTRA cost existing copper incurs for sitting on
+    wrong-purpose layers (a signal net crossing a `power` inner layer at the
+    default 4.0 multiplier pays 3x length weight extra there; copper on the
+    right-purpose layer, multiplier 1.0, adds nothing). Layers of unknown or
+    `user` type get no penalty here - they're a router concern, not a cost.
 
     `net=None` returns every routed net ranked worst-cost-first, plus board
     totals and the `weights_used` block actually applied (so a result is
@@ -4224,39 +5557,166 @@ def get_trace_cost(project_path: str | Path, net: str | None = None) -> dict[str
     via_weights = trace_cost_cfg["via_weights"]
     non_bus_deviation = float(trace_cost_cfg.get("non_bus_deviation", 0.0))
     through_via_weight = float(via_weights.get("through", 1.0))
+    deviation_cfg = trace_cost_cfg.get("deviation", {})
+    metric = deviation_cfg.get("metric", "mean_perp_distance")
+    reference = deviation_cfg.get("reference", "bus_centerline")
+
+    # Phase 7.2: layer purposes + per-net per-layer copper breakdown.
+    board_path, _, _ = _resolve_project_path(project_path)
+    layer_purpose_cfg = settings.get("layer_purpose", {})
+    power_patterns = layer_purpose_cfg.get("power_net_patterns", [])
+    layer_types = {layer["name"]: layer["type"] for layer in _parse_board_layers_cached(board_path)}
+    tracks = _parse_tracks_cached(board_path)
+    layer_lengths_by_net: dict[str, dict[str, float]] = {}
+    for seg in tracks["segments"] + tracks["arcs"]:
+        seg_net = seg["net"]
+        if not seg_net:
+            continue
+        per_layer = layer_lengths_by_net.setdefault(seg_net, {})
+        per_layer[seg["layer"]] = per_layer.get(seg["layer"], 0.0) + seg["length"]
+
+    # Build net -> bundle memberships from every qualified detected bus. Failure
+    # to detect (e.g. no netlist) degrades cleanly to the non-bus behavior.
+    net_membership: dict[str, list[dict[str, Any]]] = {}
+    try:
+        detected = detect_buses(project_path)
+    except Exception:  # pragma: no cover - defensive
+        detected = {"candidates": []}
+    for cand in detected.get("candidates", []):
+        if not cand.get("qualified"):
+            continue
+        try:
+            binfo = _compute_bus_bundles(project_path, bus=cand)
+        except Exception:  # pragma: no cover - defensive
+            continue
+        if not binfo.get("grouped"):
+            continue
+        for bundle in binfo["bundles"]:
+            role_by_net = {n["net"]: n["role"] for n in bundle["nets"]}
+            for net_name, segs in bundle.get("_net_segs", {}).items():
+                net_membership.setdefault(net_name, []).append(
+                    {
+                        "bus_type": binfo["bus_type"],
+                        "hub_ic": binfo["hub_ic"],
+                        "destination_ic": bundle["destination_ic"],
+                        "role": role_by_net.get(net_name, "shared"),
+                        "segs": segs,
+                        "centerline_s": bundle["_centerline_s"],
+                        "axis_len": bundle["_axis_len"],
+                    }
+                )
 
     width_data = get_net_track_widths(project_path)
     entries = width_data["nets"]
+
+    # Phase 9: Load critical nets classification and build a lookup by net name
+    critical_by_net: dict[str, dict[str, Any]] = {}
+    try:
+        critical_result = classify_critical_nets(project_path)
+        for rec in critical_result.get("critical_nets", []):
+            critical_by_net[rec["net"]] = rec
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+    def _deviation(net_name: str, length_mm: float) -> tuple[float, dict[str, Any] | None]:
+        memberships = net_membership.get(net_name)
+        if not memberships:
+            return non_bus_deviation, None
+
+        per_bundle: list[dict[str, Any]] = []
+        for m in memberships:
+            center = m["centerline_s"] if reference == "bus_centerline" else 0.0
+            perp_vals = [(abs(s["s"] - center), s["length"]) for s in m["segs"]]
+            net_len = sum(l for _, l in perp_vals) or 1.0
+            b_mean = sum(v * l for v, l in perp_vals) / net_len
+            b_max = max((v for v, _ in perp_vals), default=0.0)
+            axl = m["axis_len"]
+            excess = max(length_mm / axl - 1.0, 0.0) if axl > 1e-9 else 0.0
+            per_bundle.append(
+                {"destination_ic": m["destination_ic"], "mean": b_mean, "max": b_max, "excess": excess, "net_len": net_len}
+            )
+
+        if metric == "excess_length":
+            value = max(b["excess"] for b in per_bundle)
+            cost = weights["excess_length"] * value
+        elif metric == "max_perp_distance":
+            value = max(b["max"] for b in per_bundle)
+            cost = weights["deviation_mm"] * value
+        else:  # mean_perp_distance (default)
+            wsum = sum(b["net_len"] for b in per_bundle) or 1.0
+            value = sum(b["mean"] * b["net_len"] for b in per_bundle) / wsum
+            cost = weights["deviation_mm"] * value
+
+        roles = {m["role"] for m in memberships}
+        bundle_obj = {
+            "bus_type": memberships[0]["bus_type"],
+            "hub_ic": memberships[0]["hub_ic"],
+            "destinations": [m["destination_ic"] for m in memberships],
+            "role": "shared" if "shared" in roles or len(memberships) > 1 else next(iter(roles)),
+            "metric": metric,
+            "reference": reference,
+            "deviation_value": round(value, 4),
+        }
+        return cost, bundle_obj
 
     def build(entry: dict[str, Any]) -> dict[str, Any]:
         via_count = sum(entry.get("via_sizes", {}).values())
         length_mm = float(entry.get("total_length_mm", 0.0))
         layers_used = len(entry.get("layers", []) or [])
 
-        length_cost = weights["length_mm"] * length_mm
+        # Phase 9: Apply critical net length multiplier if this net is critical
+        net_name = entry["net"]
+        critical_info = critical_by_net.get(net_name)
+        length_multiplier = 1.0
+        if critical_info:
+            length_multiplier = float(critical_info.get("multiplier", 1.0))
+
+        length_cost = weights["length_mm"] * length_mm * length_multiplier
         via_cost = weights["via"] * via_count * through_via_weight
         span_cost = weights["layer_span"] * max(0, layers_used - 1)
-        deviation_cost = non_bus_deviation
-        total = length_cost + via_cost + span_cost + deviation_cost
+        deviation_cost, bundle_obj = _deviation(net_name, length_mm)
 
-        return {
-            "net": entry["net"],
-            "on_bus": False,
-            "bundle": None,
+        # Phase 7.2 layer-purpose penalty: extra cost of copper on
+        # wrong-purpose layers. Unknown/user layer types get no penalty.
+        net_kind = _net_kind(net_name, power_net_patterns=power_patterns)
+        kind_multipliers = layer_purpose_cfg.get(net_kind, {})
+        per_layer = layer_lengths_by_net.get(net_name, {})
+        layer_penalty = 0.0
+        for layer_name, layer_len in per_layer.items():
+            multiplier = kind_multipliers.get(layer_types.get(layer_name))
+            if isinstance(multiplier, (int, float)) and not isinstance(multiplier, bool):
+                layer_penalty += layer_len * (float(multiplier) - 1.0) * weights["length_mm"]
+
+        total = length_cost + via_cost + span_cost + deviation_cost + layer_penalty
+
+        result = {
+            "net": net_name,
+            "net_kind": net_kind,
+            "on_bus": bundle_obj is not None,
+            "bundle": bundle_obj,
             "metrics": {
                 "length_mm": round(length_mm, 3),
                 "via_count": via_count,
                 "via_types": {"through": via_count} if via_count else {},
                 "layers_used": layers_used,
+                "layer_lengths_mm": {name: round(val, 3) for name, val in sorted(per_layer.items())},
             },
             "cost": {
                 "length": round(length_cost, 3),
                 "vias": round(via_cost, 3),
                 "deviation": round(deviation_cost, 3),
                 "layer_span": round(span_cost, 3),
+                "layer_penalty": round(layer_penalty, 3),
                 "total": round(total, 3),
             },
         }
+        # Phase 9: Add critical net info if applicable
+        if critical_info:
+            result["critical"] = {
+                "reason": critical_info.get("reason", ""),
+                "multiplier": length_multiplier,
+            }
+        return result
 
     weights_used = {
         "length_mm": weights["length_mm"],
@@ -4266,6 +5726,11 @@ def get_trace_cost(project_path: str | Path, net: str | None = None) -> dict[str
         "layer_span": weights["layer_span"],
         "via_weights": dict(via_weights),
         "non_bus_deviation": non_bus_deviation,
+        "layer_purpose": {
+            "signal": dict(layer_purpose_cfg.get("signal", {})),
+            "power": dict(layer_purpose_cfg.get("power", {})),
+            "power_net_patterns": list(power_patterns),
+        },
     }
 
     if net is not None:
@@ -4283,6 +5748,7 @@ def get_trace_cost(project_path: str | Path, net: str | None = None) -> dict[str
         "vias": round(sum(r["cost"]["vias"] for r in ranked), 3),
         "deviation": round(sum(r["cost"]["deviation"] for r in ranked), 3),
         "layer_span": round(sum(r["cost"]["layer_span"] for r in ranked), 3),
+        "layer_penalty": round(sum(r["cost"]["layer_penalty"] for r in ranked), 3),
         "total": round(sum(r["cost"]["total"] for r in ranked), 3),
     }
     return {

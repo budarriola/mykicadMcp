@@ -387,6 +387,151 @@ def _synthetic_netlist_text_fanout(component_count: int, pads_per_component: int
     return "\n".join(parts) + "\n"
 
 
+# --- Multi-drop SPI bus mode (Phase 5 corridor / Phase 6 deviation fixtures) -
+
+
+def _ic_footprint_block(ref: str, x: float, y: float, uuid: str, pads: list[tuple[str, float, float, str]]) -> str:
+    """A multi-pad IC-style footprint at board position (x,y). `pads` is a list
+    of (pad_number, local_x, local_y, net_name). Uses a 'U'-style ref so the
+    bus-qualification IC filter (U/IC/Q prefixes) treats it as an IC."""
+    lines = [
+        '    (footprint "synthetic:IC"',
+        '        (layer "F.Cu")',
+        f'        (uuid "{uuid}")',
+        f'        (at {x} {y})',
+        f'        (property "Reference" "{ref}" (at 0 -3) (layer "F.SilkS"))',
+        f'        (property "Value" "IC" (at 0 3) (layer "F.Fab"))',
+    ]
+    for num, px, py, net in pads:
+        lines.append(
+            f'        (pad "{num}" smd rect (at {px} {py}) (size 0.4 0.4) '
+            f'(layers "F.Cu" "F.Paste" "F.Mask") (net "{net}"))'
+        )
+    lines.append("    )\n")
+    return "\n".join(lines)
+
+
+def _multidrop_spi_layout(destinations: int, prefix: str) -> dict:
+    """Geometry for a hub (U1) + `destinations` slave ICs multi-drop SPI bus.
+    Shared nets SCK/MOSI/MISO reach the hub + every destination; each CS<i> is
+    dedicated (hub + one destination). Returns component pad maps, the routed
+    segment list, and the netlist node map - all sharing net names by value."""
+    shared = [f"{prefix}SCK", f"{prefix}MOSI", f"{prefix}MISO"]
+    # per-shared-net trunk y offset, so the 3 shared traces form a parallel bundle
+    trunk_y = {shared[0]: -1.0, shared[1]: 0.0, shared[2]: 1.0}
+
+    # Hub U1 at (0,0): one pad per shared net + one per CS.
+    hub_pads: list[tuple[str, float, float, str]] = []
+    pin = 1
+    for net in shared:
+        hub_pads.append((str(pin), 0.0, trunk_y[net], net))
+        pin += 1
+    cs_nets = []
+    for d in range(destinations):
+        cs = f"{prefix}CS{d}"
+        cs_nets.append(cs)
+        hub_pads.append((str(pin), 0.0, 3.0 + d, cs))
+        pin += 1
+
+    components = {"U1": {"at": (0.0, 0.0), "pads": hub_pads}}
+    segments: list[tuple[float, float, float, float, str, str]] = []  # x1,y1,x2,y2,net,layer
+    netlist_nodes: dict[str, list[tuple[str, str]]] = {net: [("U1", str(i + 1))] for i, net in enumerate(shared + cs_nets)}
+
+    branch_x = 30.0
+    # trunk: shared nets run straight from hub to the branch point.
+    for net in shared:
+        segments.append((0.0, trunk_y[net], branch_x, trunk_y[net], net, "F.Cu"))
+
+    for d in range(destinations):
+        ref = f"U{d + 2}"
+        # destinations fan out in y so their hub->dest axes are distinct.
+        dest_y = -12.0 + d * 24.0 / max(1, destinations - 1) if destinations > 1 else 0.0
+        dest_x = 55.0
+        cs = f"{prefix}CS{d}"
+        dpads: list[tuple[str, float, float, str]] = []
+        pin = 1
+        for net in shared:
+            dpads.append((str(pin), 0.0, trunk_y[net], net))
+            pin += 1
+            # branch: shared net from the trunk branch point to this destination.
+            segments.append((branch_x, trunk_y[net], dest_x, dest_y + trunk_y[net], net, "F.Cu"))
+            netlist_nodes[net].append((ref, str(pin - 1)))
+        dpads.append((str(pin), 0.0, 2.0, cs))
+        # dedicated CS: straight hub -> destination.
+        segments.append((0.0, 3.0 + d, dest_x, dest_y + 2.0, cs, "F.Cu"))
+        netlist_nodes[cs].append((ref, str(pin)))
+        components[ref] = {"at": (dest_x, dest_y), "pads": dpads}
+
+    return {"components": components, "segments": segments, "netlist_nodes": netlist_nodes,
+            "shared": shared, "cs_nets": cs_nets}
+
+
+def generate_multidrop_spi_board(destinations: int = 2, prefix: str = "/SPI/", route: bool = True,
+                                 deviate_net: str | None = None) -> tuple[str, dict]:
+    """Build a parser-valid `.kicad_pcb` for a hub + `destinations`-slave SPI bus.
+    Returns (board_text, layout). `deviate_net` (a full net name) adds a lateral
+    jog to that net's trunk so it bows off the bundle centerline - the Phase 6
+    deviation-term fixture. `route=False` emits the footprints but no copper."""
+    layout = _multidrop_spi_layout(destinations, prefix)
+    header = _HEADER_TEMPLATE.format(layer_lines=_layer_stack_lines(2))
+    all_nets = layout["shared"] + layout["cs_nets"]
+    parts = [header, _net_table(all_nets)]
+    for i, (ref, comp) in enumerate(layout["components"].items()):
+        parts.append(_ic_footprint_block(ref, comp["at"][0], comp["at"][1], f"synth-ic-{i:04d}", comp["pads"]))
+    if route:
+        for j, (x1, y1, x2, y2, net, layer) in enumerate(layout["segments"]):
+            if net == deviate_net and abs(y1 - y2) < 1e-9:
+                # replace a straight trunk with a bowed jog that pulls the net
+                # well away from the bundle centerline (SCK is the outermost/
+                # most-negative trace, so jog further negative to raise deviation).
+                midx = (x1 + x2) / 2.0
+                parts.append(_segment_block(x1, y1, midx, y1 - 8.0, 0.2, layer, net, f"synth-seg-{j:04d}a"))
+                parts.append(_segment_block(midx, y1 - 8.0, x2, y2, 0.2, layer, net, f"synth-seg-{j:04d}b"))
+            else:
+                parts.append(_segment_block(x1, y1, x2, y2, 0.2, layer, net, f"synth-seg-{j:04d}"))
+    parts.append(_FOOTER)
+    return "".join(parts), layout
+
+
+def _multidrop_netlist_text(layout: dict) -> str:
+    parts = [
+        "(export", '  (version "E")', "  (design", '    (source "synthetic.kicad_sch")',
+        '    (date "2026-07-21")', '    (tool "synthetic_board.py")', "  )", "  (components",
+    ]
+    refs = sorted(layout["components"].keys())
+    for ref in refs:
+        parts.append(f'    (comp (ref "{ref}") (value "IC") (footprint "synthetic:IC"))')
+    parts.append("  )")
+    parts.append("  (nets")
+    for code, (net, nodes) in enumerate(layout["netlist_nodes"].items(), start=1):
+        parts.extend(_netlist_net_block(code, net, nodes))
+    parts.append("  )")
+    parts.append(")")
+    return "\n".join(parts) + "\n"
+
+
+def write_multidrop_spi_project(
+    directory: Path,
+    project_name: str = "spibus",
+    destinations: int = 2,
+    prefix: str = "/SPI/",
+    route: bool = True,
+    deviate_net: str | None = None,
+) -> dict[str, Path]:
+    """Write a full synthetic multi-drop SPI project (board + `.kicad_pro` +
+    `.net`) into `directory`. See `generate_multidrop_spi_board`."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    board_path = directory / f"{project_name}.kicad_pcb"
+    project_path = directory / f"{project_name}.kicad_pro"
+    netlist_path = directory / f"{project_name}.net"
+    board_text, layout = generate_multidrop_spi_board(destinations, prefix, route, deviate_net)
+    board_path.write_text(board_text, encoding="utf-8")
+    project_path.write_text(_synthetic_kicad_pro_text(), encoding="utf-8")
+    netlist_path.write_text(_multidrop_netlist_text(layout), encoding="utf-8")
+    return {"board": board_path, "project": project_path, "netlist": netlist_path, "layout": layout}
+
+
 def write_synthetic_project(
     directory: Path,
     project_name: str = "synthetic",

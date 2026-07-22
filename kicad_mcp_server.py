@@ -37,6 +37,7 @@ try:
     apply_layout_template,
     apply_property_position_changes,
     apply_property_position_template,
+    audit_capacitor_net_voltages,
     audit_capacitor_voltages,
     audit_netclass_conformance,
     audit_schematic_integrity,
@@ -52,6 +53,7 @@ try:
     find_components_by_net,
     find_components_by_pin_connection,
     find_layout_collisions,
+    get_board_layers,
     get_component,
     get_component_connections,
     get_footprint_pads,
@@ -73,6 +75,7 @@ try:
     list_schematic_parts,
     list_sibling_instances,
     load_pcb_settings,
+    measure_bus_corridor_areas,
     match_group_members_by_role,
     move_group,
     normalize_manufacturer_part_number_properties,
@@ -85,6 +88,16 @@ try:
     )
 except Exception as exc:  # pragma: no cover - import safety
     log_message(f"Failed to import KiCad parser module: {exc}")
+    traceback.print_exc(file=sys.stderr)
+    raise
+
+
+try:
+    from kicad_router_tool import (
+        get_ratsnest,
+    )
+except Exception as exc:  # pragma: no cover - import safety
+    log_message(f"Failed to import KiCad router module: {exc}")
     traceback.print_exc(file=sys.stderr)
     raise
 
@@ -292,6 +305,33 @@ class KiCadMcpServer:
                     "required": ["project_path"],
                 },
                 "handler": self._tool_audit_capacitor_voltages,
+            },
+            "audit_kicad_capacitor_net_voltages": {
+                "description": (
+                    "Net-aware capacitor voltage check (Phase 8) - extends audit_kicad_capacitor_voltages "
+                    "(which only checks a rating is *written* in the Value field) by reading the netlist to "
+                    "find the two nets each capacitor ('C<n>' reference convention) actually sits across, "
+                    "inferring each net's voltage from its name (override in pcb_settings.json's "
+                    "schematic_checks.cap_voltage.net_voltages > a gnd_tokens substring match -> 0V > a "
+                    "labeled-voltage pattern like '12V_Main'/'3V3' > unlabeled), and comparing the rating "
+                    "against the *applied* differential voltage |V(net_a) - V(net_b)| rather than assuming "
+                    "one rail vs ground. Verdicts per capacitor, worst-first: under_rated (rated < applied, "
+                    "hard fail), unknown_rating (labeled nets but no rating anywhere - worth chasing), "
+                    "under_derated (rated < derating_min_ratio x applied - the ceramic-DC-bias trap), ok, "
+                    "one_net_unlabeled (informational, assumed_applied_v = resolved side vs 0V), "
+                    "no_labeled_nets (skipped, counted), unsupported_pins (not exactly 2 netlist pins - "
+                    "arrays/4-terminal caps - skipped). DNP capacitors excluded. Cross-checks netlist net "
+                    "names against the board's own pad nets and reports stale_netlist_warnings on mismatch. "
+                    "Read-only; settings actually used are echoed back in settings_used for reproducibility."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string", "description": "KiCad project directory, .kicad_pro, .kicad_pcb, or .kicad_sch path."},
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_audit_capacitor_net_voltages,
             },
             "lookup_mouser_part": {
                 "description": (
@@ -672,7 +712,10 @@ class KiCadMcpServer:
                     "suggested_class_name. Never writes or applies anything - candidates only, for the "
                     "caller to confirm with the user before Phase 4 creates any net class. Also cross-"
                     "checks netlist net names against the board's own pad nets and reports mismatches "
-                    "in stale_netlist_warnings (the .net export can lag the board)."
+                    "in stale_netlist_warnings (the .net export can lag the board). Candidates the user "
+                    "confirmed on a previous run (cached in the gitignored <board>.board_local.json's "
+                    "confirmed_buses) come back marked confirmed:true with confirmed_on/confirmed_name, "
+                    "so only unconfirmed candidates need to be presented again."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -687,6 +730,37 @@ class KiCadMcpServer:
                     "required": ["project_path"],
                 },
                 "handler": self._tool_detect_buses,
+            },
+            "measure_kicad_bus_corridor_area": {
+                "description": (
+                    "Measure the routing-corridor area a bus bundle's traces enclose (the 'area "
+                    "between the traces'), PER destination IC - so a bus that fans out to several ICs "
+                    "is measured as the sub-bundles that actually run together, not one inflated "
+                    "envelope. Pass EITHER a detect_kicad_buses candidate object (bus=) or an explicit "
+                    "net list (nets=[...], optional hub_ic). Reuses the qualification roles, pad-centroid "
+                    "anchors, and copper parse of the earlier phases. Each bundle reports corridor_area_mm2 "
+                    "(station-resampled perpendicular spread along the hub->dest axis, bend-insensitive), "
+                    "hull_area_mm2 (convex-hull sanity bound), bend_ratio, mean_spacing_mm, and its nets "
+                    "with shared/dedicated roles. Also returns sum_of_bundle_areas_mm2 (shared copper "
+                    "counted once per bundle it serves), union_hull_area_mm2 (whole-bus envelope), and "
+                    "unassigned_segment_count (fan-out/transition copper). Degenerate: single destination "
+                    "-> one bundle no clipping; no hub / no destination IC -> grouped:false. Read-only."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "bus": {"type": "object", "description": "A detect_kicad_buses candidate object (its nets/common_ics/bus_type)."},
+                        "nets": {"type": "array", "items": {"type": "string"}, "description": "Explicit bus net names (alternative to bus=)."},
+                        "hub_ic": {"type": "string", "description": "Override the hub/master IC reference (e.g. 'U4')."},
+                        "bus_type": {"type": "string", "description": "Optional label (e.g. 'SPI') when passing nets= directly."},
+                        "clip_band_mult": {"type": "number", "description": "Shared-copper clip band = this x dominant trace width. Default from corridor.clip_band_mult (3.0)."},
+                        "station_step": {"type": "number", "description": "Corridor station resample step in mm. Default = dominant trace width."},
+                        "ic_ref_prefixes": {"type": "array", "items": {"type": "string"}, "description": "Reference prefixes treated as ICs. Default ['U','IC','Q']."},
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_measure_bus_corridor_area,
             },
             "get_kicad_track_inventory": {
                 "description": (
@@ -745,10 +819,15 @@ class KiCadMcpServer:
                 "description": (
                     "Score routed copper with the trace-cost model: length cost (copper length x "
                     "weights.length_mm), via cost (via count x weights.via x via_weights.through - every "
-                    "via on this board is through-hole), and layer_span cost ((layers_used - 1) x "
-                    "weights.layer_span). Deviation terms are STUBBED until Phase 5 (bus-corridor "
-                    "geometry) lands - every net reports on_bus:false and a deviation cost of "
-                    "trace_cost.non_bus_deviation (default 0). Omit net to get every routed net ranked "
+                    "via on this board is through-hole), layer_span cost ((layers_used - 1) x "
+                    "weights.layer_span), a deviation cost for nets on detected bus bundles (per "
+                    "trace_cost.deviation.metric/reference; non-bundle nets get "
+                    "trace_cost.non_bus_deviation, default 0), and a layer_penalty: each net is "
+                    "classified power/signal (net_kind, via layer_purpose.power_net_patterns), its "
+                    "copper broken down per layer, and copper sitting on a wrong-purpose layer (per the "
+                    "board's own (layers ...) types x the layer_purpose multiplier table) is charged "
+                    "length_on_layer x (multiplier - 1) x weights.length_mm extra - existing layer-"
+                    "purpose violations show up in cost triage. Omit net to get every routed net ranked "
                     "worst-cost-first plus board totals and the weights_used actually applied."
                 ),
                 "inputSchema": {
@@ -760,6 +839,55 @@ class KiCadMcpServer:
                     "required": ["project_path"],
                 },
                 "handler": self._tool_get_trace_cost,
+            },
+            "get_kicad_board_layers": {
+                "description": (
+                    "Parse the board file's own top-level (layers ...) block into the copper stack: "
+                    "one {name, ordinal, type, user_name} per copper (*.Cu) layer, in physical stack "
+                    "order (front to back). type is KiCad's own layer designation - signal | power | "
+                    "mixed | jumper - the layer purposes the trace-cost layer_penalty and the Phase 7 "
+                    "router cost model key off (e.g. on kiln: F.Cu/B.Cu signal, In1.Cu/In2.Cu power). "
+                    "Read-only; also returns copper_layer_count and per-type counts."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_get_board_layers,
+            },
+            "get_kicad_ratsnest": {
+                "description": (
+                    "List every unrouted connection (missing ratsnest line) on the board. "
+                    "Connectivity is computed with union-find over each net's pads + existing copper "
+                    "(segments/arcs/vias) AND its filled zone polygons, using the board file's own pad "
+                    "nets as ground truth (immune to .net netlist staleness): two items join when they "
+                    "share a copper layer and their copper overlaps within tolerance (a via joins the "
+                    "layers it spans; a pad/trace over a same-net plane fill joins the fill, incl. across "
+                    "thermal gaps). For each net with >= 2 connected islands the missing connections are "
+                    "the MST decomposition over its islands (no cycles), each reporting net, from/to "
+                    "island representative (nearest pad refs or copper/zone uuid), airline_length_mm, and "
+                    "the layers each side lives on. Connections are ordered most-constrained-first: by "
+                    "net_overrides.priority (from the board-local JSON) descending, then shortest airline "
+                    "first. Summary gives total connections, total airline mm, fully-routed net count, and "
+                    "the unrouted-net list; single-pad and free-copper (net \"\") nets are counted "
+                    "separately. Read-only; pass nets to restrict to specific net names."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "nets": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Restrict to these net names; omit for the whole board.",
+                        },
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_get_ratsnest,
             },
             "propose_kicad_netclass": {
                 "description": (
@@ -1508,6 +1636,18 @@ class KiCadMcpServer:
     def _tool_get_track_inventory(self, args: dict[str, Any]) -> dict[str, Any]:
         return get_project_track_inventory(args["project_path"])
 
+    def _tool_measure_bus_corridor_area(self, args: dict[str, Any]) -> dict[str, Any]:
+        return measure_bus_corridor_areas(
+            args["project_path"],
+            bus=args.get("bus"),
+            nets=args.get("nets"),
+            hub_ic=args.get("hub_ic"),
+            bus_type=args.get("bus_type"),
+            clip_band_mult=args.get("clip_band_mult"),
+            station_step=args.get("station_step"),
+            ic_ref_prefixes=args.get("ic_ref_prefixes"),
+        )
+
     def _tool_get_pcb_settings(self, args: dict[str, Any]) -> dict[str, Any]:
         return load_pcb_settings(args["project_path"])
 
@@ -1520,6 +1660,13 @@ class KiCadMcpServer:
 
     def _tool_get_trace_cost(self, args: dict[str, Any]) -> dict[str, Any]:
         return get_trace_cost(args["project_path"], args.get("net"))
+
+    def _tool_get_board_layers(self, args: dict[str, Any]) -> dict[str, Any]:
+        return get_board_layers(args["project_path"])
+
+    def _tool_get_ratsnest(self, args: dict[str, Any]) -> dict[str, Any]:
+        nets = args.get("nets")
+        return get_ratsnest(args["project_path"], list(nets) if nets else None)
 
     def _tool_propose_netclass(self, args: dict[str, Any]) -> dict[str, Any]:
         return propose_netclass_from_nets(args["project_path"], list(args["nets"]), args["name"])
@@ -1564,6 +1711,9 @@ class KiCadMcpServer:
 
     def _tool_audit_capacitor_voltages(self, args: dict[str, Any]) -> dict[str, Any]:
         return audit_capacitor_voltages(args["project_path"], default_voltage=args.get("default_voltage"))
+
+    def _tool_audit_capacitor_net_voltages(self, args: dict[str, Any]) -> dict[str, Any]:
+        return audit_capacitor_net_voltages(args["project_path"])
 
     def _tool_lookup_mouser_part(self, args: dict[str, Any]) -> dict[str, Any]:
         return lookup_mouser_part(args["url"])

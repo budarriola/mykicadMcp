@@ -29,20 +29,121 @@ pattern (handlers import from whichever module owns the function).
 
 For whoever (human or AI) picks this up next:
 
-- **Landed & verified on the real board**: Phases 1, 2, 3 (named buses +
-  DIFF_PAIR/PARALLEL/RS485 structural detectors), 4, and 6 (deviation term
-  stubbed until Phase 5); M0 is fully done. 70 MCP tools registered. `tests/`
-  has a 35-test passing pytest suite (fixtures, golden parser tests, writer
-  round-trip, synthetic board/project generator, kicad-cli acceptance). Each
-  landed phase is collapsed to a short "LANDED" anchor section in place, kept
-  because later phases reference it. **No delegations in flight** — all
-  subagent work was reviewed and folded in before this snapshot.
-- **Next work, in order**: close M1 (milestone docs pass:
-  `docs/mcp-tools/10-netclasses-and-buses.md` for the 9 new tools, README +
-  CLAUDE.md tool count/group sync 61 → 70 — a Haiku-delegation per the
-  Implementation strategy section), then M2 (Phase 5 corridors, which also
-  unstubs Phase 6's deviation term per the spec kept in the Phase 6 section;
-  Phase 8 cap audit), then M3+ (the router).
+- **Landed & verified on the real board**: Phases 1–6 complete — 1, 2, 3
+  (named buses + DIFF_PAIR/PARALLEL/RS485 structural detectors), 4, 5
+  (corridor areas), and 6 (deviation term live, fed by Phase 5 bundles).
+  M0 and M1 are fully done (docs page `10-netclasses-and-buses.md`, README +
+  CLAUDE.md synced — note: verify tool counts by instantiating
+  `KiCadMcpServer`, not by grepping; a grep-count once came back wrong).
+  **71 MCP tools registered.** `tests/` has a 48-test passing pytest suite
+  (fixtures, golden parser tests, writer round-trip, synthetic board/project
+  + multi-drop SPI generators, kicad-cli acceptance, corridor/deviation
+  tests). Each landed phase is collapsed to a short "LANDED" anchor section in
+  place, kept because later phases reference it. All subagent work above was
+  coordinator-reviewed and folded in before this snapshot.
+- **Phase 8 landed 2026-07-21** (coordinator-verified: 72 tools, 60-test suite
+  green, kiln audit hand-checked — see its anchor; notable real finding: C9's
+  schematic Value field lost its voltage rating, flagged `unknown_rating`).
+- **M2 is closed** (2026-07-21) and **M3 step 10 (Phases 7.1 + 7.2) landed**
+  same day, coordinator-verified: 73 tools, 79-test suite green, kiln board
+  cost total now 6241.7 with the `layer_penalty` term (see the 7.1/7.2
+  anchors).
+- **7.3 stage 1 (connectivity + `get_kicad_ratsnest`) landed 2026-07-21**,
+  coordinator-verified: 74 tools, 87-test suite green, kiln = 39 missing
+  connections / 25 unrouted nets, hand-checked genuine (see the stage-1
+  anchor in 7.3, incl. the approved zone-fill stopgap 7.5 must retire).
+- **Plan extended 2026-07-21 at user request** (planned by the coordinator, no
+  code yet): 7.3c adjacent-layer crossing preference; 7.5.6 stitching pass
+  (always last) + `remove_kicad_stitching_vias` + ask-before-routing rule;
+  7.11 DRC constraint resolver + kicad-cli DRC acceptance gate; 7.12
+  neck-down; 7.13 impedance-matched/matched-length sets; 7.14 connector
+  pin-swap advisor (consent-gated, user makes the sch change, loud exclusion
+  validation); 7.15 effort presets + plateau stopping; 7.16 benchmark harness
+  vs hand-routed boards; Phase 9 high-speed/critical-net classification
+  (critical-length table, XTAL, switching-inductor SW nodes, stack-up gate);
+  new `pcb_settings.json` blocks; new milestone **M6** + M3/M4 amendments;
+  Flow B session-start questions. The "hull ballooning / shared-vs-dedicated"
+  concern re-raised at planning time is already mitigated by landed Phase 5
+  (see its anchor; kiln SPI: bundles 313 vs naive hull 1707 mm²) — residual
+  approximations are M6 item 21.
+- **PAUSED again 2026-07-21 (second pause, by user request), mid-delegation.**
+  A 4-way Haiku subagent burst (7.3a tests, 7.3a kiln acceptance write-up,
+  Phase 9, 7.11) was stopped early at the user's request. Tree verified after
+  the stop: **123 tests collected, 116 green / 7 failing** (all 7 in the two
+  partial deliverables below — the pre-existing 87 remain green), **74 MCP
+  tools** (neither new tool registered — deliberate; registration is a
+  coordinator step after review), server instantiates clean.
+- **7.3a state — code complete; closure is 2/3 outstanding.** All 7.3a/7.3c
+  machinery is in `kicad_router_tool.py` after `get_ratsnest`:
+  `infer_layer_directions`, `_CoarseModel` (capacity grid + debit tracking),
+  `_Weights` (integer milli-cost), `_astar`/`_make_candidates` (k-shortest via
+  most-congested-cell blocking), home-layer/`_congestion_risk` helpers,
+  `_collect_bundles` (Phase 5 reuse, bundle-as-one-unit debit),
+  `global_route(project_path, nets=None, connections=None)`,
+  `_plane_opportunity_score` stub → 7.5.4; ratsnest connections carry
+  `from_point`/`to_point` (additive). Kiln smoke: 39/39 routed, 4 near_tie,
+  correct bundle grouping. Closure items:
+  - Item (3) cost-formula review — **DONE (coordinator, 2026-07-21).**
+    Verdict: sound. The 7.3a header comment matches both `_astar` and
+    `_path_cost_milli` (heading preserved across vias; turn penalty as a true
+    edge cost; k-shortest blocking cells correctly excluded from re-scoring);
+    integer-milli determinism holds (fully-ordered tuple tie-breaks
+    throughout). Four recorded notes: (a) heuristic admissibility is
+    config-conditional — it assumes `off_direction ≥ 1` and layer-purpose
+    multipliers ≥ the per-kind minimum; add a docstring line with 7.3b.
+    (b) The 131.75 s cold run is diagnosed, not mysterious: foreign-plane
+    cells cost `_FULL_CELL_MILLI` (5,000,000) per step while the octile
+    heuristic prices a step at ~1,000, so A* degenerates toward exhaustive
+    expansion wherever plane-covered inner layers are considered — fix via
+    7.3b windowing or by excluding foreign-plane cells from expansion.
+    (c) Bundle endpoints search with all-layer start/goal sets, so bundle
+    candidates skip the entry-via cost — coarse-stage approximation, 7.3b's
+    exact geometry corrects it. (d) `summary.total_est_cost_milli` counts a
+    bundle's shared corridor once per member connection (7 SPI members → 7×);
+    state this in the eventual MCP tool docs.
+  - Item (1) tests — `tests/test_global_route.py` (8 tests, **all green**)
+    written by a Haiku subagent; **coordinator-UNREVIEWED** (coverage vs the
+    spec list — forced crossing, k-alternates, bundle-width capacity,
+    direction goldens, byte-identical determinism, int-milli assertion — not
+    yet audited; it also uses an unregistered `slow` pytest marker that
+    warns).
+  - Item (2) kiln acceptance write-up — **NOT delivered**: the agent was
+    stopped early leaving only disposable scratch scripts outside the repo.
+    Redo from scratch on resume (runtimes, utilization, candidate tables,
+    home layers, hand-checked corridor vs Phase 5 bundles, cost composition,
+    and the direction-inference dominance fractions that feed the threshold
+    decision below).
+  - Standing concerns: cold-run time (now diagnosed, see note (b));
+    `_FULL_CELL_MILLI` dominance of the kiln total (weight balance is
+    7.5.4's job); direction inference all-None on kiln (F/B under the 60%
+    dominance threshold — thresholds untuned; the golden numbers for that
+    decision were part of the undelivered item (2)).
+- **Phase 9 — code landed 2026-07-21, UNREVIEWED, one real defect.**
+  `classify_critical_nets` + `high_speed`/`switch_node` settings blocks +
+  the `get_trace_cost` multiplier integration are in `kicad_pcb_tool.py`;
+  `tests/test_critical_nets.py` = 16 tests, 14 green. **Defect: on the real
+  kiln board classification returns ZERO critical nets** (both kiln smoke
+  tests fail; synthetic-project tests pass) — suspect hierarchical net-name /
+  bus-membership keying; diagnose before trusting any output. MCP tool
+  `detect_kicad_critical_nets` NOT registered (pending coordinator review).
+- **7.11 — partial; agent stopped mid-implementation.** `_parse_dru` +
+  `get_drc_constraints` exist at the end of `kicad_router_tool.py`;
+  `tests/test_drc_constraints.py` = 12 tests, 7 green / **5 failing** (the
+  resolver currently yields little beyond the fallback clearance:
+  track_width/via constraint extraction, `.kicad_dru`-over-`.kicad_pro`
+  precedence, unsupported-condition reporting, and cache invalidation are
+  missing or broken — the failing tests name each gap). Unreviewed; MCP tool
+  `get_kicad_drc_constraints` NOT registered. Deviation note: 7.11 was
+  pulled ahead of the 7.3b delegation for parallelism (coordinator decision
+  2026-07-21); the build order still holds — 7.3b consumes it, so it must be
+  finished before/with 7.3b.
+- **Next work when resumed:** (1) finish + fix 7.11 (drive it by its 5
+  failing tests); (2) diagnose the Phase 9 kiln zero-result defect; (3)
+  coordinator-review all three subagent deliverables (test_global_route.py
+  coverage vs spec, Phase 9 code, 7.11 code), then register
+  `detect_kicad_critical_nets` + `get_kicad_drc_constraints`; (4) redo 7.3a
+  closure item (2), the kiln acceptance write-up — that closes 7.3a. Then
+  7.3b (+7.12 per build order), then step 12 (viewer).
 - **Nothing has been committed** in either repo as of this snapshot — review the
   working tree before assuming git history matches this file.
 - Verify claims against the code (`kicad_pcb_tool.py`, `kicad_mcp_server.py`,
@@ -160,12 +261,11 @@ Implemented in `kicad_pcb_tool.py` and registered in `kicad_mcp_server.py`:
 
 Verified on kiln: 1,609 segments, 298 vias, 0 arcs, 154 routed nets; dominant
 width 0.3 mm (795 segs / 95 nets); vias 0.6/0.3 (×293) plus 5 oversized 12/7
-(3 free). Docs-page coverage for these two tools is still owed (see
-Documentation updates).
+(3 free).
 
 ---
 
-## Phase 3 — Bus detection & IC qualification — LANDED 2026-07-21 (reference anchor; no code work remains)
+## Phase 3 — Bus detection & IC qualification — LANDED 2026-07-21 (reference anchor; no work remains here)
 
 Landed in `kicad_pcb_tool.py` + registered as tool `detect_kicad_buses`:
 `_BUS_SIGNATURES` (I2C, SPI, QSPI, I2S, UART, CAN, USB, SWD, JTAG with role
@@ -196,9 +296,6 @@ pin-derived names like `Net-(U6-T+)`/`Net-(U6-T-)` (thermocouple leads) end in
 parens, outside the three specified suffix forms, so such per-IC diff pairs go
 undetected; extend the suffix forms if that ever matters.
 
-Only non-code leftover: docs-page coverage for `detect_kicad_buses` (part of
-the M1 docs pass — see Documentation updates).
-
 ---
 
 ## Phase 4 — LANDED 2026-07-21 (reference anchor; no work remains here)
@@ -216,132 +313,72 @@ SPI nets (128/154 nets mismatch Default — expected until classes are assigned)
 
 ---
 
-## Phase 5 — Inter-trace ("area between the traces") measurement per bus
+## Phase 5 — LANDED 2026-07-21 (reference anchor; no code work remains here)
 
-Goal: for each detected/confirmed bus, measure the board area the bundle's traces
-enclose — the routing corridor between them — and do it **per destination IC** so a
-bus that spurs off to several ICs is measured as the sub-bundles that actually run
-together, not as one inflated envelope.
+`measure_bus_corridor_areas` (+ `_compute_bus_bundles`, `_convex_hull_area`,
+`_perp_distance_to_axis`, `_ic_set_for_net`, `_resolve_bus_spec`) implemented in
+`kicad_pcb_tool.py` after `get_project_track_inventory`; registered as tool
+`measure_kicad_bus_corridor_area`. Accepts a `detect_buses` candidate or explicit
+`{nets, hub_ic}`; anchor-and-corridor per-destination-IC bundles (hub/dest pad
+centroids as axes; dedicated nets wholesale, shared nets clipped per
+destination); per-layer corridor + convex-hull areas per the original 5.3 output
+shape (plus a `clip_band_mm` transparency field); degenerate cases (single
+destination → no clipping; no hub → `grouped:false` un-grouped hull); pure
+stdlib; read-only. `_compute_bus_bundles` also returns internal geometry keys
+(`_hub_pt`/`_dest_pt`/`_centerline_s`/`_net_segs`/`_axis_len`) consumed by the
+Phase 6 deviation term — **Phase 7.3a's corridor reuse should consume the same
+bundle geometry**. Knob: `corridor.clip_band_mult` (band = mult × dominant
+width). 13 tests in `tests/test_bus_corridor.py` incl. a synthetic multi-drop
+SPI generator (`tests/synthetic_board.py: write_multidrop_spi_project`).
 
-`measure_bus_corridor_areas(project_path, bus)` → tool
-`measure_kicad_bus_corridor_area`
-(input: a bus candidate object from `detect_buses`, or an explicit `{nets, hub_ic}`).
+**Spec deviations recorded (approved at review, 2026-07-21):**
+- **Step C assignment** is per-segment nearest-destination-axis gated by
+  (projection within the hub→dest span extended by the band) OR (within band of
+  the bundle's dedicated copper) — NOT the originally specced "band of an
+  already-assigned trace" chaining, which on real bowed traces chained whole
+  shared trunks into one bundle (67/74 segments unassigned, bend ratios
+  150–700). The band guards span-extension/dedicated-proximity, not
+  trace-to-trace chaining.
+- **Hub tiebreak** when `common_ics` has several (I2C gave [U4,U5]): most
+  member nets, then most board-wide net participation, then name → U4.
+- **"≥2 traces" enforced as ≥2 distinct nets**, at bundle level and per
+  station, so one meandering net can't inflate a corridor.
+- Known limits: an equidistant shared trunk lands in one bundle (ties → first
+  destination), visible via `unassigned_segment_count` and the
+  `sum_of_bundle_areas` vs `union_hull` gap; arcs use the chord approximation
+  (kiln has no copper arcs). Optional M6 refinements (build-order item 21):
+  per-station polyline centerline + equidistant-trunk splitting.
 
-### 5.1 Why naïve approaches fail here
-- **One convex hull of all bus copper** balloons the moment a bus fans out: a chip
-  select spurring to a far IC drags the hull across empty board, and the "area
-  between the traces" becomes mostly area between *unrelated* traces.
-- Bus nets are **shared** (SCK/MOSI/MISO reach every slave) and **dedicated**
-  (CS1→U2, CS2→U3). The physically-meaningful corridor near U2 is
-  {SCK,MOSI,MISO,CS1} *in the stretch that runs to U2* — not the whole length of the
-  shared nets.
-
-So the problem is two-fold: **(a) group nets per destination IC**, and **(b) clip
-each shared net's copper to the stretch belonging to that destination.**
-
-### 5.2 Design — "anchor-and-corridor" per-IC bundles (recommended)
-
-**Step A — Roles from qualification (reuse Phase 3c).**
-- `hub_ic` = the IC common to all bus nets (SPI master, I2C controller, …).
-- `destinations` = every other IC on any bus net.
-- For each destination `D`: `bundle_nets(D)` = bus nets that connect to `D`.
-- Tag each bus net `dedicated` (ICs == {hub, D} only → unambiguously D's, e.g. a CS)
-  or `shared` (reaches hub + ≥2 destinations, e.g. SCK/MOSI).
-- Degenerate cases handled explicitly: **single destination** → one bundle, no
-  clipping; **no hub / weak bus** → one un-grouped hull with `grouped: false`.
-
-**Step B — Anchor geometry from pads (reuse `_parse_footprint_pads`).**
-- `hub_pt` = centroid of the hub IC's pads that sit on the bus nets.
-- `dest_pt(D)` = centroid of D's pads on `bundle_nets(D)`.
-- These give each bundle a physical *axis* `hub_pt → dest_pt(D)` to clip against.
-
-**Step C — Assign/clip shared copper to the nearest destination.**
-Each shared net's copper is split among destinations so a stretch is counted for the
-bundle it physically runs with:
-- For every copper segment of a shared net, assign it to the destination `D` whose
-  axis `hub_pt→dest_pt(D)` the segment's midpoint is closest to (perpendicular
-  distance), **and** that lies within a band of the bus's own pitch (see 5.4) of at
-  least one already-assigned trace of that bundle — so a shared trace only joins a
-  bundle where it actually runs alongside it, not where it has peeled away.
-- Dedicated nets' copper is assigned wholesale to their destination.
-- Segments that match no bundle within the band → reported as `unassigned` (the
-  fan-out/transition copper) so nothing is silently dropped.
-
-**Step D — Corridor area per bundle.** Two methods; report both, recommend the
-first:
-1. **`corridor` (recommended, literal "between the traces"):** build the bundle's
-   centerline (ordered stations from `hub_pt` to `dest_pt(D)` — project each
-   segment midpoint onto the axis, sort, resample at a fixed step). At each station
-   take the perpendicular spread = distance from the leftmost to the rightmost
-   bundle trace. Area ≈ Σ(spread × step). This is the true inter-trace corridor and
-   is insensitive to bends (measured along the local axis, not a global hull).
-2. **`hull` (sanity bound):** convex-hull area of the bundle's clipped copper
-   (Andrew's monotone chain + shoelace). Always ≥ corridor area; the ratio flags
-   how much the bundle bends or fans.
-
-### 5.3 Output shape
-```json
-{
-  "bus_type": "SPI",
-  "hub_ic": "U1",
-  "bundles": [
-    { "destination_ic": "U2",
-      "nets": [{"net":".../SCK","role":"shared"}, {"net":".../CS1","role":"dedicated"}, ...],
-      "trace_count": 4,
-      "axis": {"from":[x,y],"to":[x,y]}, "length_mm": 18.4,
-      "corridor_area_mm2": 9.7, "hull_area_mm2": 12.1, "bend_ratio": 1.25,
-      "mean_spacing_mm": 0.53, "layers": ["F.Cu"] },
-    { "destination_ic": "U3", ... }
-  ],
-  "sum_of_bundle_areas_mm2": 27.9,   // shared copper counted once per bundle it serves
-  "union_hull_area_mm2": 41.2,       // whole-bus envelope, for reference
-  "unassigned_segment_count": 6,     // fan-out/transition copper not in any bundle
-  "grouped": true,
-  "warnings": ["net .../MISO has copper on 2 layers; corridor computed per layer then summed"]
-}
-```
-Report **both** `sum_of_bundle_areas` and `union_hull` so double-counting of shared
-copper (which is real — one physical SCK trace serves several bundles) is explicit
-rather than hidden.
-
-### 5.4 Details & correctness
-- **Per layer**: compute corridors per copper layer, then sum — a bus that jumps
-  F.Cu↔B.Cu shouldn't have its two layers' spread conflated. Vias mark the hops.
-- **Pitch / band width**: default clip band = a few × the bus's dominant trace width
-  (from Phase 1) or its median inter-trace spacing; expose as a parameter with a
-  sensible default. Document that too-tight a band leaves shared copper
-  `unassigned`, too-wide over-claims.
-- **Only ≥2 traces**: a bundle needs at least two traces to have an area; a
-  single-net "bundle" returns `corridor_area = 0` with just a length.
-- **Geometry is pure stdlib** (convex hull, shoelace, point-segment distance,
-  projection) — no `shapely`/`numpy`, matching the module's zero-extra-dependency
-  posture (`requirements-mcp.txt` is just `mcp` + optional `kicad-python`). If
-  robustness ever demands it, `shapely` can be an *optional* import behind a
-  fallback, exactly like `kicad-python` gates the live-IPC tools.
-- **Reuses**: Phase 1 `_parse_tracks_cached` for copper, `_parse_footprint_pads`
-  for anchors, Phase 3c qualification for hub/destination roles. No new board
-  parsing pass.
-- Read-only; nothing is written.
-
-### 5.5 Where it plugs into the flow
-After a bus is confirmed (interaction flow step 2), `measure_kicad_bus_corridor_area`
-gives the per-IC corridor areas — useful on its own (routing density, coupling area,
-board-space budgeting) and as an input when deciding a bus's net-class width/spacing
-in Phase 4.
+Verified on kiln: I2C /MainControler/ = single-destination degenerate (U4→U5,
+corridor 152.1 mm²); SPI /MainControler/ = true multi-drop (U4→U7/U8/U9,
+bundles 137.0/157.4/18.7 mm², 7 unassigned fan-out segments, sum 313.1 vs
+union hull 1706.6); SPI /SaftyProcessor/ correctly degrades to
+`grouped:false` (its slaves are off-board).
 
 ---
 
-## Phase 6 — LANDED 2026-07-21 except the M2 deviation unstub (schema below kept as reference)
+## Phase 6 — LANDED 2026-07-21, deviation term unstubbed same day (schema below kept as reference)
 
 `DEFAULT_PCB_SETTINGS` + `load_pcb_settings` (deep-merge over defaults,
 non-negative weight validation, file-vs-default key report) +
 `init_pcb_settings` (dry-run/overwrite-guarded seeding) + `get_trace_cost`
-(length/via/layer_span terms; **deviation stubbed `on_bus: false` until M2's
-Phase 5 lands**, per the build order) are implemented in `kicad_pcb_tool.py`
+(length/via/layer_span terms) are implemented in `kicad_pcb_tool.py`
 and registered as `get_kicad_pcb_settings`, `init_kicad_pcb_settings`,
-`get_kicad_trace_cost`. Verified on kiln: 154 nets ranked, board total 5584.4
-(worst: GND_Main 520.1, GND_Safty 240.8, 12V_Main 211.9 — via-heavy
-power/ground nets, the Phase 7.5 plane motivation made measurable).
+`get_kicad_trace_cost`. The deviation term is live: bundle memberships come
+from every qualified `detect_buses` candidate via Phase 5's
+`_compute_bus_bundles`; `mean_perp_distance`/`max_perp_distance`/
+`excess_length` per `deviation.metric` + `reference`; shared nets roll up
+across bundles (max for max_perp, length-weighted mean for mean_perp; **max
+also for excess_length** — unspecified in the original spec, chosen at review —
+with `direct` = bundle-axis length between hub/dest pad centroids, not a
+single pad pair). Bus nets report `on_bus:true` + a `bundle` object; the
+`bus_centerline` reference approximates the centerline as a straight line at
+the bundle's mean perpendicular offset (S-shaped bundles read slightly high).
+Verified on kiln: 154 nets ranked; board total 5584.4 → 5628.8 with the
+deviation term (44.41 board-wide); SPI /MainControler/ nets all `on_bus:true`
+except CS3 (reaches only the hub — correctly on no bundle). Worst nets remain
+GND_Main 520.1, GND_Safty 240.8, 12V_Main 211.9 — via-heavy power/ground
+nets, the Phase 7.5 plane motivation made measurable.
 
 The `pcb_settings.json` schema below is **kept as reference** — Phases 5, 7,
 and 8 read their knobs (`corridor`, `layer_purpose`, `autorouter`, `plane`,
@@ -431,9 +468,46 @@ committed; absent file → defaults.
                                         // convention as audit_capacitor_voltages' default_voltage)
     }
   },
+  "high_speed": {                       // Phase 9: high-speed classification & critical lengths
+    "bus_frequencies_mhz": { "SPI": 20, "QSPI": 80, "I2C": 0.4, "I2S": 12,
+                             "UART": 1, "CAN": 1, "USB": 480, "MIPI": 1000,
+                             "DDR": 800, "SWD": 4, "JTAG": 10, "CLK": 25 },
+    "velocity_fraction": 0.5,           // signal speed as a fraction of c (mid-FR4)
+    "rise_fraction": 0.05,              // t_rise estimated as this fraction of the bit period
+    "critical_length_overrides_mm": {}, // per-bus-type L_crit overrides, wins over the formula
+    "critical_fraction": 0.9,           // straight-line >= this x L_crit -> stack-up gate question
+    "length_weight_mult": 4.0           // per-mm cost multiplier for classified fast nets
+  },
+  "switch_node": {                      // Phase 9: switching-supply inductor detection
+    "min_inductor_mm": 2.0,             // courtyard/footprint edge above this (both axes) qualifies
+    "length_weight_mult": 8.0           // per-mm cost multiplier on the SW-node net
+  },
+  "neck_down": {                        // Phase 7.12: wide nets onto small pads
+    "enabled": true,
+    "max_width_vs_pad": 1.0,            // neck when class width > this x pad's smaller dimension
+    "min_length_mm": 0.5, "max_length_mm": 3.0
+  },
+  "stitching": {                        // Phase 7.5.6: plane stitching pass (always last)
+    "enabled": true,
+    "target_spacing_mm": 5.0,           // general plane stitching pitch
+    "near_high_speed_mm": 1.0,          // return-path vias placed within this of a fast trace
+    "near_high_speed_pitch_mm": 2.0
+  },
+  "pin_swap": {                         // Phase 7.14: connector pin-swap advisor (consent-gated)
+    "enabled": false,
+    "min_gain": 25.0,                   // board-score gain that pauses the run to ask the USER
+    "ref_prefixes": ["J", "P", "CN", "X"]
+  },
+  "impedance_profiles": {               // Phase 7.13: user-specified geometry, never computed
+    "profiles": {},                     // e.g. {"usb90": {"target_ohms": 90, "layers": {"F.Cu": {"width": 0.2, "gap": 0.15}}, "tolerance_mm": 0.5}}
+    "assignments": {}                   // net-set / bus name -> profile name
+  },
   "optimizer": {                        // Phase 7.6: iterative whole-board optimization
     "max_iterations": 20,
     "time_budget_s": 300,
+    "effort": "balanced",               // 7.15: "quick" | "balanced" | "best" preset (session asks the user)
+    "plateau_window": 3,                // 7.15: iterations in the rate windows
+    "plateau_slope_ratio": 0.1,         // 7.15: stop when trailing rate < ratio x initial rate
     "worst_k": 5,                       // nets re-examined per iteration
     "unrouted_penalty": 500.0,          // added to board score per still-unrouted connection
     "accept": "greedy",                 // "greedy" | "sa" (simulated annealing)
@@ -452,17 +526,6 @@ committed; absent file → defaults.
 }
 ```
 
-**Deviation unstub spec (the one remaining Phase 6 item, done as part of M2's
-Phase 5):** when a net belongs to a detected bus bundle, add the deviation term
-per `deviation.metric` — `mean_perp_distance`/`max_perp_distance` = mean/max
-perpendicular distance of segment midpoints from the bundle **centerline**
-(`deviation_cost = w.deviation_mm * value`); `excess_length` = `w.excess_length
-* max(actual_length / direct_distance(hub_pad→dest_pad) - 1, 0)` with direct
-distance from real **pad** positions. Shared bus nets are measured against each
-destination bundle they serve and rolled up with the metric's aggregate (max
-for `max_perp`, length-weighted mean for `mean_perp`). Result gains `on_bus:
-true` + a `bundle` object; non-bundle nets keep today's behavior.
-
 ---
 
 ## Phase 7 — Python autorouter (grid A* with rip-up, layer-purpose aware)
@@ -474,52 +537,49 @@ router needs (obstacles, clearances, costs, corridors, layer purposes) is comput
 in Python from files already parsed by earlier phases; the MCP caller only picks
 nets, reviews previews, and confirms writes.
 
-### 7.1 Board-local state JSON (`<board>.board_local.json`, NOT in git)
+### 7.1 — LANDED 2026-07-21 (anchor). Board-local state JSON (`<board>.board_local.json`, NOT in git)
 
-Companion to `pcb_settings.json`, with the opposite contract:
-- **`pcb_settings.json`** = shareable *policy* (weights, multipliers) → committed.
-- **`<board>.board_local.json`** (e.g. `kiln.board_local.json`, next to the board
-  file) = *state of this working board* → **gitignored** (already in the kilnCtl
-  `.gitignore`, along with `/*.route_progress.jsonl`; still need the README note
-  that the file is disposable).
+`_board_local_path` / `load_board_local` / `save_board_local` +
+`record_confirmed_bus` in `kicad_pcb_tool.py` (after `init_pcb_settings`).
+Contract as designed: `pcb_settings.json` = committed shareable policy;
+`<board_stem>.board_local.json` next to the board = gitignored per-board state
+(both `.gitignore` entries verified present; README "disposable" note still
+owed with the M3 docs). Schema (all keys optional, unknown keys preserved;
+tools create/extend as they run): `version`, `autorouter_owned`
+`{segments, vias}` (every uuid the router ever wrote — rip-up/undo only ever
+touches these, never human copper), `keepouts`, `net_overrides`
+(`{priority, layers}` per net), `confirmed_buses`
+(`{bus_type, nets, hub_ic, name, confirmed_on}` — user verifications cached so
+re-runs don't re-ask), `last_route_session`. `detect_buses` marks candidates
+`confirmed:true/false` (+`confirmed_on`/`confirmed_name`) by matching
+bus_type + exact net set, result gains `confirmed_count`; membership changes
+require re-confirmation (by design). Deviations approved at review:
+`save_board_local` writes verbatim (load-modify-save contract), no merge;
+`load_board_local` returns `{board_local_path, loaded_from_file, data}`.
 
-Contents (all optional, tools create/extend it as they run):
-```json
-{
-  "version": 1,
-  "autorouter_owned": { "segments": ["uuid", ...], "vias": ["uuid", ...] },
-      // every uuid the autorouter has ever written -> rip-up/undo only ever
-      // touches copper the router itself created, never human routing
-  "keepouts": [ {"layer": "F.Cu", "rect": [x1, y1, x2, y2], "note": "antenna area"} ],
-  "net_overrides": { "/MainControler/MOSI": {"priority": 10, "layers": ["F.Cu"]} },
-  "confirmed_buses": [ { "bus_type": "SPI", "nets": [...], "hub_ic": "U1",
-                         "name": "SPI_MainControler", "confirmed_on": "2026-07-21" } ],
-      // Phase 3 user verifications cached here so re-runs don't re-ask
-  "last_route_session": { "routed": [...], "failed": [...], "grid_mm": 0.2 }
-}
-```
-`load_board_local` / `save_board_local` helpers mirror `load_pcb_settings` (deep
-merge over `{}`, tolerant of a missing file). Caching **confirmed bus
-verifications** here also retro-improves Phases 3–5: detection re-runs present only
-*new* candidates and reuse prior confirmations.
+### 7.2 — LANDED 2026-07-21 (anchor). Layer purposes from the board file
 
-### 7.2 Layer purposes from the board file
-
-The board's `(layers ...)` block already types every layer — verified on kiln:
-`F.Cu`/`B.Cu` are `signal`, `In1.Cu`/`In2.Cu` are `power` (KiCad also allows
-`mixed` and `jumper`). New parser `_parse_board_layers(board_path)` (cached) returns
-`{name, ordinal, type, user_name}` per copper layer.
-
-Cost integration: each net gets a `net_kind` (`power` if its name matches
-`layer_purpose.power_net_patterns` or its netclass says so; else `signal`), and
-every grid step on a layer is multiplied by
-`layer_purpose[net_kind][layer_type]` from `pcb_settings.json`. So routing a signal
-across `In1.Cu` (a power plane) costs 4x, a power net is happiest on a `power`
-layer, `mixed` is mildly penalized for everyone, and `jumper` layers are usable but
-discouraged for continuous routing. Unknown/`user` layers are simply not routable.
-The same multiplier table is also reported by `get_kicad_trace_cost` (Phase 6) as a
-per-net `layer_penalty`, so *existing* routing that violates layer purpose shows up
-in the cost triage too.
+`_parse_board_layers(_cached)` (new `_board_layers_cache`, invalidated with
+the others) → per-copper-layer `{name, ordinal, type, user_name}` **in file
+order** (the true stack order — kiln ordinals 0/4/6/2 are not stack-ordered);
+public `get_board_layers` → tool `get_kicad_board_layers` (73 tools total).
+Kiln golden: F.Cu/B.Cu `signal`, In1.Cu/In2.Cu `power`. `_net_kind(net_name,
+netclass=None, power_net_patterns=None)` — patterns tried against full name
+AND post-`/` basename (anchored `^GND` must catch `/Power/GND`); netclass
+check is token-based (power/pwr/gnd/ground/supply) but `get_trace_cost`
+currently classifies by name only (`_parse_nets` doesn't capture the `.net`
+`(class ...)` field). **Router cost integration (for 7.3): every grid step on
+a layer is multiplied by `layer_purpose[net_kind][layer_type]`** — signal
+across a power plane 4x, `mixed` mildly penalized, `jumper` usable but
+discouraged for continuous routing, unknown/`user` layers not routable.
+`get_trace_cost` already reports per net: `net_kind`,
+`metrics.layer_lengths_mm`, and `cost.layer_penalty` = Σ length_on_layer ×
+(multiplier − 1) × `w.length_mm` (segments+arcs only; vias have no dwell
+length; multipliers < 1 would discount — per spec, not clamped), included in
+net totals / `board_totals` / `weights_used`. Kiln: board total 5628.8 →
+6241.7 (`layer_penalty` 612.9 board-wide; 10 power / 144 signal nets; worst:
+GND_Main +182.1, 12V_Main +138.9, GND_Safty +117.8 — all power nets on signal
+layers: the Phase 7.5 plane motivation, now visible in triage).
 
 ### 7.3 Router core — two-stage: global route, then detailed route
 
@@ -585,11 +645,30 @@ path); **detailed routing** turns each choice into exact geometry. All Python.
    `autorouter_owned`. `write=False` preview: per-net length, vias, layers,
    est. Phase 6 cost, SVG, failures with reasons.
 
-Companion tools: `unroute_kicad_nets` (delete autorouter-owned copper for given
-nets — the undo), and `get_kicad_ratsnest` (list unrouted connections with airline
-lengths — ships first, also useful standalone). Ratsnest/ordering as before:
-union-find connectivity over pads+copper, MST decomposition of multi-pad nets,
-most-constrained first, `net_overrides.priority` wins.
+Companion tool still to build: `unroute_kicad_nets` (delete autorouter-owned
+copper for given nets — the undo).
+
+**Stage 1 LANDED 2026-07-21** (anchor): `kicad_router_tool.py` exists with
+`build_connectivity` (union-find islands per net) + `get_ratsnest` → tool
+`get_kicad_ratsnest` (74 tools). Contact rule: two items join when they share
+a copper layer and come within `reach_a + reach_b + 0.02 mm` (reach = half
+copper width; pad = half its larger dimension — deliberately generous, since
+false splits are the failure mode and over-merge stays within one net);
+through-hole pads span all copper layers; vias span the layers physically
+between their endpoints (stack order from `_parse_board_layers`). Airlines/MST
+edges are 2-D layer-agnostic between island terminal points, like KiCad.
+Ordering: `net_overrides.priority` desc, then shortest-airline-first.
+`_parse_footprint_pads` gained pad `size`/`type` keys (additive). **Scope
+addition approved at review:** minimal read-only `_parse_zone_fills` +
+scanline `_FillRaster` live in the router module because plane nets connect
+through filled pours (without them: 211 phantom connections; with: 39) —
+**7.5 must supersede and delete these** in favor of its real zone model.
+Verified on kiln: 39 missing connections / 726.2 mm airline / 149 nets fully
+routed / 25 unrouted / 62 single-pad; hand-checked shortest connections are
+genuinely unrouted (e.g. MOSI→R28.1 needs a via drop; 3.3V_Main pads await
+plane vias to In2.Cu). Perf: cold ≈ 9 s (three full board parses), warm
+≈ 0.2 s; per-net connectivity is O(n²) pairwise — add a spatial index before
+big-board work (7.8). 8 tests in `tests/test_ratsnest.py`.
 
 **7.3c Layer directions & layer-thrift (jumps) — whole-board ease by cost
 shaping.** Two disciplines every seasoned router uses, both implemented as cost
@@ -629,6 +708,13 @@ board score, and obey the same parity rules — no special-case path logic):
   existing 7.7 `bundle_layer`/`conflict_yield` decisions rather than a new
   decision type. Phase 6's `layer_span` weight makes multi-layer sprawl visible
   on *existing* boards too, before the router ever runs.
+- **Crossing pairs prefer adjacent layers.** When the global stage resolves a
+  crossing conflict by putting the two nets on different layers, candidate
+  scoring biases toward an **adjacent** copper-layer pair (the vias involved
+  span fewer layers and the return-path discontinuity at the crossing is
+  smaller). A pairing bias in crossing-conflict resolution, not a hard rule —
+  `layer_span` and via-span costs already price distant pairs; this breaks the
+  tie toward adjacency when costs are otherwise close.
 
 ### 7.4 What makes it better than a naive maze router
 - **Corridor-guided buses** (Phase 5 reuse): bundles stay bundled by cost shaping.
@@ -661,7 +747,11 @@ this board; it's how its power distribution actually works. All plane costs live
 zone — `net`, `layers` (KiCad 9 multi-layer zones — present on this board), `uuid`,
 `name`, `priority`, `hatch`/`connect_pads`/`min_thickness`/`fill` settings, outline
 `polygon` points, and `filled_polygon` blocks when present. Exposed as
-`list_kicad_zones`.
+`list_kicad_zones`. **Must supersede and delete the connectivity-only stopgap
+`_parse_zone_fills`/`_FillRaster` in `kicad_router_tool.py`** (added by 7.3
+stage 1 so plane nets don't false-split; no thermal-spoke/`connect_pads`/
+island-removal semantics) — port `get_ratsnest` onto the real zone model and
+keep its kiln result at 39 connections.
 
 **7.5.2 Fill model.** Authoritative fills are KiCad's ("Fill All Zones", `B`) — we
 never fabricate `filled_polygon` blocks. For costing, use the file's
@@ -710,6 +800,40 @@ writer; zone outlines are uuid-anchored s-expr surgery like `delete_group`:
 - Board-local JSON records `autorouter_owned.zones` uuids — the optimizer may only
   move/delete zones it created, never the six hand-made ones (they can only be
   *proposed* for change, for the user to confirm).
+
+### 7.5.6 Plane stitching pass (always runs LAST) + stitching-via management
+
+**Ordering contract: stitching is the final copper pass.** Only after all trace
+routing and plane creation/moves have converged (7.6's stopping rule fires)
+does a dedicated stitching pass place vias, in this order:
+1. **Island rescue** — attach would-be islands/stubs found by 7.5.3, at the
+   cheapest attachment positions it already computes.
+2. **Return-path stitching** — on power/ground planes, stitching vias near
+   high-speed traces (Phase 9 classification): target pitch
+   `stitching.near_high_speed_pitch_mm`, placed within
+   `stitching.near_high_speed_mm` of the trace wherever fill + DRC clearances
+   (7.11) allow.
+3. **General stitching** to `stitching.target_spacing_mm` where the budget
+   allows (7.7's `stitching_budget` decision type prices this).
+
+Every stitching via is `autorouter_owned` **and tagged `stitching: true`** in
+the board-local JSON — distinct from routing vias, so management tools can
+target exactly them.
+
+`remove_kicad_stitching_vias(project_path, area=None, write=False)` → tool:
+delete all stitching vias, or only those inside a given rect/polygon `area`.
+Deletes only autorouter-owned stitching vias; `include_foreign: true` *lists*
+(never auto-deletes) other freestanding same-net vias for the user to confirm
+one by one — kiln's 3 free vias would surface here.
+
+**Interaction rule (session contract):** before routing or optimizing in an
+area that contains stitching vias (owned or foreign), the session must ask the
+user whether to remove them first (AskUserQuestion with count + area); the
+answer is recorded per area in the board-local session so one run asks once,
+and removed stitching is re-placed by the final stitching pass anyway.
+
+Knobs `stitching`: `{target_spacing_mm: 5.0, near_high_speed_mm: 1.0,
+near_high_speed_pitch_mm: 2.0, enabled: true}`.
 
 ### 7.6 Iterative whole-board optimization (`optimize_kicad_board`)
 
@@ -1092,79 +1216,215 @@ copper is legal to change. The decision log (7.7) notes seeded/adopted origins o
 moves that modify them, so the final review shows "replaced adopted trace
 (was hand-routed, backed up)" distinctly from "rerouted own copper".
 
+### 7.11 DRC rules as router input ("the autorouter uses DRC")
+
+One resolver, `get_drc_constraints(project_path)` (cached) → tool
+`get_kicad_drc_constraints`, merging rule sources in precedence order:
+1. **Custom rules file** (the project's `.kicad_dru`, e.g. JLCPCB.kicad_dru.txt):
+   parse `(rule …)` constraints — clearance, track_width, via diameter/drill,
+   hole-to-hole — with condition expressions limited to the predicates we can
+   evaluate offline (netclass, layer, net name). **Unsupported conditions are
+   reported per rule, never silently ignored.**
+2. **Board/project design settings** (`.kicad_pcb` setup + `.kicad_pro`
+   net-class clearances/widths/minimums).
+3. `autorouter.clearance_fallback_mm` as the last resort.
+
+Everything geometric the router does consumes this one resolver: obstacle
+inflation (7.3b step 1), emit widths/via sizes, the pre-write self-check (7.3b
+step 5), plane fill estimation (7.5.2), stitching placement (7.5.6), neck-down
+width selection (7.12). **Acceptance gate:** every routing/optimization
+acceptance run ends with `kicad-cli pcb drc` on the written scratch board;
+new violations vs. the pre-route baseline fail the run (extends the M0
+kicad-cli harness into the router path). Lands with 7.3b, which is its first
+consumer.
+
+### 7.12 Neck-down: wide nets onto small pads
+
+Power net classes route wide (e.g. 1 mm) but must land on 0.3 mm IC pins/balls.
+Per connection endpoint: if the netclass/target width >
+`neck_down.max_width_vs_pad` × the pad's smaller copper dimension, emit a
+**neck** — the final stretch before the pad routes at `neck_width` =
+min(class width, pad-fit width), never below the 7.11 minimum, for a length
+between `neck_down.min_length_mm` and `max_length_mm` (at least the pad-escape
+distance out of the pin field). The 7.3b pad-escape stub is the natural home —
+stubs are already emitted separately from the gridded path. The self-check
+prices the neck at its true width (DRC-true), and Phase 4c
+`audit_netclass_conformance` must learn to accept necks: a segment narrower
+than its class is conformant when it terminates on a pad within neck length
+and matches the neck rules — otherwise still flagged. Knobs `neck_down`:
+`{enabled: true, max_width_vs_pad: 1.0, min_length_mm: 0.5, max_length_mm: 3.0}`.
+
+### 7.13 Impedance-matched traces & matched sets
+
+Now planned (was "out of scope until the core is proven"; still gated on 7.3b
+landing first). Applies to DIFF_PAIR candidates (Phase 3 structural detector),
+buses tagged impedance-critical (Phase 9), and explicit user sets.
+- **`impedance_profiles` in `pcb_settings.json`**: named profiles
+  `{target_ohms, per-layer {width, gap}, tolerance_mm}` plus `assignments`
+  (net-set → profile). Widths/gaps come from the user's stackup/field-solver —
+  **we enforce the geometry the user specifies; we never compute impedance.**
+- **Coupled routing:** a pair/set routes as one search — 7.3a already treats
+  bundles as one capacity unit; 7.3b routes the P/N pair simultaneously as two
+  parallel traces at profile width/gap, layer changes as a via pair.
+  Uncoupled stretches exist only for pad escape and are reported as
+  `uncoupled_mm`, never hidden.
+- **Length matching:** within a matched set, after routing, serpentine/trombone
+  meanders are inserted in the slack member (inside its own corridor,
+  self-checked against 7.11) until lengths agree within `tolerance_mm`; report
+  final per-member lengths + residual mismatch. The meander emitter is a
+  shared helper (DDR-class buses reuse it).
+- **Stack-up gate:** an impedance-critical net with no assigned profile trips
+  the same "wait until impedance control / stack-up is set up?" question as
+  Phase 9's critical-length gate — one code path, one recorded answer.
+
+### 7.14 Connector detection & pin-swap advisor
+
+`detect_connectors(project_path)` → tool `detect_kicad_connectors` (read-only):
+candidates by ref prefix (`pin_swap.ref_prefixes`, default J/P/CN/X) plus
+footprint/library names containing connector tokens; returns refs, pin counts,
+attached nets. It never guesses swappability — that is the user's call.
+
+**Interaction contract (before optimization):** present detected connectors and
+ask (a) whether the optimizer may consider pin swaps at all, (b) which
+connectors are off-limits, (c) optional per-connector swappable pin groups
+(default: signal pins swappable within one connector; power/ground pins —
+Phase 9/`_net_kind` classification — excluded). **Exclusion validation:** every
+exclusion the user names must resolve to a detected connector (case-insensitive
+ref match); unresolved names abort loudly with the detected-ref list shown —
+no silent typo drops.
+
+**Optimizer move (7.6 family):** a swap = re-terminating two nets' ratsnest
+endpoints on that connector; scored like any move. **The tool never edits the
+schematic.** If the best swap gains ≥ `pin_swap.min_gain` board-score points,
+the session pauses (`awaiting_decision`, decision type `pin_swap`) and asks the
+**user** — not the 7.7 AI — to make the change in the schematic and re-export
+the netlist; the session re-syncs (netlist-staleness check) and continues.
+Sub-threshold swaps are reported, not proposed. Knobs `pin_swap`:
+`{enabled: false, min_gain: 25.0, ref_prefixes: ["J","P","CN","X"]}` (off by
+default — consent-gated anyway).
+
+### 7.15 Effort control & plateau-based stopping
+
+- **Effort question at session start:** the session asks the user
+  (AskUserQuestion) how much effort to spend, three defaults mapping to
+  `optimizer.effort` presets — **quick** (one pass + cheap cleanup:
+  max_iterations 5, replicas 1, greedy), **balanced** (today's defaults),
+  **best** (SA on, replicas max, hours-scale time budget — "overnight") — plus
+  free-form override of explicit knobs.
+- **Plateau stopping (primary rule; the user-requested "iterate until the pace
+  of improvement slows dramatically"):** track per-iteration board-score
+  improvement; reference rate = mean of the first `plateau_window` productive
+  iterations; **stop when the trailing-window mean rate <
+  `plateau_slope_ratio` × reference** (defaults: window 3, ratio 0.1 — pace
+  fell to a tenth), or on the hard budgets. Score curve + both rates land in
+  the session log and viewer so "why did it stop" is inspectable.
+  `convergence_delta` survives only as a floor for degenerate curves.
+- Knobs under `optimizer`: `"effort": "balanced"`, `"plateau_window": 3`,
+  `"plateau_slope_ratio": 0.1`.
+
+### 7.16 Benchmark harness — other people's boards vs. the autorouter
+
+Measure the router against real human routing, not just synthetic stress.
+`benchmark_autoroute(source_board, mode)` → tool `benchmark_kicad_autoroute`
+(scratch copies only; the source board is never written):
+- Modes: `strip_and_reroute` (delete all non-zone copper, keep zones +
+  placement, route from zero) and `complete_only` (route only what's
+  unrouted).
+- Metrics vs. the human original: completion %, total copper length, via
+  count, Phase 6 board score (same weights both sides), per-layer utilization,
+  DRC violation count (7.11 gate), runtime.
+- Corpus: `benchmarks/boards/` (gitignored except a manifest recording each
+  board's source + license) — openly-licensed KiCad boards (KiCad demos,
+  open-hardware projects).
+- Once 7.3b lands, router milestone acceptance gains corpus targets ("≥N%
+  completion, DRC-clean") and the hand-vs-auto comparison tables join the
+  M4/M5 reports.
+
 ---
 
-## Phase 8 — Net-aware capacitor voltage check (schematic audit extension)
+## Phase 8 — LANDED 2026-07-21 (reference anchor; only its M2 docs item remains, in the build order)
 
-Goal: extend the schematic-check family with a check that reads **net names as
-voltage labels** and verifies each capacitor's voltage rating against the voltage
-it actually sits across — rating vs. |V(net_a) − V(net_b)| — instead of only
-checking that a rating is written in the Value field (which is all the existing
-`audit_capacitor_voltages` does). Knobs live in `pcb_settings.json` under
-`schematic_checks.cap_voltage` (see 6.1).
+`_infer_net_voltage(net_name, net_voltages, gnd_tokens)` (standalone helper
+right after `_coerce_voltage` — **kept standalone deliberately**: Phase 7.2's
+`power_net_patterns` says *whether* a net is power, this says *what voltage*,
+and the autorouter/plane phases may adopt it, e.g. warning when zones of
+different inferred voltages overlap) + `audit_capacitor_net_voltages` in
+`kicad_pcb_tool.py`; registered as tool `audit_kicad_capacitor_net_voltages`
+(72 tools total). Precedence override → gnd → label → none with per-net
+`source`; 3V3/1V8 convention; GND-beats-label + `ambiguous_label`; verdicts
+`under_rated`/`unknown_rating`/`under_derated`/`ok`/`one_net_unlabeled` (with
+`assumed_applied_v`)/`no_labeled_nets`/`unsupported_pins`, sorted worst-first;
+netlist-staleness cross-check as in `detect_buses`; knobs from
+`schematic_checks.cap_voltage`. 12 tests in `tests/test_cap_net_voltage_audit.py`
++ new synthetic cap-schematic generator `tests/synthetic_cap_schematic.py`.
 
-`audit_capacitor_net_voltages(project_path)` → tool
-`audit_kicad_capacitor_net_voltages`. Read-only. Sits beside (does not replace)
-`audit_capacitor_voltages`, reusing its `_extract_voltage`/`_coerce_voltage`
-helpers and `C<n>` reference convention.
+**Spec deviations recorded (approved at review, 2026-07-21):**
+- Iterates `_flatten_schematic_components` (with `_CAPACITOR_REF_RE` + DNP
+  exclusion) instead of `list_schematic_parts`' grouped output — the check is
+  per-instance and grouping by Value+Footprint loses per-instance nets.
+- `_VOLTAGE_RE` and digit-V-digit are combined into one alternation regex
+  (digit-V-digit first) so `3V3` matches once instead of spuriously flagging
+  `ambiguous_label`.
+- Rows gain `rated_v_source` (`value`/`default`/`unknown`).
 
-### 8.1 Inferring a net's voltage from its name
-Order of precedence, applied to the net's **basename** (last `/` segment):
-1. **Explicit override** in `net_voltages` (exact, case-insensitive match) — for
-   names that carry no number (`VBUS`, `AREF`).
-2. **GND rule (as specified):** name contains any `gnd_tokens` token
-   (case-insensitive substring) → **0 V**. Covers `GND_Main`, `GND_Safty`, `AGND`…
-3. **Labeled voltage:** reuse the `_VOLTAGE_RE` pattern against the name —
-   `12V_Main` → 12.0, `3.3v_Safty` → 3.3, `+5V` → 5.0. Also accept the `3V3`/`1V8`
-   digit-V-digit convention (`(\d+)[vV](\d+)` → 3.3, 1.8). Multiple voltage tokens
-   in one name → take the largest and flag the row `ambiguous_label`.
-4. Otherwise → **unlabeled** (no voltage known).
+Verified on kiln: 68 caps — 0 under_rated, 24 unknown_rating, 0 under_derated,
+3 ok, 31 one_net_unlabeled, 10 no_labeled_nets; `stale_netlist_warnings` empty.
+Hand-checked: C9 (470 µF bulk cap, `12V_Main`↔`GND_Main`) → `unknown_rating`
+is a **real schematic finding** — its live Value field is just `"470uf"`; the
+stale `.net` cached value still says `"470uf 50v"` and the MPN (UCM1H471MNJ1MS)
+is a 50 V part, so the schematic Value lost its rating at some point. C13
+(regulator bootstrap cap across BST/SW) correctly `no_labeled_nets`. No cap on
+kiln sits across two non-ground labeled rails (that path is synthetic-tested
+only). Known limit: the staleness guard cross-checks net *names* only — it
+cannot catch component-*value* staleness like C9's.
 
-Each inferred voltage is reported with its `source`
-(`override | gnd | label | none`) so a wrong guess is visible, never silent.
+---
 
-### 8.2 The check, per capacitor
-Capacitors from `list_schematic_parts` (`C<n>` refs); each instance's two nets from
-the netlist (`_parse_nets` membership — same source Phase 3 uses). Per cap:
+## Phase 9 — High-speed & critical-net classification (feeds the cost model and pre-route gates)
 
-- **applied_v** = |V(net_a) − V(net_b)| when both nets resolve — the cap between
-  12 V and 3.3 V rails sees 8.7 V, not 12; a decoupler `12V_Main`↔`GND_Main` sees
-  12. This differential form is why the check needs *both* nets, per the request.
-- **rated_v** = `_extract_voltage` on the Value field, else
-  `default_cap_rating`, else unknown.
-- **Verdict** (`derating_min_ratio` = 2.0 default):
-  - `under_rated` — rated_v < applied_v (hard fail, e.g. 6.3 V cap on a 12 V rail),
-  - `under_derated` — rated_v < ratio x applied_v (works, but violates derating
-    policy — the common ceramic-DC-bias trap),
-  - `ok` — rated_v ≥ ratio x applied_v,
-  - `unknown_rating` — cap on a voltage-labeled net with no rating anywhere
-    (this is precisely the cap worth chasing; listed first after failures),
-  - `one_net_unlabeled` — one side resolved, other unknown: reported
-    informationally with `assumed_applied_v` = the resolved side vs. 0 V
-    (right for the overwhelmingly common rail↔signal decoupler case, and
-    labeled as an assumption),
-  - `no_labeled_nets` — neither side resolves; skipped from scoring, counted.
-- Edge cases: caps with ≠2 pins (arrays/4-terminal) flagged `unsupported_pins`
-  and skipped; DNP caps excluded (reusing list_schematic_parts' DNP handling);
-  net names matching both a gnd token and a voltage label (`GND_5V_RTN`) → GND
-  wins (precedence above) and the row is flagged `ambiguous_label`.
+`classify_critical_nets(project_path)` → tool `detect_kicad_critical_nets`.
+Read-only, pure analysis, landable independently of the router (like Phase 8
+was); the router and `get_trace_cost` consume its output where present.
 
-Output: rows sorted worst-first (`under_rated`, `unknown_rating`,
-`under_derated`, …), each with reference, value, rated_v, both nets with their
-inferred voltage + source, applied_v, required_min (= ratio x applied), verdict —
-plus summary counts and the settings used (self-describing like Phase 6).
+**Classification sources (each row reports its `reason`):**
+1. **Bus/net-name high-speed table.** Bus types from Phase 3 detection plus
+   name tokens (CLK, MCLK, …) map to a typical frequency via
+   `high_speed.bus_frequencies_mhz` — defaults `{SPI: 20, QSPI: 80, I2C: 0.4,
+   I2S: 12, UART: 1, CAN: 1, USB: 480, MIPI: 1000, DDR: 800, SWD: 4,
+   JTAG: 10, CLK: 25}` — every value user-overridable.
+2. **XTAL nets.** Nets touching a crystal/resonator (ref `Y*`/`X*`, or
+   footprint/lib name containing crystal/resonator/osc tokens) are always
+   critical with the highest length weight — the concern is parasitics and
+   drive level, not impedance, so the multiplier applies even when short.
+3. **Switching-supply inductors.** An `L*` component whose footprint/courtyard
+   exceeds `switch_node.min_inductor_mm` square (default 2.0 × 2.0 mm) with
+   one terminal net reaching an IC pin → that terminal net is a **switch
+   node** (`switch_node: true`): per-mm cost ×
+   `switch_node.length_weight_mult` (default 8) to keep it short.
 
-### 8.3 Fit with the rest of the plan
-- Pure reuse: netlist parsing (Phase 0 infra), `_extract_voltage` (existing),
-  settings loader (6.1). No new file parsing.
-- The net-name voltage inference (8.1) is deliberately a standalone helper
-  (`_infer_net_voltage`) — Phase 7.2's `power_net_patterns` says *whether* a net
-  is power; this says *what voltage* — and the autorouter/plane phases may adopt
-  it later (e.g. warning when zones of different inferred voltages overlap), so
-  it must not be buried inside the audit function.
-- Docs: covered in `docs/mcp-tools/10-netclasses-and-buses.md`'s audit section
-  (or the existing schematic-data page `02-schematic-data.md` if that reads more
-  naturally at write-time — implementer's call, note it in the doc commit).
+**Critical length per bus type:** `L_crit = v × t_rise / 6`, with
+`v = c × high_speed.velocity_fraction` (default 0.5 — mid-FR4) and
+`t_rise = high_speed.rise_fraction / f` (default 0.05 — rise ≈ 5 % of the bit
+period); per-bus-type overrides in `high_speed.critical_length_overrides_mm`.
+The resolved table is included in the result so every number is inspectable.
+
+**Pre-route gate (interaction):** before routing/optimizing, for every
+critical net whose **straight-line distance between its connection points ≥
+`high_speed.critical_fraction` (default 0.9) × L_crit**, the session asks the
+user whether to pause until impedance control / stack-up is configured (same
+gate and recorded answer as 7.13's missing-profile case; stored per net set in
+the board-local JSON).
+
+**Cost integration:** classified nets get a per-net length-weight multiplier —
+`high_speed.length_weight_mult` (default 4) for fast data/clock lines, the
+switch-node multiplier for SW nets, XTAL highest — applied in `get_trace_cost`
+and every router cost model, so the optimizer shortens exactly these first.
+Per-net report: `{critical: true, reason, frequency_mhz, l_crit_mm,
+straight_line_mm, multiplier}`.
+
+Reuses `detect_buses`, `_net_kind`, `_parse_footprint_pads` (pad/courtyard
+sizes), netlist membership. Knob blocks `high_speed` + `switch_node` (schema
+in 6.1).
 
 ---
 
@@ -1173,15 +1433,15 @@ plus summary counts and the settings used (self-describing like Phase 6).
 Work phases as sub-tasks delegated to subagents, keeping plan/decisions in the main
 session (which also owns all user-facing verification questions):
 
-- **Router core & geometry (Phases 5, 7.3), plane engine (7.5), optimizer +
+- **Router core & geometry (Phase 7.3), plane engine (7.5), optimizer +
   decision protocol (7.6/7.7)** — the algorithm-heavy code: delegate to an
   **Opus** subagent with the relevant plan section pasted in whole; require it to
   run against `kiln.kicad_pcb` (a scratch copy for anything that writes) and
-  report measured numbers (corridor areas, routed lengths, island counts,
-  before/after board score, global-stage runtimes), not just code. 7.3a, 7.3b,
+  report measured numbers (routed lengths, island counts, before/after board
+  score, global-stage runtimes), not just code. 7.3a, 7.3b,
   7.5, and 7.6/7.7 are separate delegations, each landed and reviewed before the
   next; 7.7's delegation must include the scripted-decider test harness.
-- **Parsers, inventory, settings plumbing (Phases 1, 2, 6.1, 7.1, 7.2, 7.5.1)** —
+- **Parsers, inventory, settings plumbing (Phase 7.5.1)** —
   pattern-following work with clear specs: **Sonnet** subagents, one phase each, in
   dependency order; verify each lands green before starting a dependent.
 - **Progress viewer (7.9)** — self-contained, spec'd, and decoupled from the
@@ -1194,14 +1454,15 @@ session (which also owns all user-facing verification questions):
   runtime/memory numbers at 10x and 100x kiln scale, not just working code.
 - **Docs (docs page, README, CLAUDE.md updates)** — **Haiku** subagent once code is
   merged, with the final tool list as input.
-- **Test infrastructure (M0)** — pytest fixtures and golden files: **Sonnet**;
-  the synthetic board generator too (it reuses the emit helpers and its output
-  must open in KiCad — acceptance is a screenshot of a generated board loaded
-  in pcbnew without errors).
-- **Bus signatures dictionary (3a)** and **net-voltage cap audit (Phase 8)** —
-  well-specified, reuse-heavy work: Sonnet. Phase 8's acceptance test: run it on
-  kiln and hand-check a few rows (a `12V_Main`↔`GND_Main` decoupler, a cap
-  between two labeled rails, an unlabeled-net cap) against the schematic.
+- **Phase 9 classification, 7.16 benchmark harness, 7.12 neck-down, 7.14
+  connector detection** — well-specified, reuse-heavy: **Sonnet** delegations.
+  Phase 9's acceptance: run on kiln and hand-check the classification table
+  (kiln has SPI/I2C buses and at least one XTAL; check whether any inductor
+  trips the switch-node rule). 7.14's acceptance must include the
+  exclusion-validation error path.
+- **7.13 impedance/matched sets and the 7.14 optimizer move + pause-the-user
+  protocol** — algorithm-heavy, ride the router core: **Opus**, after their
+  build-order prerequisites.
 - Always: subagent output reviewed in the main session against this plan; each
   completed delegation removes its items from this file per "How to work this plan".
 
@@ -1211,8 +1472,6 @@ session (which also owns all user-facing verification questions):
 
 | Tool | Function | Writes? |
 |------|----------|---------|
-| `measure_kicad_bus_corridor_area` | `measure_bus_corridor_areas` | no |
-| `get_kicad_ratsnest` | `get_ratsnest` | no |
 | `route_kicad_nets` | `route_nets` | **yes (board + board_local.json)** |
 | `unroute_kicad_nets` | `unroute_nets` | **yes (board + board_local.json)** |
 | `list_kicad_zones` | `list_zones` | no |
@@ -1227,28 +1486,26 @@ session (which also owns all user-facing verification questions):
 | `get_kicad_system_resources` | `probe_system_resources` | no |
 | `adopt_kicad_routing` | `adopt_routing` | **yes (board_local.json)** |
 | `seed_kicad_routing_from_board` | `seed_routing_from_board` | **yes (board + board_local.json)** |
-| `audit_kicad_capacitor_net_voltages` | `audit_capacitor_net_voltages` | no |
+| `get_kicad_drc_constraints` | `get_drc_constraints` | no |
+| `remove_kicad_stitching_vias` | `remove_stitching_vias` | **yes (board + board_local.json)** |
+| `detect_kicad_connectors` | `detect_connectors` | no |
+| `detect_kicad_critical_nets` | `classify_critical_nets` | no |
+| `benchmark_kicad_autoroute` | `benchmark_autoroute` | no (scratch copies + report files) |
 
 Each registered in `self.tools` with `inputSchema` + a `_tool_*` handler, exactly
 like the existing entries.
 
-### Documentation updates (required — part of this feature)
-- **New** `docs/mcp-tools/10-netclasses-and-buses.md` — one section per tool above
-  (purpose, inputs, output shape, example call/response), plus a short "how bus
-  corridor area is computed / how spurs are grouped per IC" explainer so the
-  measurement is reproducible by a reader, plus a "trace cost model & the
-  `pcb_settings.json` schema" section (every weight/knob, its units, defaults, and a
-  worked cost example).
-- **`README.md`** — add the new tool group to the tool listing/count, a short
-  "Net classes & bus analysis" blurb, and link the new docs page. (README is
-  currently open in the editor.)
-- **`CLAUDE.md`** — bump the "exposes 61 tools across 9 groups" line to the new
-  count/group, add the new group to the group list and the
-  `docs/mcp-tools/` reference, and note `NETCLASS_PLAN.md` as the design doc.
-- Keep the tool count in README and CLAUDE.md in sync with the new tools added
-  (Phases 1–7), and document **both** config files: `pcb_settings.json`
-  (committed policy) and `<board>.board_local.json` (gitignored per-board state —
-  document that it's disposable and how the autorouter uses it).
+### Documentation updates (still owed; M1 + M2 passes landed 2026-07-21 —
+`docs/mcp-tools/10-netclasses-and-buses.md` covers all 11 group-10 tools with
+the bus-qualification, corridor-area, and cost-model/`pcb_settings.json`
+explainers; README + CLAUDE.md synced at 72 tools / 10 groups)
+- Extend `docs/mcp-tools/10-netclasses-and-buses.md` (or the autorouter page,
+  as fits) as each remaining tool in the summary table above lands (same
+  per-tool format).
+- Keep the tool count in README and CLAUDE.md in sync as Phase 7 tools land,
+  and document `<board>.board_local.json` (gitignored per-board state —
+  disposable, and how the autorouter uses it) when Phase 7.1
+  introduces it.
 - Autorouter gets its own docs page `docs/mcp-tools/11-autorouter.md`: pipeline,
   cost model incl. layer-purpose multipliers, rip-up rules ("only autorouter-owned
   copper"), failure reporting, and the route→review→write workflow.
@@ -1280,14 +1537,23 @@ like the existing entries.
 2. Starting point: nothing (route from scratch), `adopt_kicad_routing` (improve
    the board as routed), and/or `seed_kicad_routing_from_board` (carry over an
    earlier revision).
-3. `get_kicad_ratsnest` → what's unrouted; `open_kicad_route_viewer` to watch.
-4. `optimize_kicad_board` (or plain `route_kicad_nets` for a quick single pass) —
+3. **Session-start questions (AskUserQuestion, answers recorded in the
+   board-local session):** effort level (7.15 — three presets); the Phase 9
+   critical-length / 7.13 missing-profile stack-up gate ("pause until
+   impedance control / stack-up is set up?") for any tripped nets; pin-swap
+   consent + exclusions (7.14, validated loudly); and, per area containing
+   existing stitching vias, whether to remove them before routing (7.5.6).
+4. `get_kicad_ratsnest` → what's unrouted; `open_kicad_route_viewer` to watch.
+5. `optimize_kicad_board` (or plain `route_kicad_nets` for a quick single pass) —
    chunk by chunk; answer `awaiting_decision` pauses via `decide_kicad_route`;
-   plane proposals touching hand-made zones go to the **user**, not the AI.
-5. Converged → review the dry-run diff, per-net costs, decision log, SVG/viewer →
+   plane proposals touching hand-made zones and pin-swap proposals go to the
+   **user**, not the AI. Iterates until the 7.15 plateau rule fires.
+6. Stitching pass runs last (7.5.6), then: review the dry-run diff, per-net
+   costs, decision log, SVG/viewer →
    `write=True` (backup taken automatically if adopted copper changed).
-6. In KiCad: refill zones (`B`), run DRC — the authoritative check. Iterate from
-   step 4 if wanted; `unroute_kicad_nets` undoes any autorouter copper.
+7. In KiCad: refill zones (`B`), run DRC — the authoritative check (the run
+   already self-gated on `kicad-cli pcb drc`, 7.11). Iterate from
+   step 5 if wanted; `unroute_kicad_nets` undoes any autorouter copper.
 
 ---
 
@@ -1349,23 +1615,26 @@ synthetic-only projects), and `kicad-cli pcb drc` acceptance tests (KiCad
 passing under `mykicadMcp\.venv`. Only non-automated bit: a literal pcbnew-GUI
 screenshot — the kicad-cli DRC load exercises the same board reader.
 
-**M1 — Net classes end-to-end (Flow A works)** — all code landed 2026-07-21
-(Phases 1, 2, 3, 6-stubbed, 4; see their anchors). Remaining to close M1: only
-the milestone docs pass — `docs/mcp-tools/10-netclasses-and-buses.md` for the
-9 landed tools, README + CLAUDE.md tool count/group sync (61 → 70 tools),
-`pcb_settings.json` documented as committed policy.
+**M1 — Net classes end-to-end (Flow A works) — DONE 2026-07-21** (code:
+Phases 1, 2, 3, 6-stubbed, 4 — see their anchors; docs pass landed:
+`docs/mcp-tools/10-netclasses-and-buses.md`, README + CLAUDE.md at 70 tools /
+10 groups, `pcb_settings.json` documented as committed policy).
 
-**M2 — Analysis suite:**
-8. Phase 5 corridor areas (unstubs Phase 6's deviation terms).
-9. Phase 8 net-aware cap voltage audit (independent; any time after step 6).
+**M2 — Analysis suite — DONE 2026-07-21** (Phases 5 + 8, the Phase 6 deviation
+unstub, and the M2 docs pass all landed — see the phase anchors;
+`docs/mcp-tools/10-netclasses-and-buses.md` covers all 11 group-10 tools,
+README + CLAUDE.md synced at 72 tools).
 
-**M3 — Router MVP (routes real nets, single pass):**
-10. Phase 7.1/7.2 board-local JSON + layer-purpose parser (also wires the
-    layer-penalty report into Phase 6 output).
-11. Phase 7.3 — ratsnest/connectivity first (`get_kicad_ratsnest` ships as soon
-    as it works), then 7.3a global routing (candidate lists reviewable on their
-    own — also the 7.7 decision surface), then 7.3b detailed: windows + pad
-    escape + A* + rip-up + self-check + emit/unroute. Integer milli-cost
+**M3 — Router MVP (routes real nets, single pass)** (step 10, Phase 7.1/7.2,
+landed 2026-07-21 — see their anchors; remaining:):
+11. Phase 7.3 (stage 1, ratsnest/connectivity, landed 2026-07-21 — see the
+    anchor in 7.3): next 7.3a global routing (candidate lists reviewable on
+    their own — also the 7.7 decision surface), then 7.3b detailed: windows +
+    pad escape + A* + rip-up + self-check + emit/unroute, **with the 7.11 DRC
+    constraint resolver — partially landed 2026-07-21, see the status
+    snapshot — finished first inside the 7.3b delegation** (obstacle
+    inflation and the self-check consume it) and 7.12 neck-down riding the
+    pad-escape stub. Integer milli-cost
     quantization and the memory planner land here (cpu tier is the reference
     everything else must match); multi-core waves land here too (the wave
     decomposition is shared by all tiers; parity suite runs workers=1 vs N).
@@ -1373,15 +1642,19 @@ the milestone docs pass — `docs/mcp-tools/10-netclasses-and-buses.md` for the
     7.3b emits events.
 
 **M4 — Planes + whole-board optimization:**
-13. Phase 7.5 plane engine — zone parser/`list_kicad_zones`, then fill estimation
+13. Phase 7.5 plane engine — zone parser/`list_kicad_zones` (supersedes the 7.3
+    stage-1 zone-fill stopgap), then fill estimation
     + `audit_kicad_plane_islands` (validated against KiCad's own fills on the six
     existing zones), then plane-aware routing, then propose/create/modify
-    (writers last).
+    (writers last), then the 7.5.6 stitching pass +
+    `remove_kicad_stitching_vias` + its ask-before-routing interaction rule
+    (stitching is last in the run order AND last in this milestone).
 14. Phase 7.6 optimizer + 7.7 decision protocol — greedy first, SA once greedy is
     trusted; sessions/resume before decisions (7.7 rides the session mechanism);
     7.7 verified with a scripted decider (canned answers) before a live AI sits
-    in the loop. Viewer gains the cancel flag + decision banner. Portfolio
-    replicas land here (a session feature).
+    in the loop. **7.15 effort presets + plateau stopping land with 7.6** (they
+    are its stopping/budget layer). Viewer gains the cancel flag + decision
+    banner. Portfolio replicas land here (a session feature).
 15. Phase 7.10 warm start — adoption with 7.6 (ownership flag + backup rule);
     cross-board seeding after it (feeds 7.3a priors). Acceptance: adopt kiln's
     routing on a scratch copy, optimize, verify backup exists and the diff only
@@ -1394,6 +1667,26 @@ the milestone docs pass — `docs/mcp-tools/10-netclasses-and-buses.md` for the
     run completes via demotion, not crash. Hybrid scheduling last, once both
     executors exist (hybrid vs cpu-only parity proves executor assignment can't
     change results).
+
+**M6 — Routing intelligence (added 2026-07-21 at user request):**
+17. Phase 9 high-speed & critical-net classification
+    (`detect_kicad_critical_nets` + cost-model multipliers + the stack-up
+    gate) — code landed 2026-07-21 but unreviewed with a kiln zero-result
+    defect and no MCP registration (see the status snapshot); finish =
+    diagnose defect + coordinator review + register; its cost multipliers
+    start paying off in `get_kicad_trace_cost` immediately and in the router
+    as it lands.
+18. Phase 7.13 impedance-matched sets (coupled pair routing + length-matching
+    meanders + profiles/assignments) — after 7.3b; Opus.
+19. Phase 7.14 connector pin-swap advisor (detection any time; the optimizer
+    move + pause-and-ask-the-user protocol after 7.6) — exclusion validation
+    is part of its acceptance tests.
+20. Phase 7.16 benchmark harness + corpus (`benchmark_kicad_autoroute`) —
+    after 7.3b for `strip_and_reroute`; corpus targets attach to M4/M5
+    acceptance.
+21. Optional Phase 5 refinements recorded in its anchor: per-station polyline
+    centerline (S-shaped bundles read slightly high today) and
+    equidistant-trunk splitting.
 
 **Every milestone:** docs for its tools (`docs/mcp-tools/10-…`/`11-…`), README +
 CLAUDE.md tool count/group sync, `.gitignore`/requirements entries when that
