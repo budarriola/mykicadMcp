@@ -4842,6 +4842,7 @@ DEFAULT_PCB_SETTINGS: dict[str, Any] = {
     },
     "corridor": {"clip_band_mult": 3.0},
     "bus_detection": {"ic_ref_prefixes": ["U", "IC"], "extra_signatures": {}},
+    "pin_swap": {"enabled": False, "min_gain": 25.0, "ref_prefixes": ["J", "P", "CN", "X"]},
     "layer_purpose": {
         "signal": {"signal": 1.0, "mixed": 1.2, "power": 4.0, "jumper": 2.0},
         "power": {"signal": 2.0, "mixed": 1.2, "power": 1.0, "jumper": 3.0},
@@ -5314,7 +5315,7 @@ def classify_critical_nets(project_path: str | Path) -> dict[str, Any]:
     components = _parse_board_components_cached(board_path)
     nets = _parse_nets_cached(netlist_path)
     footprints = _parse_footprint_pads_cached(board_path)
-    _, net_map = _build_net_maps(nets)
+    refs_to_nets, net_map = _build_net_maps(nets)
 
     # Build a map: component reference -> component info
     comp_by_ref = {c.get("reference", ""): c for c in components}
@@ -5346,7 +5347,13 @@ def classify_critical_nets(project_path: str | Path) -> dict[str, Any]:
             continue
         bus_type = cand.get("bus_type", "")
         if bus_type in bus_frequencies_mhz:
-            members = cand.get("members", [])
+            # detect_buses candidates key their member nets as "nets" (each
+            # {"net", "role", "width_summary"}), not "members" - see the
+            # `candidates.append({... "nets": member_entries ...})` sites in
+            # detect_buses. Using the wrong key silently produced an empty
+            # list for every bus candidate, so no bus ever contributed a
+            # critical net (root cause of the kiln smoke-test failures).
+            members = cand.get("nets", [])
             for member in members:
                 net_name = member.get("net", "")
                 if net_name:
@@ -5359,8 +5366,12 @@ def classify_critical_nets(project_path: str | Path) -> dict[str, Any]:
         ref = comp.get("reference", "").upper()
         footprint = comp.get("footprint", "").upper()
         if ref.startswith(("Y", "X")) or any(token in footprint for token in xtal_tokens):
-            # Get all nets connected to this component
-            nets_for_comp = net_map.get(ref, [])
+            # Get all nets connected to this component. `net_map` is keyed by
+            # net name (see _build_net_maps), not by component ref - the
+            # ref-keyed lookup table is `refs_to_nets`. Using `net_map` here
+            # silently returned [] for every component, so XTAL nets were
+            # never detected regardless of whether a crystal was present.
+            nets_for_comp = refs_to_nets.get(ref, [])
             for node in nets_for_comp:
                 net_name = node.get("net", "")
                 if net_name:
@@ -5381,18 +5392,37 @@ def classify_critical_nets(project_path: str | Path) -> dict[str, Any]:
         if not fp:
             continue
 
-        # Check footprint courtyard size: both x and y must be >= min_inductor_mm
-        # For now, use pad positions as a proxy for footprint size
+        # Check footprint size: both x and y must be >= min_inductor_mm. No
+        # courtyard graphics are parsed anywhere in this module, so this uses
+        # each pad's full rotated rectangle extent (absolute position +/-
+        # size/2, rotated by the pad's absolute rotation) unioned across all
+        # pads as the courtyard proxy - NOT just pad center positions. A bbox
+        # of pad *positions* alone collapses to 0 on one axis for an ordinary
+        # 2-pad inductor whose pads share an x or y center (verified against
+        # kiln's SRP1038C: 0.0 x 8.95 mm from centers alone vs. its real
+        # ~10x10mm footprint), which meant the "both axes >= min_inductor_mm"
+        # gate could never pass for any 2-pad inductor.
         pads = fp.get("pads", [])
         if len(pads) < 2:
             continue
 
-        # Compute bounding box from pad positions
-        if pads:
-            xs = [p.get("position", {}).get("x", 0) for p in pads]
-            ys = [p.get("position", {}).get("y", 0) for p in pads]
-            bbox_width = max(xs) - min(xs) if xs else 0
-            bbox_height = max(ys) - min(ys) if ys else 0
+        xs: list[float] = []
+        ys: list[float] = []
+        for p in pads:
+            pos = p.get("position", {})
+            px, py = pos.get("x", 0.0), pos.get("y", 0.0)
+            size = p.get("size", {})
+            half_w, half_h = size.get("x", 0.0) / 2.0, size.get("y", 0.0) / 2.0
+            pad_rotation = p.get("rotation", 0.0)
+            for corner_x, corner_y in ((half_w, half_h), (half_w, -half_h), (-half_w, half_h), (-half_w, -half_h)):
+                rot_x, rot_y = _rotate_point(corner_x, corner_y, pad_rotation)
+                xs.append(px + rot_x)
+                ys.append(py + rot_y)
+
+        # Compute bounding box from pad rectangle extents
+        if xs and ys:
+            bbox_width = max(xs) - min(xs)
+            bbox_height = max(ys) - min(ys)
 
             # Both axes must exceed min_inductor_mm
             if bbox_width >= min_inductor_mm and bbox_height >= min_inductor_mm:
@@ -5472,6 +5502,145 @@ def classify_critical_nets(project_path: str | Path) -> dict[str, Any]:
             "high_speed": dict(high_speed_cfg),
             "switch_node": dict(switch_node_cfg),
         },
+    }
+
+
+# Footprint/library-name substrings that mark a footprint as connector-like,
+# independent of its reference designator (e.g. a JST header wired up with a
+# non-standard ref, or a ref prefix outside the configured set).
+_CONNECTOR_FOOTPRINT_TOKENS = ("conn", "header", "connector", "socket", "terminal")
+
+
+def detect_connectors(
+    project_path: str | Path,
+    ref_prefixes: list[str] | None = None,
+) -> dict[str, Any]:
+    """Phase 7.14 (detection only): read-only connector candidate scan over the
+    board's own footprints/pads - never the schematic - so results reflect
+    what's actually placed and wired right now.
+
+    A footprint is a candidate when EITHER signal matches (both are reported
+    per-candidate via `matched_by` when they overlap):
+      - its reference starts with one of `ref_prefixes` (case-insensitive;
+        defaults to `pcb_settings.json` `pin_swap.ref_prefixes`, itself
+        defaulting to `["J", "P", "CN", "X"]`), OR
+      - its footprint/library name contains a connector token - "conn",
+        "header", "connector", "socket", "terminal" (case-insensitive
+        substring) - catching connectors placed under a non-standard ref.
+
+    Per candidate: `ref`, `footprint`, `pin_count`, `matched_by`
+    (["ref_prefix"], ["footprint_token"], or both), and `pins` - one entry per
+    pad with its pad number and the net attached to it right now (from the
+    board file's own `(net ...)` on each pad - ground truth, independent of
+    any possibly-stale `.net` schematic export).
+
+    This function NEVER judges swappability - which pins could safely trade
+    places is a schematic-level question (signal vs. power/ground, connector
+    pinout conventions) that belongs to the user, per the Phase 7.14
+    interaction contract. It also never writes anything.
+    """
+    board_path, _, _ = _resolve_project_path(project_path)
+    settings = load_pcb_settings(project_path)["config"]
+    configured_prefixes = settings.get("pin_swap", {}).get("ref_prefixes") or ["J", "P", "CN", "X"]
+    prefixes = tuple(p.strip().upper() for p in (ref_prefixes if ref_prefixes is not None else configured_prefixes) if str(p).strip())
+
+    components = _parse_board_components_cached(board_path)
+    footprint_pads = _parse_footprint_pads_cached(board_path)
+
+    candidates: list[dict[str, Any]] = []
+    for comp in components:
+        reference = comp.get("reference", "")
+        if not reference:
+            continue
+        footprint_name = comp.get("footprint", "") or ""
+        by_ref = any(reference.strip().upper().startswith(p) for p in prefixes)
+        by_footprint = any(token in footprint_name.lower() for token in _CONNECTOR_FOOTPRINT_TOKENS)
+        if not (by_ref or by_footprint):
+            continue
+
+        matched_by: list[str] = []
+        if by_ref:
+            matched_by.append("ref_prefix")
+        if by_footprint:
+            matched_by.append("footprint_token")
+
+        fp_uuid = comp.get("uuid", "")
+        pads = footprint_pads.get(fp_uuid, {}).get("pads", [])
+        pins = [{"pad": pad.get("number", ""), "net": pad.get("net", "")} for pad in pads]
+        pins.sort(key=lambda p: _pad_sort_key(p["pad"]))
+
+        candidates.append(
+            {
+                "ref": reference,
+                "footprint": footprint_name,
+                "pin_count": len(pins),
+                "matched_by": matched_by,
+                "pins": pins,
+            }
+        )
+
+    candidates.sort(key=lambda c: c["ref"])
+    return {
+        "project_path": str(project_path),
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "ref_prefixes_used": list(prefixes),
+        "connector_footprint_tokens_used": list(_CONNECTOR_FOOTPRINT_TOKENS),
+    }
+
+
+def _pad_sort_key(pad_number: str) -> tuple[int, Any]:
+    """Sort pad numbers numerically when purely numeric (pad "2" before "10"),
+    falling back to lexical order for lettered pads (e.g. shield tabs "MP1")."""
+    if pad_number.isdigit():
+        return (0, int(pad_number))
+    return (1, pad_number)
+
+
+def validate_connector_exclusions(
+    project_path: str | Path,
+    exclusions: list[str],
+    ref_prefixes: list[str] | None = None,
+) -> dict[str, Any]:
+    """Phase 7.14 interaction contract helper (read-only): validate a
+    user-supplied list of connector refs to exclude from pin-swap
+    consideration against what `detect_connectors` actually found on the
+    board right now.
+
+    Every name in `exclusions` must resolve, case-insensitively, to a
+    detected connector ref. If any don't, this raises `ValueError` naming the
+    unresolved entries AND listing every detected ref - loud failure, not a
+    silently-dropped typo that would leave a connector the user meant to
+    protect open to the optimizer's pin-swap move.
+
+    On success, returns the canonical (board-cased) ref for each exclusion
+    plus the full detected-ref list, so a caller can present it back to the
+    user for confirmation.
+    """
+    detected = detect_connectors(project_path, ref_prefixes=ref_prefixes)
+    detected_refs = [c["ref"] for c in detected["candidates"]]
+    by_upper = {ref.upper(): ref for ref in detected_refs}
+
+    resolved: list[str] = []
+    unresolved: list[str] = []
+    for name in exclusions:
+        canonical = by_upper.get(str(name).strip().upper())
+        if canonical is None:
+            unresolved.append(name)
+        else:
+            resolved.append(canonical)
+
+    if unresolved:
+        raise ValueError(
+            f"Unresolved connector exclusion(s) {unresolved!r} - these do not match any detected "
+            f"connector ref. Detected connectors on this board: {sorted(detected_refs)!r}. "
+            "Fix the typo or run detect_kicad_connectors again if the board changed."
+        )
+
+    return {
+        "project_path": str(project_path),
+        "resolved_exclusions": resolved,
+        "detected_refs": sorted(detected_refs),
     }
 
 

@@ -13,7 +13,7 @@ query and edit the board.
   lookups. Requires a free `MOUSER_API_KEY` in the repo-root `.env` (see `.env.example`).
 - [kicad_ipc_tool.py](kicad_ipc_tool.py) - talks to a *running* KiCad instance over its IPC API
   (via `kicad-python`) instead of parsing files on disk; backs the live tools in Group 9 below.
-- [kicad_mcp_server.py](kicad_mcp_server.py) - the MCP server itself; registers all 72 tools and
+- [kicad_mcp_server.py](kicad_mcp_server.py) - the MCP server itself; registers all 79 tools and
   serves them over stdio or HTTP transport.
 - [requirements-mcp.txt](requirements-mcp.txt) - Python dependencies (`mcp>=1.0.0` required;
   `kicad-python>=0.7.0` optional - enables the live IPC tools, otherwise they're just left
@@ -82,7 +82,8 @@ editing (to avoid racing the GUI's own unsaved state); see
 | 7. Silkscreen Label Position Templates | [07-label-position-templates.md](docs/mcp-tools/07-label-position-templates.md) | Copying a hand-decluttered text property's (Reference/Value label) offset onto sibling instances. |
 | 8. Footprint Flip Templates | [08-footprint-flip-templates.md](docs/mcp-tools/08-footprint-flip-templates.md) | Copying a correctly front/back-flipped footprint's full flip state onto siblings that need the same treatment. |
 | 9. Live KiCad IPC Tools | [09-live-ipc-tools.md](docs/mcp-tools/09-live-ipc-tools.md) | Tools that talk to a *running* KiCad instance (real geometry, GUI selection/highlighting) instead of parsing files on disk. |
-| 10. Net Classes & Buses | [10-netclasses-and-buses.md](docs/mcp-tools/10-netclasses-and-buses.md) | Bus detection from schematic net names, net class proposal/creation, trace-cost scoring (with live deviation measurement), bus corridor-area measurement, capacitor voltage auditing, and pcb_settings.json management for routing policy. |
+| 10. Net Classes & Buses | [10-netclasses-and-buses.md](docs/mcp-tools/10-netclasses-and-buses.md) | Bus detection from schematic net names, net class proposal/creation, trace-cost scoring (with live deviation measurement), bus corridor-area measurement, capacitor voltage auditing, critical-net classification, connector detection, and pcb_settings.json management for routing policy. |
+| 11. Autorouter & Detailed Routing | [11-autorouter.md](docs/mcp-tools/11-autorouter.md) | Phase 7.3b windowed A* detailed routing (fine-grained exact copper generation), ratsnest calculation, layer/constraint querying, and undo (unrouting). Includes the core autorouter pipeline as implemented today (connectivity, ratsnest, detailed route, self-check, emit). |
 
 ### Picking the right group
 
@@ -101,6 +102,10 @@ editing (to avoid racing the GUI's own unsaved state); see
   GUI instead of typing its reference? **Group 9** - but it needs KiCad open with the IPC API
   enabled (Preferences > Plugins > Enable IPC API); everything else works from the files on disk
   alone.
+- Ready to autoroute your board? **Group 11** — calculate the unrouted ratsnest, query board layers
+  and DRC constraints, and run the windowed A* detailed router. Includes undo (unrouting) and
+  honest documentation of what's not yet implemented (rip-up negotiation, plane-aware routing,
+  neck-down).
 
 ## Reorganizing a repeated sub-circuit's layout
 

@@ -560,6 +560,160 @@ consistent trace-width/via/clearance standards across all team members' layouts.
 - **Trace cost before/after deviation term:** 5584.4 → 5628.8 (+44.41)
 - **Capacitor audit:** 68 caps — 0 under_rated, 24 unknown_rating (missing Value/rating in schematic), 0 under_derated, 3 ok, 31 one_net_unlabeled, 10 no_labeled_nets
 
+## `detect_kicad_critical_nets`
+
+Classify high-speed and critical nets so the cost model (and future router stages) shorten and
+prioritize them. Sources (each row reporting its classification reason):
+
+1. **Bus frequency** — Member nets of qualified `detect_kicad_buses` candidates (plus any net with
+   a CLK-token in its name) map to a typical operating frequency via `pcb_settings.json`
+   `high_speed.bus_frequencies_mhz` table.
+2. **Xtal nets** — Nets touching a crystal/resonator (component ref starting with Y or X, or
+   footprint/library name containing crystal/resonator/osc tokens) are always critical with the
+   highest length-weight multiplier.
+3. **Switch-node inductors** — An L* component whose footprint courtyard exceeds
+   `switch_node.min_inductor_mm` on both axes, with one terminal net reaching an IC pin → that
+   terminal net is a switch-node net with an 8× length-weight multiplier.
+
+Per critical net, the output includes:
+- `net` — the net name
+- `critical: true` — marker
+- `reason` — one of "bus_frequency", "xtal", or "switch_node"
+- `frequency_mhz` — the classified frequency (from the bus table or heuristic)
+- `l_crit_mm` — critical length = c × velocity_fraction × (rise_fraction / frequency) / 6, computed
+  using the speed-of-light physics formula for transmission-line rise time
+- `straight_line_mm` — estimated distance between the net's connection points (bounding box diagonal
+  of all pads on the net)
+- `stack_up_gate` — whether `straight_line_mm >= critical_fraction × l_crit_mm` (indicates the net
+  needs impedance control and stack-up planning before routing)
+- `multiplier` — the length-weight multiplier `get_kicad_trace_cost` applies to this net
+
+The response includes the resolved `l_crit_table` (L_crit per bus type) and a `settings_snapshot`
+of the high_speed and switch_node configuration applied, so results are fully auditable and
+reproducible.
+
+**Read-only; no writes.**
+
+**Args:** `project_path`
+
+**Example output (excerpt):**
+```json
+{
+  "critical_nets": [
+    {
+      "net": "/MainControler/CLK",
+      "critical": true,
+      "reason": "bus_frequency",
+      "frequency_mhz": 32.0,
+      "l_crit_mm": 25.4,
+      "straight_line_mm": 45.2,
+      "stack_up_gate": true,
+      "multiplier": 4.0
+    },
+    {
+      "net": "/Power/XTAL_IN",
+      "critical": true,
+      "reason": "xtal",
+      "frequency_mhz": 25.0,
+      "l_crit_mm": 30.0,
+      "straight_line_mm": 8.5,
+      "stack_up_gate": false,
+      "multiplier": 8.0
+    },
+    {
+      "net": "/Power/SWITCH_NODE",
+      "critical": true,
+      "reason": "switch_node",
+      "frequency_mhz": 0,
+      "l_crit_mm": 0.0,
+      "straight_line_mm": 0.0,
+      "stack_up_gate": false,
+      "multiplier": 8.0
+    }
+  ],
+  "l_crit_table": {
+    "SPI": 50.0,
+    "I2C": 0.0,
+    "CLK": 25.4,
+    "UART": 0.0
+  },
+  "settings_snapshot": {
+    "high_speed": {
+      "bus_frequencies_mhz": {"SPI": 32.0, "I2C": 0.4, "CLK": 25.0},
+      "velocity_fraction": 0.5,
+      "rise_fraction": 0.05,
+      "critical_length_overrides_mm": {},
+      "critical_fraction": 0.9,
+      "length_weight_mult": 4.0
+    },
+    "switch_node": {
+      "min_inductor_mm": 2.0,
+      "length_weight_mult": 8.0
+    }
+  }
+}
+```
+
+## `detect_kicad_connectors`
+
+**Phase 7.14 (Detection only, read-only):** Scan the board's footprints for connector candidates.
+A footprint qualifies when EITHER of these signals match (both are reported via `matched_by`):
+
+- Its reference starts with one of `ref_prefixes` (case-insensitive; default from
+  `pcb_settings.json` `pin_swap.ref_prefixes`, itself defaulting to `["J", "P", "CN", "X"]`), OR
+- Its footprint/library name contains a connector token — "conn", "header", "connector", "socket",
+  or "terminal" (case-insensitive substring) — catching connectors placed under a non-standard ref.
+
+Per candidate, the output includes:
+- `ref` — the component's reference designator
+- `footprint` — the footprint name
+- `pin_count` — total pad count
+- `matched_by` — which signal(s) triggered the match: array of "ref_prefix" and/or "footprint_token"
+- `pins` — one entry per pad with its pad number and the net attached right now (from the board
+  file's own `(net ...)` entry on each pad — ground truth, independent of any stale `.net` export)
+
+**IMPORTANT:** This tool NEVER judges swappability (which pins could safely swap). That's a
+schematic-level question (signal vs. power/ground, connector pinout standards) that belongs to the
+user, not the tool. It only reports what the board currently shows.
+
+**Read-only; no writes; purely a detection/reporting tool.**
+
+**Args:** `project_path`, `ref_prefixes` (optional array of reference prefixes; default from
+pcb_settings.json pin_swap.ref_prefixes)
+
+**Example output:**
+```json
+{
+  "project_path": "path/to/kiln",
+  "candidate_count": 5,
+  "candidates": [
+    {
+      "ref": "J1",
+      "footprint": "JST_PH_B2B-PH-K",
+      "pin_count": 2,
+      "matched_by": ["ref_prefix"],
+      "pins": [
+        {"pad": "1", "net": "/Power/12V"},
+        {"pad": "2", "net": "/Power/GND"}
+      ]
+    },
+    {
+      "ref": "P2",
+      "footprint": "Samtec_HSEC8-ANLT-LC-Z_1X8",
+      "pin_count": 8,
+      "matched_by": ["ref_prefix", "footprint_token"],
+      "pins": [
+        {"pad": "1", "net": "/MainControler/SDA"},
+        {"pad": "2", "net": "/MainControler/SCL"},
+        ...
+      ]
+    }
+  ],
+  "ref_prefixes_used": ["J", "P", "CN", "X"],
+  "connector_footprint_tokens_used": ["conn", "header", "connector", "socket", "terminal"]
+}
+```
+
 ---
 
 ## References

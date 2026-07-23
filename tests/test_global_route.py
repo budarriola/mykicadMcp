@@ -242,18 +242,20 @@ def test_congested_channel_k_alternates(tmp_path: Path) -> None:
     result = router.global_route(str(tmp_path))
     assert result is not None
 
-    # For the congested connections, check that at least one has multiple candidates.
-    all_candidates = [c["candidates"] for c in result["connections"] if c["routed"]]
-    multi_candidate_paths = [cands for cands in all_candidates if len(cands) > 1]
+    routed = [c for c in result["connections"] if c["routed"]]
+    assert len(routed) == 2, "Both NET_A and NET_B connections should route"
 
-    # With two connections sharing a tight corridor, we expect k-alternates
-    # (though not guaranteed if the board is simple enough). Document what actually happens.
-    if multi_candidate_paths:
-        for cands in multi_candidate_paths:
-            # Verify candidates are ranked by cost.
-            costs = [c["est_cost_milli"] for c in cands]
-            assert costs == sorted(costs), "Candidates should be sorted by cost"
-            assert isinstance(costs[0], int), "Costs should be integers (milli-cost)"
+    # Measured on this fixture: each connection gets 3 ranked alternates. The
+    # k-shortest machinery must produce genuine alternates, not a single path.
+    for conn in routed:
+        cands = conn["candidates"]
+        assert len(cands) > 1, f"{conn['net']} should have k>1 candidate paths, got {len(cands)}"
+        costs = [c["est_cost_milli"] for c in cands]
+        assert costs == sorted(costs), "Candidates should be sorted by cost"
+        assert all(isinstance(c, int) for c in costs), "Costs should be integers (milli-cost)"
+        # Alternates must be genuinely different paths, not the best path repeated.
+        paths = [json.dumps(c.get("path", c), sort_keys=True) for c in cands]
+        assert len(set(paths)) == len(paths), "Alternate candidates should be distinct paths"
 
 
 # =========================================================================== #
@@ -261,40 +263,67 @@ def test_congested_channel_k_alternates(tmp_path: Path) -> None:
 # =========================================================================== #
 
 
+def _strip_alternate_segments(board: Path, nets: list[str]) -> dict[str, int]:
+    """Delete every other (segment ...) block belonging to the given nets.
+
+    Bundles require a PARTIALLY routed bus: `_collect_bundles` reuses Phase 5
+    corridor geometry computed from existing copper, so a fully-unrouted bus has
+    no bundle geometry and a fully-routed one has no ratsnest connections.
+    Stripping alternate segments leaves corridor copper AND missing connections.
+    """
+    import re
+
+    text = board.read_text(encoding="utf-8")
+    seg_re = re.compile(r"    \(segment\n(?:[^\n]*\n)*?    \)\n")
+    counts = {net: 0 for net in nets}
+
+    def repl(m: "re.Match[str]") -> str:
+        blk = m.group(0)
+        for net in counts:
+            if f'(net "{net}")' in blk:
+                counts[net] += 1
+                if counts[net] % 2 == 0:
+                    return ""
+        return blk
+
+    board.write_text(seg_re.sub(repl, text), encoding="utf-8")
+    return counts
+
+
 def test_bundle_width_capacity_debited_as_unit(tmp_path: Path) -> None:
-    """Multi-drop SPI with a bus bundle: verify the bundle is routed as ONE unit
-    and capacity is debited for the whole bundle width."""
-    # Use write_multidrop_spi_project helper to generate a project with bus structure.
+    """Partially-routed multi-drop SPI: verify the bus bundle is routed as ONE
+    unit (shared bundle_id, shared home layer, shared candidate corridors)."""
     # Destinations=2 -> hub U1 + U2,U3; shared nets SCK/MOSI/MISO form a bus.
-    layout = write_multidrop_spi_project(tmp_path, destinations=2, route=True)
+    # Route it fully, then strip alternate MISO/MOSI segments so the bus keeps
+    # its corridor copper but has unrouted connections for the router to bundle.
+    write_multidrop_spi_project(tmp_path, destinations=2, route=True)
+    board = next(tmp_path.glob("*.kicad_pcb"))
+    counts = _strip_alternate_segments(board, ["/SPI/MISO", "/SPI/MOSI"])
+    assert all(v >= 2 for v in counts.values()), f"Fixture should strip real segments, saw {counts}"
 
     result = router.global_route(str(tmp_path))
     assert result is not None
     assert "connections" in result
 
-    # Verify bundles are reported.
-    bundle_ids = set(c["bundle_id"] for c in result["connections"] if c["bundle_id"] is not None)
-    # The layout has 3 shared nets (SCK, MOSI, MISO) + 2 CS nets, so potentially
-    # one bundle for the shared trio (if detection/qualification succeeded).
-    # Document what we actually found.
-    if bundle_ids:
-        # For each bundle, verify all member connections report the same home layer
-        # and shared candidates.
-        bundle_conns = {}
-        for conn in result["connections"]:
-            bid = conn["bundle_id"]
-            if bid is not None:
-                if bid not in bundle_conns:
-                    bundle_conns[bid] = []
-                bundle_conns[bid].append(conn)
+    bundle_conns: dict[str, list[dict]] = {}
+    for conn in result["connections"]:
+        bid = conn["bundle_id"]
+        if bid is not None:
+            bundle_conns.setdefault(bid, []).append(conn)
 
-        for bid, conns in bundle_conns.items():
-            # All members of the same bundle should have the same home layer
-            home_layers = set(c["home_layer"] for c in conns)
-            assert len(home_layers) == 1, f"Bundle {bid} members should all have same home layer"
-            # All should report the same candidates (shared routing)
-            candidate_lists = [tuple(json.dumps(c, sort_keys=True) for c in conn["candidates"]) for conn in conns]
-            assert len(set(candidate_lists)) == 1, f"Bundle {bid} members should share candidates"
+    # Measured on this fixture: one bundle (SPI:U1->U2) holding both the MISO
+    # and MOSI connections. A vacuous no-bundle result is a regression.
+    assert bundle_conns, "Partially-routed SPI bus must produce at least one bundle"
+    multi_member = [conns for conns in bundle_conns.values() if len(conns) >= 2]
+    assert multi_member, "At least one bundle should hold multiple member connections"
+
+    for bid, conns in bundle_conns.items():
+        # All members of the same bundle should have the same home layer
+        home_layers = set(c["home_layer"] for c in conns)
+        assert len(home_layers) == 1, f"Bundle {bid} members should all have same home layer"
+        # All should report the same candidates (shared routing)
+        candidate_lists = [tuple(json.dumps(c, sort_keys=True) for c in conn["candidates"]) for conn in conns]
+        assert len(set(candidate_lists)) == 1, f"Bundle {bid} members should share candidates"
 
 
 # =========================================================================== #

@@ -28,6 +28,8 @@ from __future__ import annotations
 import heapq
 import json
 import math
+import re
+import uuid as _uuid
 from pathlib import Path
 from typing import Any
 
@@ -1807,6 +1809,75 @@ def global_route(
 
 _drc_constraints_cache: dict[str, tuple[float, int, dict[str, Any]]] = {}
 
+# KiCad .kicad_dru constraint values are numbers with an optional unit
+# suffix (mm, mil, in, um/µm); a bare number is already mm. All resolved
+# constraint values in this module are in mm.
+_DRU_UNIT_TO_MM = {
+    'mm': 1.0,
+    'mil': 0.0254,
+    'in': 25.4,
+    'um': 0.001,
+    'µm': 0.001,
+}
+_DRU_NUMBER_RE = re.compile(r'^([+-]?\d*\.?\d+)\s*([a-zA-Zµ]*)$')
+
+
+def _parse_dru_length_mm(token: Any) -> float | None:
+    """Parse a DRU numeric length token (e.g. '0.15mm', '6.3mm', '1mm') to mm.
+
+    Returns None if the token isn't a recognizable number (rather than
+    raising), so callers can skip malformed constraint values instead of
+    dropping the whole rule.
+    """
+    if not isinstance(token, str):
+        return None
+    match = _DRU_NUMBER_RE.match(token.strip())
+    if not match:
+        return None
+    try:
+        value = float(match.group(1))
+    except ValueError:
+        return None
+    unit = match.group(2).lower()
+    if not unit:
+        return value
+    factor = _DRU_UNIT_TO_MM.get(unit)
+    if factor is None:
+        return value  # unknown unit suffix; treat the number as already mm
+    return value * factor
+
+
+def _strip_dru_comments(text: str) -> str:
+    """Strip '#'-to-end-of-line comments from a .kicad_dru file's text.
+
+    KiCad's custom design-rule syntax uses '#' (not the ';' the generic
+    SexprParser treats as a comment marker elsewhere) for line comments,
+    including commenting out entire rules or individual clauses mid-rule
+    (see JLCPCB.kicad_dru.txt). Done here rather than in the shared
+    SexprParser, which other parsers still rely on '#' being an ordinary
+    token character for (none currently do, but this keeps the change
+    scoped to DRU parsing). Quote-aware so a literal '#' inside a string
+    literal is left alone.
+    """
+    out_lines: list[str] = []
+    for line in text.splitlines():
+        in_string = False
+        cut = len(line)
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            if ch == '\\' and in_string:
+                i += 2
+                continue
+            if ch == '"':
+                in_string = not in_string
+            elif ch == '#' and not in_string:
+                cut = i
+                break
+            i += 1
+        out_lines.append(line[:cut])
+    return '\n'.join(out_lines)
+
 
 def _parse_dru_file(dru_path: Path) -> dict[str, Any]:
     """Parse a .kicad_dru (design rule) file and extract rule definitions.
@@ -1831,9 +1902,21 @@ def _parse_dru_file(dru_path: Path) -> dict[str, Any]:
     except Exception as e:
         return {'rules': [], 'parse_error': str(e)}
 
+    text = _strip_dru_comments(text)
     parser = _pcb.SexprParser(text)
+
+    # Unlike `.kicad_pcb`/`.kicad_sch`, a `.kicad_dru` file is NOT a single
+    # sexpr wrapping the whole file - it's a flat sequence of top-level forms:
+    # `(version 1)` followed by one `(rule ...)` per rule. `SexprParser.parse()`
+    # only consumes the first form, so walk `_parse_value` across the token
+    # stream here to collect every top-level form.
     try:
-        root = parser.parse()
+        top_level_forms: list[Any] = []
+        idx = 0
+        num_tokens = len(parser.tokens)
+        while idx < num_tokens:
+            value, idx = parser._parse_value(idx)
+            top_level_forms.append(value)
     except Exception as e:
         return {'rules': [], 'parse_error': str(e)}
 
@@ -1866,11 +1949,9 @@ def _parse_dru_file(dru_path: Path) -> dict[str, Any]:
                         if isinstance(centry, list) and len(centry) >= 2:
                             ctype = centry[0]
                             if ctype in ('min', 'max', 'opt') and len(centry) >= 2:
-                                try:
-                                    val = float(centry[1])
+                                val = _parse_dru_length_mm(centry[1])
+                                if val is not None:
                                     constraint_data[ctype] = val
-                                except (ValueError, TypeError):
-                                    pass
                     if constraint_data:
                         constraints[constraint_type] = constraint_data
 
@@ -1882,7 +1963,8 @@ def _parse_dru_file(dru_path: Path) -> dict[str, Any]:
                     'constraints': constraints
                 })
 
-    walk(root)
+    for form in top_level_forms:
+        walk(form)
     return {'rules': rules, 'parse_error': None}
 
 
@@ -1998,10 +2080,18 @@ def get_drc_constraints(project_path: str | Path) -> dict[str, Any]:
     except OSError:
         stat = None
 
+    # The resolved result also depends on .kicad_pro (net classes / board
+    # rules), so its mtime/size participates in invalidation too.
+    try:
+        pro_stat = project_file.stat() if project_file else None
+    except OSError:
+        pro_stat = None
+    pro_key = (pro_stat.st_mtime, pro_stat.st_size) if pro_stat else None
+
     if stat and cache_key in _drc_constraints_cache:
         cached = _drc_constraints_cache[cache_key]
-        if cached[0] == stat.st_mtime and cached[1] == stat.st_size:
-            return cached[2]
+        if cached[0] == stat.st_mtime and cached[1] == stat.st_size and cached[2] == pro_key:
+            return cached[3]
 
     # Parse .kicad_dru rules
     dru_data = _parse_dru_file(dru_path) if dru_path else {'rules': [], 'parse_error': None}
@@ -2115,6 +2205,1123 @@ def get_drc_constraints(project_path: str | Path) -> dict[str, Any]:
 
     # Cache the result
     if stat:
-        _drc_constraints_cache[cache_key] = (stat.st_mtime, stat.st_size, result)
+        _drc_constraints_cache[cache_key] = (stat.st_mtime, stat.st_size, pro_key, result)
 
     return result
+
+
+# =========================================================================== #
+# Phase 7.3b - Detailed (fine, windowed) routing
+#
+# Turns the 7.3a global corridor choice into exact copper. Per connection, in
+# the SAME global-stage order (priority desc, airline asc):
+#   1. Obstacle window   - rasterize only the connection bbox + margin at grid_mm
+#   2. Pad escape        - exact off-grid stub from the endpoint to the nearest
+#                          legal grid node
+#   3. Fine A*           - integer-milli-cost (cx, cy, layer) search in the window,
+#                          softly constrained to the global corridor
+#   4. Rip-up & reroute  - STUBBED for this landing (see route_nets docstring):
+#                          on failure the window doubles up to the whole board;
+#                          a still-blocked net fails with its nearest blocker
+#                          named. No PathFinder negotiated congestion / no
+#                          ripping of already-placed copper yet.
+#   5. Self-check + emit - a Python clearance pass proves every proposed
+#                          segment/via against ALL copper at netclass clearance
+#                          BEFORE any write; then simplified (segment)/(via)
+#                          blocks are appended with create_group-style top-level
+#                          surgery and their uuids recorded in board-local
+#                          autorouter_owned.
+#
+# Clearance discipline (7.11 anchor's "Notes for 7.3b"): clearance is NEVER read
+# from the single merged DRC value (0.0 on kiln - a bare board rule). It resolves
+# from the Default net-class clearance, else the merged DRC value only when > 0,
+# else autorouter.clearance_fallback_mm - obstacle inflation never trusts a 0.
+# =========================================================================== #
+
+# Nudge added to every A* obstacle-inflation radius: half a grid diagonal, so a
+# foreign edge threading between two grid nodes is still marked blocked. This
+# makes the fine A* over-block relative to the exact self-check (step 5) - the
+# safe direction: any path A* finds clears the self-check, never the reverse.
+_FINE_CELL_MARGIN_FRAC = 0.7072  # ~ 1/sqrt(2)
+
+_FINE_ASTAR_MAX_EXPANSIONS = 1_500_000
+_EMIT_EPS_MM = 1e-6
+
+# Hard cap on a single connection's obstacle-window span (mm). The spec's
+# "double up to the whole board" is infeasible at a 0.2 mm fine grid in pure
+# Python (a whole-kiln window is ~2.3M nodes x 4 layers); windowing exists
+# precisely to keep per-connection A* in the tens of thousands of cells. A
+# connection that cannot route within this span fails fast (blocker named)
+# rather than melting into a whole-board rasterization. Raise for larger boards
+# once a spatial index / native backend lands (7.8 / GPU).
+_MAX_WINDOW_SPAN_MM = 60.0
+# Guard against a pathological window: if node*layer count exceeds this, the
+# window is refused (reported as a failure) instead of built.
+_MAX_WINDOW_NODES = 400_000
+
+
+def _resolve_route_rules(project_path: str | Path, settings: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the width / clearance / via geometry the router emits and checks
+    against, honoring the 7.11 anchor's rule that clearance must not come from a
+    bare merged 0. Precedence: Default net-class (`.kicad_pro`) > merged DRC
+    constraint (only when > 0) > `autorouter.clearance_fallback_mm`.
+
+    kiln has a single Default net-class (clearance 0.2, track 0.2, via 0.6/0.3)
+    and no per-net classes in `get_drc_constraints().net_classes`, so the values
+    are board-uniform here; the resolver is written to prefer a matching
+    net-class when one exists so multi-class boards resolve per-net later.
+    """
+    board_path, project_file, _ = _pcb._resolve_project_path(project_path)
+    drc = get_drc_constraints(project_path)
+    default_nc = _pcb._default_netclass(project_file) or {}
+    autor = settings.get("autorouter", {})
+    fallback = float(autor.get("clearance_fallback_mm", 0.2)) or 0.2
+
+    clearance: float | None = None
+    src = "fallback"
+    nc_cl = float(default_nc.get("clearance", 0.0) or 0.0)
+    if nc_cl > 0:
+        clearance, src = nc_cl, "default_netclass"
+    if clearance is None:
+        merged = drc["constraints"].get("clearance", {}).get("value")
+        try:
+            merged_f = float(merged) if merged is not None else 0.0
+        except (TypeError, ValueError):
+            merged_f = 0.0
+        if merged_f > 0:
+            clearance, src = merged_f, "merged_drc"
+    if clearance is None or clearance <= 0:
+        clearance, src = fallback, "fallback"
+
+    width = float(default_nc.get("track_width", 0.0) or 0.0) or 0.2
+    via_d = float(default_nc.get("via_diameter", 0.0) or 0.0) or 0.6
+    via_dr = float(default_nc.get("via_drill", 0.0) or 0.0) or 0.3
+    edge_cl = float(drc["board_rules"].get("min_copper_edge_clearance", 0.0) or 0.0)
+    if edge_cl <= 0:
+        edge_cl = clearance
+    return {
+        "clearance": clearance,
+        "clearance_source": src,
+        "track_width": width,
+        "via_diameter": via_d,
+        "via_drill": via_dr,
+        "edge_clearance": edge_cl,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Obstacle collection (all copper + edges + keepouts), built once per board
+# --------------------------------------------------------------------------- #
+
+class _Obst:
+    """A copper (or edge / keepout) obstacle reduced to geometry, the copper
+    layers it occupies, a half-width, and its owning net. Same-net obstacles are
+    skipped by the caller (same-net copper is free)."""
+
+    __slots__ = ("kind", "net", "layers", "half", "x1", "y1", "x2", "y2",
+                 "raster", "pts", "minx", "miny", "maxx", "maxy", "is_edge")
+
+    def __init__(self, kind: str, net: str, layers: frozenset[str], half: float,
+                 x1: float, y1: float, x2: float, y2: float,
+                 raster: "_FillRaster | None" = None, is_edge: bool = False,
+                 pts: list[tuple[float, float]] | None = None) -> None:
+        self.kind = kind      # "seg" | "pt" | "zone" | "edge"
+        self.net = net
+        self.layers = layers
+        self.half = half
+        self.x1, self.y1, self.x2, self.y2 = x1, y1, x2, y2
+        self.raster = raster
+        self.pts = pts or []   # zone fill polygon (for PRECISE edge distance)
+        self.is_edge = is_edge
+        if raster is not None:
+            self.minx, self.miny, self.maxx, self.maxy = raster.minx, raster.miny, raster.maxx, raster.maxy
+        else:
+            self.minx, self.maxx = min(x1, x2), max(x1, x2)
+            self.miny, self.maxy = min(y1, y2), max(y1, y2)
+
+    def center_dist(self, px: float, py: float) -> float:
+        """Distance from a point to this obstacle's copper centerline geometry
+        (0 inside a zone fill). Reporting only - clearance decisions use the
+        halo-aware `point_within` / `seg_within`, which account for a zone's
+        fill EDGE, not just its interior."""
+        if self.kind == "zone":
+            assert self.raster is not None
+            return 0.0 if self.raster.covers(px, py, 0.0) else math.inf
+        if self.kind in ("seg", "edge"):
+            return _dist_point_segment(px, py, self.x1, self.y1, self.x2, self.y2)
+        return _dist_point_point(px, py, self.x1, self.y1)
+
+    def _zone_within(self, px: float, py: float, need: float) -> bool:
+        """A point is within `need` of the fill's copper edge. Fast raster reject
+        first (the raster over-estimates by ~one cell, so a raster miss is a
+        guaranteed true miss); only near the boundary is the exact polygon-edge
+        distance computed - so the clearance the router enforces matches KiCad's
+        own, not the coarse raster (which would false-positive on a legal skim)."""
+        assert self.raster is not None
+        if not self.raster.covers(px, py, need):
+            return False  # conservatively-generous reject -> definitely clear
+        return _dist_point_poly(px, py, self.pts) < need if self.pts else True
+
+    def point_within(self, px: float, py: float, need: float) -> bool:
+        """True when a point comes within `need` of this obstacle's COPPER EDGE.
+        For a zone this accounts for the fill EDGE (its clearance halo), not just
+        its interior - the fix for copper skimming a plane edge that an
+        interior-only test misses (kicad-cli flags it, we must too)."""
+        if self.kind == "zone":
+            return self._zone_within(px, py, need)
+        if self.kind in ("seg", "edge"):
+            return _dist_point_segment(px, py, self.x1, self.y1, self.x2, self.y2) < need
+        return _dist_point_point(px, py, self.x1, self.y1) < need
+
+    def seg_within(self, ax: float, ay: float, bx: float, by: float, need: float) -> bool:
+        """True when a finite segment A-B comes within `need` of this obstacle's
+        copper edge (zone: any sampled point within `need` of the fill edge)."""
+        if self.kind == "zone":
+            length = math.hypot(bx - ax, by - ay)
+            nsamp = max(2, int(length / 0.1) + 1)
+            for i in range(nsamp + 1):
+                t = i / nsamp
+                if self._zone_within(ax + t * (bx - ax), ay + t * (by - ay), need):
+                    return True
+            return False
+        if self.kind in ("seg", "edge"):
+            return _dist_segment_segment(ax, ay, bx, by, self.x1, self.y1, self.x2, self.y2) < need
+        return _dist_point_segment(self.x1, self.y1, ax, ay, bx, by) < need
+
+
+def _edge_cut_segments(board_path: Path) -> list[tuple[float, float, float, float]]:
+    """Edge.Cuts geometry as line segments: gr_line as one segment, gr_rect as
+    its four sides. gr_poly points as consecutive segments. gr_arc/gr_circle are
+    approximated by their bounding rectangle (documented coarse-ness - interior
+    routes on this board are never edge-bound)."""
+    text = _pcb._read_text(board_path)
+    root = _pcb.SexprParser(text).parse()
+    segs: list[tuple[float, float, float, float]] = []
+
+    def _num(tok: Any) -> bool:
+        return isinstance(tok, str) and _pcb._is_number(tok)
+
+    def _on_edge(node: list[Any]) -> bool:
+        for e in node[1:]:
+            if isinstance(e, list) and len(e) >= 2 and e[0] == "layer" and e[1] == "Edge.Cuts":
+                return True
+        return False
+
+    def _pt(node: list[Any], tag: str) -> tuple[float, float] | None:
+        for e in node[1:]:
+            if isinstance(e, list) and e and e[0] == tag:
+                nums = [float(t) for t in e[1:] if _num(t)]
+                if len(nums) >= 2:
+                    return (nums[0], nums[1])
+        return None
+
+    def walk(node: Any) -> None:
+        if isinstance(node, list):
+            tag0 = node[0] if node else None
+            if isinstance(tag0, str) and tag0.startswith("gr_") and _on_edge(node):
+                if tag0 == "gr_line":
+                    s, e = _pt(node, "start"), _pt(node, "end")
+                    if s and e:
+                        segs.append((s[0], s[1], e[0], e[1]))
+                elif tag0 == "gr_rect":
+                    s, e = _pt(node, "start"), _pt(node, "end")
+                    if s and e:
+                        x0, y0, x1, y1 = s[0], s[1], e[0], e[1]
+                        segs.extend([(x0, y0, x1, y0), (x1, y0, x1, y1),
+                                     (x1, y1, x0, y1), (x0, y1, x0, y0)])
+                else:
+                    # gr_poly / gr_arc / gr_circle: pool xy points, connect them.
+                    pts: list[tuple[float, float]] = []
+                    for e in node[1:]:
+                        if isinstance(e, list) and e and e[0] == "pts":
+                            for sub in e[1:]:
+                                if isinstance(sub, list) and sub and sub[0] == "xy":
+                                    nums = [float(t) for t in sub[1:] if _num(t)]
+                                    if len(nums) >= 2:
+                                        pts.append((nums[0], nums[1]))
+                    for i in range(len(pts) - 1):
+                        segs.append((pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]))
+            for child in node:
+                walk(child)
+
+    walk(root)
+    return segs
+
+
+def _collect_obstacles(board_path: Path, routable: set[str], all_cu: list[str],
+                       edge_clearance: float) -> list["_Obst"]:
+    """Every copper item on the board as an `_Obst` (segments/arcs, vias, pads,
+    foreign zone fills) plus Edge.Cuts segments. Built once per board; the
+    per-connection window filters this list by bbox."""
+    tracks = _pcb._parse_tracks_cached(board_path)
+    footprints = _pcb._parse_footprint_pads_cached(board_path)
+    fills = _parse_zone_fills_cached(board_path)
+    stack = {name: i for i, name in enumerate(all_cu)}
+    obs: list[_Obst] = []
+
+    for seg in tracks["segments"] + tracks["arcs"]:
+        if seg["layer"] not in routable:
+            continue
+        obs.append(_Obst("seg", seg["net"], frozenset([seg["layer"]]), seg["width"] / 2.0,
+                         seg["start"]["x"], seg["start"]["y"], seg["end"]["x"], seg["end"]["y"]))
+    for via in tracks["vias"]:
+        at = via["at"]
+        layers = _via_layer_set(via, stack, all_cu)
+        layers = frozenset(l for l in layers if l in routable) or frozenset(
+            l for l in via.get("layers", []) if l in routable)
+        obs.append(_Obst("pt", via["net"], layers, via.get("size", 0.6) / 2.0,
+                         at["x"], at["y"], at["x"], at["y"]))
+    for fp in footprints.values():
+        for pad in fp["pads"]:
+            layers = frozenset(l for l in _pad_layer_set(pad, all_cu) if l in routable)
+            if not layers:
+                continue
+            pos = pad["position"]
+            obs.append(_Obst("pt", pad.get("net", ""), layers, _pad_reach(pad),
+                             pos["x"], pos["y"], pos["x"], pos["y"]))
+    for net_name, fill_list in fills.items():
+        for zf in fill_list:
+            if zf["layer"] not in routable:
+                continue
+            obs.append(_Obst("zone", net_name, frozenset([zf["layer"]]), 0.0,
+                             zf["pts"][0][0], zf["pts"][0][1], zf["pts"][0][0], zf["pts"][0][1],
+                             raster=zf.get("raster"), pts=zf["pts"]))
+    for (x1, y1, x2, y2) in _edge_cut_segments(board_path):
+        obs.append(_Obst("edge", "", frozenset(all_cu), 0.0, x1, y1, x2, y2, is_edge=True))
+    return obs
+
+
+def _clip_polygon_edges(pts: list[tuple[float, float]], bx0: float, by0: float,
+                        bx1: float, by1: float) -> list[tuple[float, float, float, float]]:
+    """Edges of a closed polygon whose segment bbox intersects the query box -
+    lets a node near a board-spanning fill measure only the fill edges that pass
+    through its window instead of the whole ring (the build hot-spot)."""
+    edges: list[tuple[float, float, float, float]] = []
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        if max(x1, x2) < bx0 or min(x1, x2) > bx1 or max(y1, y2) < by0 or min(y1, y2) > by1:
+            continue
+        edges.append((x1, y1, x2, y2))
+    return edges
+
+
+def _min_dist_to_edges(px: float, py: float,
+                       edges: list[tuple[float, float, float, float]]) -> float:
+    best = math.inf
+    for (x1, y1, x2, y2) in edges:
+        d = _dist_point_segment(px, py, x1, y1, x2, y2)
+        if d < best:
+            best = d
+    return best
+
+
+# --------------------------------------------------------------------------- #
+# Windowed obstacle raster + fine grid model
+# --------------------------------------------------------------------------- #
+
+class _FineWindow:
+    """Fine (grid_mm) routing window over one connection's bbox + margin.
+
+    Grid NODES sit at (minx + ix*grid, miny + iy*grid). `blocked_track[layer]`
+    is the set of nodes a `track_half`-wide trace of net `net` cannot occupy;
+    `blocked_via` is the set of nodes a via cannot occupy (foreign copper on any
+    layer within the via's radius). Same-net obstacles are excluded (free)."""
+
+    __slots__ = ("grid", "minx", "miny", "cols", "rows", "layers", "layer_types",
+                 "blocked_track", "blocked_via", "net")
+
+    def __init__(self, minx: float, miny: float, maxx: float, maxy: float, grid: float,
+                 layers: list[str], layer_types: dict[str, str], net: str) -> None:
+        self.grid = grid
+        self.minx, self.miny = minx, miny
+        self.cols = max(2, int(math.ceil((maxx - minx) / grid)) + 1)
+        self.rows = max(2, int(math.ceil((maxy - miny) / grid)) + 1)
+        self.layers = layers
+        self.layer_types = layer_types
+        self.net = net
+        self.blocked_track: dict[str, set[tuple[int, int]]] = {l: set() for l in layers}
+        self.blocked_via: set[tuple[int, int]] = set()
+
+    def node_xy(self, ix: int, iy: int) -> tuple[float, float]:
+        return (self.minx + ix * self.grid, self.miny + iy * self.grid)
+
+    def cell_of(self, x: float, y: float) -> tuple[int, int]:
+        ix = int(round((x - self.minx) / self.grid))
+        iy = int(round((y - self.miny) / self.grid))
+        return (min(max(ix, 0), self.cols - 1), min(max(iy, 0), self.rows - 1))
+
+    def in_bounds(self, ix: int, iy: int) -> bool:
+        return 0 <= ix < self.cols and 0 <= iy < self.rows
+
+    def build(self, obstacles: list["_Obst"], track_half: float, via_radius: float,
+              clearance: float, edge_clearance: float) -> None:
+        g = self.grid
+        margin = g * _FINE_CELL_MARGIN_FRAC
+        wminx = self.minx - g
+        wminy = self.miny - g
+        wmaxx = self.minx + (self.cols - 1) * g + g
+        wmaxy = self.miny + (self.rows - 1) * g + g
+        for ob in obstacles:
+            if ob.net == self.net and not ob.is_edge:
+                continue  # same-net copper is free
+            # window bbox reject
+            reach = max(track_half, via_radius) + max(clearance, edge_clearance) + ob.half + margin
+            if (ob.maxx < wminx - reach or ob.minx > wmaxx + reach
+                    or ob.maxy < wminy - reach or ob.miny > wmaxy + reach):
+                continue
+            cl = edge_clearance if ob.is_edge else clearance
+            track_reach = track_half + cl + ob.half + margin
+            via_reach = via_radius + cl + ob.half + margin
+            # candidate node range (inflated bbox)
+            big = max(track_reach, via_reach)
+            ix0 = max(0, int(math.floor((ob.minx - big - self.minx) / g)))
+            ix1 = min(self.cols - 1, int(math.ceil((ob.maxx + big - self.minx) / g)))
+            iy0 = max(0, int(math.floor((ob.miny - big - self.miny) / g)))
+            iy1 = min(self.rows - 1, int(math.ceil((ob.maxy + big - self.miny) / g)))
+            if ix0 > ix1 or iy0 > iy1:
+                continue
+            ob_layers = [l for l in ob.layers if l in self.blocked_track]
+            # For a board-spanning zone fill, testing each node against the FULL
+            # polygon ring is the build hot-spot. Clip the fill's edges to this
+            # window once, so near-boundary nodes only measure against the few
+            # edges that pass through here (the raster gives the cheap inside
+            # test). Non-zone obstacles use the plain point_within.
+            zedges: list[tuple[float, float, float, float]] | None = None
+            if ob.kind == "zone" and ob.pts:
+                zedges = _clip_polygon_edges(
+                    ob.pts, wminx - big, wminy - big, wmaxx + big, wmaxy + big)
+            for iy in range(iy0, iy1 + 1):
+                for ix in range(ix0, ix1 + 1):
+                    px, py = self.node_xy(ix, iy)
+                    if zedges is not None:
+                        assert ob.raster is not None
+                        inside = ob.raster.covers(px, py, 0.0)
+                        dmin = 0.0 if inside else _min_dist_to_edges(px, py, zedges)
+                        if dmin < via_reach:
+                            self.blocked_via.add((ix, iy))
+                        if dmin < track_reach:
+                            for l in ob_layers:
+                                self.blocked_track[l].add((ix, iy))
+                        continue
+                    if ob.point_within(px, py, via_reach):
+                        self.blocked_via.add((ix, iy))
+                    if ob.point_within(px, py, track_reach):
+                        for l in ob_layers:
+                            self.blocked_track[l].add((ix, iy))
+
+    def nearest_free(self, x: float, y: float, layers: list[str], max_ring: int = 6
+                     ) -> tuple[int, int] | None:
+        """Nearest grid node (spiral out) not track-blocked on at least one of
+        `layers` - the pad-escape landing node."""
+        cx, cy = self.cell_of(x, y)
+        for ring in range(max_ring + 1):
+            best: tuple[float, tuple[int, int]] | None = None
+            for iy in range(cy - ring, cy + ring + 1):
+                for ix in range(cx - ring, cx + ring + 1):
+                    if max(abs(ix - cx), abs(iy - cy)) != ring:
+                        continue
+                    if not self.in_bounds(ix, iy):
+                        continue
+                    if any((ix, iy) not in self.blocked_track[l] for l in layers):
+                        nx, ny = self.node_xy(ix, iy)
+                        d = (nx - x) ** 2 + (ny - y) ** 2
+                        if best is None or d < best[0]:
+                            best = (d, (ix, iy))
+            if best is not None:
+                return best[1]
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# Fine A* over (cx, cy, layer)
+# --------------------------------------------------------------------------- #
+
+def _fine_astar(
+    win: _FineWindow,
+    net_kind: str,
+    weights: _Weights,
+    layer_purpose: dict[str, Any],
+    directions: dict[str, Any],
+    start_cell: tuple[int, int],
+    start_layers: list[str],
+    goal_cell: tuple[int, int],
+    goal_layers: set[str],
+    home_layer: str | None,
+    corridor_cells: set[tuple[int, int]] | None,
+) -> list[tuple[int, int, str]] | None:
+    """Integer-milli-cost A* over fine (cx, cy, layer) nodes with an octile
+    heuristic, mirroring the 7.3a coarse A* cost model (step x layer-purpose x
+    off-direction, turn = direction_change, via = via x through_via, away-from-
+    home, soft off_corridor). Blocked nodes are impassable (a DRC obstacle, not a
+    congestion penalty). Deterministic frontier order."""
+    g = win.grid
+    lp_kind = layer_purpose.get(net_kind, {})
+    layers = win.layers
+    li = {name: i for i, name in enumerate(layers)}
+    min_lp = min([float(lp_kind.get(win.layer_types[l], 1.0)) for l in layers] or [1.0])
+    step_milli_per_unit = weights.q(weights.step * min_lp)
+    gx, gy = goal_cell
+
+    def heuristic(cx: int, cy: int) -> int:
+        ax, ay = abs(cx - gx), abs(cy - gy)
+        octile = (ax + ay) + (_SQRT2 - 2.0) * min(ax, ay)
+        return int(math.floor(octile * step_milli_per_unit))
+
+    start_states = [(start_cell[0], start_cell[1], l, -1) for l in start_layers
+                    if start_cell not in win.blocked_track.get(l, set())]
+    if not start_states:
+        # start node itself is blocked on every start layer; allow it anyway on
+        # the first start layer (pad escape already picked it), so the search can
+        # leave the pad. It will still be self-checked before emit.
+        start_states = [(start_cell[0], start_cell[1], start_layers[0], -1)] if start_layers else []
+    if not start_states:
+        return None
+
+    best_g: dict[tuple[int, int, str, int], int] = {}
+    came: dict[tuple[int, int, str, int], tuple[int, int, str, int] | None] = {}
+    heap: list[tuple[int, int, int, int, int, int]] = []
+    for (sx, sy, l, d) in start_states:
+        st = (sx, sy, l, d)
+        best_g[st] = 0
+        came[st] = None
+        heapq.heappush(heap, (heuristic(sx, sy), 0, sx, sy, li[l], d))
+
+    def is_goal(cx: int, cy: int, layer: str) -> bool:
+        return cx == gx and cy == gy and layer in goal_layers
+
+    expansions = 0
+    goal_state: tuple[int, int, str, int] | None = None
+    while heap:
+        f, gc, cx, cy, layer_i, d = heapq.heappop(heap)
+        layer = layers[layer_i]
+        st = (cx, cy, layer, d)
+        if gc != best_g.get(st):
+            continue
+        if is_goal(cx, cy, layer):
+            goal_state = st
+            break
+        expansions += 1
+        if expansions > _FINE_ASTAR_MAX_EXPANSIONS:
+            return None
+
+        for di, (dx, dy) in enumerate(_MOVES):
+            ncx, ncy = cx + dx, cy + dy
+            if not win.in_bounds(ncx, ncy):
+                continue
+            if (ncx, ncy) in win.blocked_track[layer] and not (ncx == gx and ncy == gy):
+                continue
+            dist_units = _SQRT2 if (dx and dy) else 1.0
+            dist_mm = dist_units * g
+            base = weights.step * dist_units * float(lp_kind.get(win.layer_types[layer], 1.0))
+            base *= _direction_factor(weights, directions.get(layer), dx, dy)
+            extra = 0.0
+            if home_layer is not None and layer != home_layer:
+                extra += weights.away_from_home_per_mm * dist_mm
+            if corridor_cells is not None and (ncx, ncy) not in corridor_cells:
+                extra += weights.off_corridor * dist_mm
+            if d != -1 and di != d:
+                extra += weights.direction_change
+            move_milli = weights.q(base + extra)
+            ng = gc + move_milli
+            nst = (ncx, ncy, layer, di)
+            if nst not in best_g or ng < best_g[nst]:
+                best_g[nst] = ng
+                came[nst] = st
+                heapq.heappush(heap, (ng + heuristic(ncx, ncy), ng, ncx, ncy, layer_i, di))
+
+        # via moves - layer change at the same node; needs a clear via cell.
+        if (cx, cy) not in win.blocked_via:
+            for other in layers:
+                if other == layer:
+                    continue
+                move_milli = weights.q(weights.via * weights.through_via)
+                ng = gc + move_milli
+                nst = (cx, cy, other, d)
+                if nst not in best_g or ng < best_g[nst]:
+                    best_g[nst] = ng
+                    came[nst] = st
+                    heapq.heappush(heap, (ng + heuristic(cx, cy), ng, cx, cy, li[other], d))
+
+    if goal_state is None:
+        return None
+    rev: list[tuple[int, int, str]] = []
+    cur: tuple[int, int, str, int] | None = goal_state
+    while cur is not None:
+        cx, cy, layer, _d = cur
+        if not rev or rev[-1] != (cx, cy, layer):
+            rev.append((cx, cy, layer))
+        cur = came[cur]
+    rev.reverse()
+    return rev
+
+
+# --------------------------------------------------------------------------- #
+# Path -> world polyline -> simplified (segment)/(via) emit
+# --------------------------------------------------------------------------- #
+
+def _collinear(ax: float, ay: float, bx: float, by: float, cx: float, cy: float) -> bool:
+    cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+    return abs(cross) <= 1e-7
+
+
+def _simplify_polyline(pts: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Drop interior points collinear with their neighbours (collapses straight
+    and 45-degree runs into single spans). Endpoints are always kept."""
+    if len(pts) <= 2:
+        return list(pts)
+    out = [pts[0]]
+    for i in range(1, len(pts) - 1):
+        if not _collinear(out[-1][0], out[-1][1], pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]):
+            out.append(pts[i])
+    out.append(pts[-1])
+    return out
+
+
+def _route_to_emit(
+    win: _FineWindow, path: list[tuple[int, int, str]],
+    from_xy: tuple[float, float], to_xy: tuple[float, float],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Turn a fine A* (cx, cy, layer) path plus its exact off-grid endpoints into
+    emit-ready segment and via records. Pad-escape stubs join the exact endpoints
+    to the first/last grid nodes; per-layer runs are simplified to collinear
+    spans; each layer transition becomes a through via at the shared node."""
+    # world points with layers: exact from-point, grid nodes, exact to-point.
+    world: list[tuple[float, float, str]] = []
+    first_layer = path[0][2]
+    world.append((from_xy[0], from_xy[1], first_layer))
+    for (ix, iy, layer) in path:
+        nx, ny = win.node_xy(ix, iy)
+        world.append((nx, ny, layer))
+    last_layer = path[-1][2]
+    world.append((to_xy[0], to_xy[1], last_layer))
+
+    # split into per-layer runs, emitting a via at each layer change.
+    segments: list[dict[str, Any]] = []
+    vias: list[dict[str, Any]] = []
+    run: list[tuple[float, float]] = [(world[0][0], world[0][1])]
+    run_layer = world[0][2]
+    for i in range(1, len(world)):
+        x, y, layer = world[i]
+        if layer != run_layer:
+            # via at the previous node (== current node coords for a via hop).
+            vx, vy, _ = world[i - 1]
+            simp = _simplify_polyline(_dedup(run))
+            for k in range(len(simp) - 1):
+                segments.append({"x1": simp[k][0], "y1": simp[k][1],
+                                 "x2": simp[k + 1][0], "y2": simp[k + 1][1], "layer": run_layer})
+            vias.append({"x": vx, "y": vy})
+            run = [(vx, vy)]
+            run_layer = layer
+        run.append((x, y))
+    simp = _simplify_polyline(_dedup(run))
+    for k in range(len(simp) - 1):
+        segments.append({"x1": simp[k][0], "y1": simp[k][1],
+                         "x2": simp[k + 1][0], "y2": simp[k + 1][1], "layer": run_layer})
+    # drop zero-length segments (can appear at a via node).
+    segments = [s for s in segments
+                if math.hypot(s["x2"] - s["x1"], s["y2"] - s["y1"]) > _EMIT_EPS_MM]
+    return segments, vias
+
+
+def _dedup(pts: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    for p in pts:
+        if not out or math.hypot(p[0] - out[-1][0], p[1] - out[-1][1]) > _EMIT_EPS_MM:
+            out.append(p)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Self-check (Python clearance pass before any write)
+# --------------------------------------------------------------------------- #
+
+def _self_check(
+    net: str, segments: list[dict[str, Any]], vias: list[dict[str, Any]],
+    obstacles: list["_Obst"], rules: dict[str, Any], via_radius: float,
+) -> list[dict[str, Any]]:
+    """Prove every proposed segment/via against ALL foreign copper at netclass
+    clearance (edge-to-edge >= clearance). Returns a list of violation records;
+    empty means the route is DRC-safe to emit. Same-net obstacles are skipped
+    (a route legitimately touches its own endpoints' copper)."""
+    track_half = rules["track_width"] / 2.0
+    clearance = rules["clearance"]
+    edge_cl = rules["edge_clearance"]
+    violations: list[dict[str, Any]] = []
+    for ob in obstacles:
+        if ob.net == net and not ob.is_edge:
+            continue
+        cl = edge_cl if ob.is_edge else clearance
+        ob_layers = ob.layers
+        for s in segments:
+            if s["layer"] not in ob_layers:
+                continue
+            need = track_half + cl + ob.half - 1e-6
+            if ob.seg_within(s["x1"], s["y1"], s["x2"], s["y2"], need):
+                violations.append({"kind": "segment", "layer": s["layer"],
+                                   "against_net": ob.net, "against_kind": ob.kind,
+                                   "required_mm": round(need, 4)})
+        for v in vias:
+            # a through via touches every routable layer; check against every
+            # foreign obstacle regardless of the obstacle's own layer set.
+            need = via_radius + cl + ob.half - 1e-6
+            if ob.point_within(v["x"], v["y"], need):
+                violations.append({"kind": "via", "against_net": ob.net,
+                                   "against_kind": ob.kind, "required_mm": round(need, 4)})
+    return violations
+
+
+def _nearest_blocker(win: _FineWindow, obstacles: list["_Obst"], net: str,
+                     goal_xy: tuple[float, float]) -> dict[str, Any] | None:
+    """The foreign obstacle nearest the (blocked) goal - named in a failure so a
+    net that cannot route says WHAT is in the way (human copper especially)."""
+    best: tuple[float, _Obst] | None = None
+    for ob in obstacles:
+        if ob.net == net and not ob.is_edge:
+            continue
+        d = ob.center_dist(goal_xy[0], goal_xy[1])
+        if best is None or d < best[0]:
+            best = (d, ob)
+    if best is None:
+        return None
+    ob = best[1]
+    return {"net": ob.net or "(edge/keepout)", "kind": ob.kind,
+            "distance_mm": round(best[0], 4), "layers": sorted(ob.layers)}
+
+
+# --------------------------------------------------------------------------- #
+# Board surgery: emit / delete autorouter copper
+# --------------------------------------------------------------------------- #
+
+def _fmt(v: float) -> str:
+    return _pcb._format_at_number(round(v, 6))
+
+
+def _segment_block(s: dict[str, Any], net: str, width: float, uid: str) -> str:
+    return (f'\t(segment\n\t\t(start {_fmt(s["x1"])} {_fmt(s["y1"])})\n'
+            f'\t\t(end {_fmt(s["x2"])} {_fmt(s["y2"])})\n'
+            f'\t\t(width {_fmt(width)})\n\t\t(layer "{s["layer"]}")\n'
+            f'\t\t(net "{net}")\n\t\t(uuid "{uid}")\n\t)')
+
+
+def _via_block(v: dict[str, Any], net: str, size: float, drill: float,
+               top: str, bottom: str, uid: str) -> str:
+    return (f'\t(via\n\t\t(at {_fmt(v["x"])} {_fmt(v["y"])})\n'
+            f'\t\t(size {_fmt(size)})\n\t\t(drill {_fmt(drill)})\n'
+            f'\t\t(layers "{top}" "{bottom}")\n\t\t(net "{net}")\n\t\t(uuid "{uid}")\n\t)')
+
+
+def _delete_blocks_by_uuid(text: str, uuids: set[str]) -> tuple[str, int]:
+    """Delete the enclosing (segment ...)/(via ...)/(arc ...) block for each
+    uuid, by uuid/text-anchored surgery (same discipline as delete_group)."""
+    removed = 0
+    for uid in uuids:
+        marker = f'(uuid "{uid}")'
+        uidx = text.find(marker)
+        if uidx == -1:
+            continue
+        # find the enclosing block open paren (segment/via/arc) before the uuid.
+        start = -1
+        for token in ("(segment", "(via", "(arc"):
+            p = text.rfind(token, 0, uidx)
+            if p > start:
+                start = p
+        if start == -1:
+            continue
+        depth = 0
+        end = None
+        for i in range(start, len(text)):
+            if text[i] == "(":
+                depth += 1
+            elif text[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end is None:
+            continue
+        line_start = text.rfind("\n", 0, start)
+        line_start = 0 if line_start == -1 else line_start
+        seg_end = end + 1
+        if seg_end < len(text) and text[seg_end] == "\n":
+            seg_end += 1
+        text = text[:line_start] + text[seg_end:]
+        removed += 1
+    return text, removed
+
+
+# --------------------------------------------------------------------------- #
+# Public: route_nets / unroute_nets
+# --------------------------------------------------------------------------- #
+
+def _corridor_from_global(win: _FineWindow, global_conn: dict[str, Any] | None,
+                          coarse_grid: float, coarse_min: tuple[float, float]) -> set[tuple[int, int]] | None:
+    """Fine window nodes within one coarse cell of the global stage's chosen
+    coarse path - the soft corridor the detailed search is discounted to stay
+    inside (leaving it costs off_corridor)."""
+    if not global_conn or not global_conn.get("candidates"):
+        return None
+    coarse_path = global_conn["candidates"][0].get("coarse_path") or []
+    if not coarse_path:
+        return None
+    radius = coarse_grid
+    cells: set[tuple[int, int]] = set()
+    cmnx, cmny = coarse_min
+    for entry in coarse_path:
+        ccx, ccy = entry[0], entry[1]
+        wx = cmnx + (ccx + 0.5) * coarse_grid
+        wy = cmny + (ccy + 0.5) * coarse_grid
+        cix, ciy = win.cell_of(wx, wy)
+        rr = int(math.ceil(radius / win.grid))
+        for iy in range(ciy - rr, ciy + rr + 1):
+            for ix in range(cix - rr, cix + rr + 1):
+                if win.in_bounds(ix, iy):
+                    cells.add((ix, iy))
+    return cells or None
+
+
+def route_nets(
+    project_path: str | Path,
+    nets: list[str] | None = None,
+    connections: list[dict[str, Any]] | None = None,
+    write: bool = False,
+    allow_while_open: bool = False,
+    max_ripup_iterations: int | None = None,
+) -> dict[str, Any]:
+    """Phase 7.3b detailed (fine, windowed) routing.
+
+    For every unrouted connection (from `get_ratsnest`, filtered by `nets`, or a
+    caller-supplied `connections` list) route exact copper in a per-connection
+    obstacle window, in the SAME canonical order as the global stage (priority
+    desc, airline asc). Each connection: build an obstacle window (bbox +
+    `search_window_margin_mm`, doubling up to the whole board on failure); pad-
+    escape both endpoints to the nearest legal grid node; run the fine A* softly
+    constrained to the global stage's corridor; SELF-CHECK every proposed
+    segment/via against all copper at netclass clearance BEFORE any write; then
+    (write=True) append simplified `(segment)`/`(via)` blocks with create_group-
+    style top-level surgery, recording their uuids in board-local
+    `autorouter_owned` (per-net) so `unroute_nets` can undo them.
+
+    Newly emitted copper becomes an obstacle for later connections in the same
+    run (so two routed nets in one call stay DRC-clean against each other).
+
+    STUBBED for this landing (documented honestly): step 4's PathFinder
+    negotiated-congestion rip-up & reroute. `max_ripup_iterations` is accepted
+    and reported but only the window-doubling retry is active; a connection that
+    cannot route without ripping existing copper FAILS with its nearest blocker
+    named (human copper is never ripped anyway). No congestion re-costing, no
+    ripping of already-placed autorouter copper. Also simplified vs. the full
+    spec: pad escape lands on the nearest free grid node rather than a pad-
+    direction-aware exact stub; termination is on the connection's `to` point
+    (not "any same-net copper"); neck-down (7.12) is not applied.
+
+    write=False (default) returns a full preview - per connection: routed flag,
+    length_mm, via count, layers used, est. Phase-6 cost, self-check result, and
+    failures with reasons - without touching the board. Always preview first.
+    """
+    board_path, project_file, _ = _pcb._resolve_project_path(project_path)
+    settings = _pcb.load_pcb_settings(project_path)["config"]
+    autor = settings.get("autorouter", {})
+    grid = float(autor.get("grid_mm", 0.2)) or 0.2
+    base_margin = float(autor.get("search_window_margin_mm", 8.0)) or 8.0
+    if max_ripup_iterations is None:
+        max_ripup_iterations = int(autor.get("max_ripup_iterations", 5))
+
+    rules = _resolve_route_rules(project_path, settings)
+    track_half = rules["track_width"] / 2.0
+    via_radius = rules["via_diameter"] / 2.0
+
+    weights = _Weights(autor.get("cost", {}),
+                       float(settings.get("trace_cost", {}).get("via_weights", {}).get("through", 1.0)))
+    layer_purpose = settings.get("layer_purpose", {})
+    power_patterns = layer_purpose.get("power_net_patterns", [])
+    directions = infer_layer_directions(project_path, settings=settings)["directions"]
+
+    # routable layer set (mirror _CoarseModel's rule).
+    all_layers = _pcb._parse_board_layers_cached(board_path)
+    all_cu = [l["name"] for l in all_layers] or ["F.Cu", "B.Cu"]
+    routable_types = {"signal", "power", "mixed", "jumper"}
+    allowed = autor.get("allowed_layers", []) or []
+    layer_types: dict[str, str] = {}
+    routable_layers: list[str] = []
+    for l in all_layers:
+        if l["type"] not in routable_types:
+            continue
+        if allowed and l["name"] not in allowed:
+            continue
+        routable_layers.append(l["name"])
+        layer_types[l["name"]] = l["type"]
+    if not routable_layers:
+        routable_layers = all_cu
+        for name in routable_layers:
+            layer_types.setdefault(name, "signal")
+    routable_set = set(routable_layers)
+
+    obstacles = _collect_obstacles(board_path, routable_set, all_cu, rules["edge_clearance"])
+    board_bbox = _board_bbox(board_path)
+
+    # connections to route.
+    if connections is None:
+        rats = get_ratsnest(project_path, nets=nets)
+        conns = rats["connections"]
+    else:
+        conns = list(connections)
+        if nets is not None:
+            wanted = set(nets)
+            conns = [c for c in conns if c.get("net") in wanted]
+    conns = sorted(conns, key=lambda c: (-float(c.get("priority", 0.0)),
+                                         float(c.get("airline_length_mm", 0.0)),
+                                         c.get("net", "")))
+
+    # global stage (for home layer + corridor), routed on the same connections.
+    global_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+    coarse_grid = 2.0
+    coarse_min = (board_bbox[0], board_bbox[1])
+    try:
+        gr = global_route(project_path, connections=conns)
+        coarse_grid = float(gr.get("global_grid_mm", 2.0))
+        coarse_min = (gr["bbox"]["minx"], gr["bbox"]["miny"])
+        for oc in gr["connections"]:
+            key = (oc["net"], round(oc["from_point"]["x"], 3), round(oc["from_point"]["y"], 3),
+                   round(oc["to_point"]["x"], 3), round(oc["to_point"]["y"], 3))
+            global_by_key[key] = oc
+    except Exception:
+        pass
+
+    # proposed copper accumulated across this run (obstacles for later conns).
+    proposed_obstacles: list[_Obst] = []
+    out_conns: list[dict[str, Any]] = []
+    emit_segments: list[tuple[str, dict[str, Any], str]] = []  # (net, seg, uuid)
+    emit_vias: list[tuple[str, dict[str, Any], str]] = []
+    routed_count = 0
+
+    for conn in conns:
+        net = conn["net"]
+        net_kind = _pcb._net_kind(net, None, power_patterns)
+        from_xy, to_xy = _conn_endpoints(conn)
+        gkey = (net, round(from_xy[0], 3), round(from_xy[1], 3),
+                round(to_xy[0], 3), round(to_xy[1], 3))
+        gconn = global_by_key.get(gkey)
+        home_layer = gconn.get("home_layer") if gconn else None
+        # Start/goal layers are the PRECISE contact-item layers (the copper that
+        # actually lives at from_point/to_point), not the whole island's layer
+        # set - otherwise the emitted trace can land on a layer the endpoint
+        # copper never reaches and float (the connection stays split). Fall back
+        # to the island layers, then all routable layers.
+        from_item_layers = (conn.get("from") or {}).get("layers") or conn.get("from_layers") or routable_layers
+        to_item_layers = (conn.get("to") or {}).get("layers") or conn.get("to_layers") or routable_layers
+        start_layers = [l for l in from_item_layers if l in routable_set] or routable_layers
+        goal_layers = set(l for l in to_item_layers if l in routable_set) or set(routable_layers)
+
+        result_rec: dict[str, Any] = {
+            "net": net, "net_kind": net_kind,
+            "from_point": {"x": round(from_xy[0], 4), "y": round(from_xy[1], 4)},
+            "to_point": {"x": round(to_xy[0], 4), "y": round(to_xy[1], 4)},
+            "airline_length_mm": conn.get("airline_length_mm"),
+            "home_layer": home_layer, "routed": False,
+            "length_mm": 0.0, "via_count": 0, "layers": [],
+            "self_check": None, "failure": None,
+        }
+
+        margin = base_margin
+        active_obstacles = obstacles + proposed_obstacles
+        routed_ok = False
+        win: _FineWindow | None = None
+        for _attempt in range(4):  # window doubling (step 4's active retry), capped
+            minx = min(from_xy[0], to_xy[0]) - margin
+            miny = min(from_xy[1], to_xy[1]) - margin
+            maxx = max(from_xy[0], to_xy[0]) + margin
+            maxy = max(from_xy[1], to_xy[1]) + margin
+            minx = max(minx, board_bbox[0] - grid)
+            miny = max(miny, board_bbox[1] - grid)
+            maxx = min(maxx, board_bbox[2] + grid)
+            maxy = min(maxy, board_bbox[3] + grid)
+            win = _FineWindow(minx, miny, maxx, maxy, grid, routable_layers, layer_types, net)
+            if win.cols * win.rows * max(1, len(routable_layers)) > _MAX_WINDOW_NODES:
+                result_rec["failure"] = {"reason": "window_too_large",
+                                         "detail": f"window {win.cols}x{win.rows} exceeds node budget",
+                                         "window_margin_mm": margin}
+                break
+            win.build(active_obstacles, track_half, via_radius, rules["clearance"], rules["edge_clearance"])
+
+            s_cell = win.nearest_free(from_xy[0], from_xy[1], start_layers) or win.cell_of(*from_xy)
+            g_cell = win.nearest_free(to_xy[0], to_xy[1], list(goal_layers)) or win.cell_of(*to_xy)
+            corridor = _corridor_from_global(win, gconn, coarse_grid, coarse_min)
+
+            path = _fine_astar(win, net_kind, weights, layer_purpose, directions,
+                               s_cell, start_layers, g_cell, goal_layers,
+                               home_layer, corridor)
+            if path is None:
+                if margin >= _MAX_WINDOW_SPAN_MM:
+                    break
+                margin = min(margin * 2.0, _MAX_WINDOW_SPAN_MM)
+                continue
+
+            segments, vias = _route_to_emit(win, path, from_xy, to_xy)
+            violations = _self_check(net, segments, vias, active_obstacles, rules, via_radius)
+            if violations:
+                result_rec["self_check"] = {"passed": False, "violations": violations[:8],
+                                            "violation_count": len(violations)}
+                # step 4 (rip-up) would negotiate here; stubbed -> fail this conn.
+                result_rec["failure"] = {"reason": "self_check_failed",
+                                         "detail": "proposed copper clears A* obstacles but "
+                                                   "not the exact clearance pass; rip-up is stubbed"}
+                break
+
+            length = sum(math.hypot(s["x2"] - s["x1"], s["y2"] - s["y1"]) for s in segments)
+            layers_used = sorted({s["layer"] for s in segments},
+                                 key=lambda l: routable_layers.index(l) if l in routable_layers else 999)
+            # est. Phase 6 cost: length + via weight (same shape as get_trace_cost).
+            tw = settings.get("trace_cost", {}).get("weights", {})
+            est_cost = (length * float(tw.get("length_mm", 1.0))
+                        + len(vias) * float(tw.get("via", 5.0)))
+            result_rec.update({
+                "routed": True, "length_mm": round(length, 4), "via_count": len(vias),
+                "layers": layers_used, "segment_count": len(segments),
+                "window_margin_mm": margin, "est_phase6_cost": round(est_cost, 4),
+                "self_check": {"passed": True, "violation_count": 0},
+            })
+            # register emitted copper as obstacles + emit records.
+            for s in segments:
+                uid = str(_uuid.uuid4())
+                emit_segments.append((net, s, uid))
+                proposed_obstacles.append(_Obst("seg", net, frozenset([s["layer"]]), track_half,
+                                                s["x1"], s["y1"], s["x2"], s["y2"]))
+            for v in vias:
+                uid = str(_uuid.uuid4())
+                emit_vias.append((net, v, uid))
+                proposed_obstacles.append(_Obst("pt", net, frozenset(routable_layers), via_radius,
+                                                v["x"], v["y"], v["x"], v["y"]))
+            routed_ok = True
+            break
+
+        if not routed_ok and result_rec["failure"] is None:
+            blocker = _nearest_blocker(win, active_obstacles, net, to_xy) if win is not None else None
+            result_rec["failure"] = {"reason": "unreachable_in_window",
+                                     "nearest_blocker": blocker,
+                                     "window_margin_mm": margin}
+        if routed_ok:
+            routed_count += 1
+        out_conns.append(result_rec)
+
+    # ---- emit (write) -------------------------------------------------------
+    written = False
+    owned_added = {"segments": [], "vias": []}
+    if write and (emit_segments or emit_vias):
+        _pcb._check_not_locked_by_editor(board_path, allow_while_open)
+        blocks: list[str] = []
+        records: list[dict[str, Any]] = []
+        for (net, s, uid) in emit_segments:
+            blocks.append(_segment_block(s, net, rules["track_width"], uid))
+            records.append({"uuid": uid, "net": net, "kind": "segment"})
+            owned_added["segments"].append(uid)
+        for (net, v, uid) in emit_vias:
+            top, bottom = routable_layers[0], routable_layers[-1]
+            # through via spans the full copper stack, not just routable subset.
+            if all_cu:
+                top, bottom = all_cu[0], all_cu[-1]
+            blocks.append(_via_block(v, net, rules["via_diameter"], rules["via_drill"], top, bottom, uid))
+            records.append({"uuid": uid, "net": net, "kind": "via"})
+            owned_added["vias"].append(uid)
+        text = _pcb._read_text(board_path)
+        newline = _pcb._detect_newline(text)
+        for block in blocks:
+            text = _pcb._append_top_level_block(text, block)
+        with board_path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        _pcb._invalidate_board_cache(board_path)
+
+        # record ownership in board-local state (per-net, for unroute).
+        state = _pcb.load_board_local(project_path)
+        data = state["data"]
+        data.setdefault("version", 1)
+        owned = data.setdefault("autorouter_owned", {})
+        owned.setdefault("segments", [])
+        owned.setdefault("vias", [])
+        owned.setdefault("records", [])
+        owned["segments"].extend(owned_added["segments"])
+        owned["vias"].extend(owned_added["vias"])
+        owned["records"].extend(records)
+        _pcb.save_board_local(project_path, data)
+        written = True
+
+    return {
+        "board_path": str(board_path),
+        "grid_mm": grid,
+        "write": write,
+        "written": written,
+        "rules": rules,
+        "max_ripup_iterations": max_ripup_iterations,
+        "ripup_active": False,
+        "connections": out_conns,
+        "summary": {
+            "total_connections": len(out_conns),
+            "connections_routed": routed_count,
+            "connections_failed": len(out_conns) - routed_count,
+            "segments_emitted": len(emit_segments),
+            "vias_emitted": len(emit_vias),
+            "total_length_mm": round(sum(c["length_mm"] for c in out_conns), 4),
+        },
+    }
+
+
+def unroute_nets(
+    project_path: str | Path,
+    nets: list[str] | None = None,
+    write: bool = False,
+    allow_while_open: bool = False,
+) -> dict[str, Any]:
+    """Delete autorouter-owned copper (the undo for `route_nets`). Removes only
+    segments/vias recorded in board-local `autorouter_owned` - human-routed
+    copper is never touched. `nets` restricts the deletion to those nets; omit to
+    remove all autorouter-owned copper. write=False previews the uuids that would
+    be removed without touching the board.
+    """
+    board_path, _, _ = _pcb._resolve_project_path(project_path)
+    state = _pcb.load_board_local(project_path)
+    data = state["data"]
+    owned = data.get("autorouter_owned", {}) or {}
+    records = owned.get("records", []) or []
+    wanted = set(nets) if nets else None
+
+    to_remove: list[dict[str, Any]] = []
+    seg_set = set(owned.get("segments", []) or [])
+    via_set = set(owned.get("vias", []) or [])
+    if records:
+        for rec in records:
+            if wanted is None or rec.get("net") in wanted:
+                to_remove.append(rec)
+    else:
+        # no per-record map (older state): fall back to the flat uuid lists.
+        for uid in seg_set:
+            to_remove.append({"uuid": uid, "net": None, "kind": "segment"})
+        for uid in via_set:
+            to_remove.append({"uuid": uid, "net": None, "kind": "via"})
+
+    remove_uuids = {r["uuid"] for r in to_remove}
+    removed = 0
+    written = False
+    if write and remove_uuids:
+        _pcb._check_not_locked_by_editor(board_path, allow_while_open)
+        text = _pcb._read_text(board_path)
+        text, removed = _delete_blocks_by_uuid(text, remove_uuids)
+        with board_path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        _pcb._invalidate_board_cache(board_path)
+        # prune board-local ownership.
+        owned["segments"] = [u for u in seg_set if u not in remove_uuids]
+        owned["vias"] = [u for u in via_set if u not in remove_uuids]
+        owned["records"] = [r for r in records if r["uuid"] not in remove_uuids]
+        _pcb.save_board_local(project_path, data)
+        written = True
+
+    return {
+        "board_path": str(board_path),
+        "write": write,
+        "written": written,
+        "nets": sorted(wanted) if wanted else None,
+        "candidates": len(remove_uuids),
+        "removed": removed,
+        "removed_uuids": sorted(remove_uuids),
+    }

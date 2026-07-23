@@ -532,6 +532,148 @@ def write_multidrop_spi_project(
     return {"board": board_path, "project": project_path, "netlist": netlist_path, "layout": layout}
 
 
+# --- Custom-component / custom-net board mode (Phase 9 critical-net fixtures) -
+
+
+def _critical_nets_footprint_block(
+    ref: str,
+    footprint: str,
+    value: str,
+    x: float,
+    y: float,
+    uuid: str,
+    pads: list[tuple],
+    rotation: float = 0.0,
+) -> str:
+    """A footprint with an arbitrary footprint-library name, ref, and pad
+    geometry - used to build XTAL/switch-node critical-net fixtures where the
+    ref prefix (Y*/X*/L*), footprint name (crystal/resonator/osc tokens), and
+    pad size/spacing all matter to `classify_critical_nets`, none of which the
+    fixed two-pad-resistor/IC-pad shapes above can vary.
+
+    `pads` entries are `(number, local_x, local_y, size_x, size_y, net)`,
+    optionally with a 7th `pad_type` (default `"smd"`) and 8th `shape`
+    (default `"rect"`).
+    """
+    at_clause = f"(at {x} {y} {rotation})" if rotation else f"(at {x} {y})"
+    lines = [
+        f'    (footprint "{footprint}"',
+        '        (layer "F.Cu")',
+        f'        (uuid "{uuid}")',
+        f'        {at_clause}',
+        f'        (property "Reference" "{ref}" (at 0 -3) (layer "F.SilkS"))',
+        f'        (property "Value" "{value}" (at 0 3) (layer "F.Fab"))',
+    ]
+    for pad in pads:
+        num, lx, ly, sx, sy, net = pad[:6]
+        pad_type = pad[6] if len(pad) > 6 else "smd"
+        shape = pad[7] if len(pad) > 7 else "rect"
+        lines.append(
+            f'        (pad "{num}" {pad_type} {shape} (at {lx} {ly}) (size {sx} {sy}) '
+            f'(layers "F.Cu" "F.Paste" "F.Mask") (net "{net}"))'
+        )
+    lines.append("    )\n")
+    return "\n".join(lines)
+
+
+def generate_critical_nets_board(components: list[dict], layers: int = 2) -> tuple[str, list[str]]:
+    """Build a parser-valid `.kicad_pcb` from an explicit list of component
+    dicts, for Phase 9 `classify_critical_nets` fixtures that need control
+    over ref prefixes, footprint names, and real pad geometry (XTAL-by-ref,
+    XTAL-by-footprint-token, switch-node-by-size, switch-node-requires-IC-pin)
+    that the generic `generate_synthetic_board` two-pad-resistor shape can't
+    express.
+
+    Each `components` entry is
+    `{"ref", "footprint", "value" (optional, defaults to ref), "x", "y",
+    "pads": [(number, local_x, local_y, size_x, size_y, net), ...],
+    "rotation" (optional), "uuid" (optional)}`.
+
+    Returns `(board_text, net_names)` with `net_names` in first-seen order
+    across all components' pads (for building a matching `.net` file with
+    `_critical_nets_netlist_text`).
+    """
+    header = _HEADER_TEMPLATE.format(layer_lines=_layer_stack_lines(layers))
+    net_names: list[str] = []
+    seen: set[str] = set()
+    for comp in components:
+        for pad in comp["pads"]:
+            net = pad[5]
+            if net and net not in seen:
+                seen.add(net)
+                net_names.append(net)
+
+    parts = [header, _net_table(net_names)]
+    for i, comp in enumerate(components):
+        fp_uuid = comp.get("uuid") or f"synth-crit-fp-{i:06d}"
+        parts.append(
+            _critical_nets_footprint_block(
+                comp["ref"],
+                comp["footprint"],
+                comp.get("value", comp["ref"]),
+                comp["x"],
+                comp["y"],
+                fp_uuid,
+                comp["pads"],
+                comp.get("rotation", 0.0),
+            )
+        )
+    parts.append(_FOOTER)
+    return "".join(parts), net_names
+
+
+def _critical_nets_netlist_text(components: list[dict]) -> str:
+    """`.net` text matching `generate_critical_nets_board`: one node per pad,
+    grouped by net name, mirroring each component's own pad connectivity."""
+    parts = [
+        "(export", '  (version "E")', "  (design", '    (source "synthetic.kicad_sch")',
+        '    (date "2026-07-22")', '    (tool "synthetic_board.py")', "  )", "  (components",
+    ]
+    for comp in components:
+        parts.append(
+            f'    (comp (ref "{comp["ref"]}") (value "{comp.get("value", comp["ref"])}") '
+            f'(footprint "{comp["footprint"]}"))'
+        )
+    parts.append("  )")
+    parts.append("  (nets")
+    net_nodes: dict[str, list[tuple[str, str]]] = {}
+    for comp in components:
+        for pad in comp["pads"]:
+            num, _lx, _ly, _sx, _sy, net = pad[:6]
+            if net:
+                net_nodes.setdefault(net, []).append((comp["ref"], str(num)))
+    for code, (net, nodes) in enumerate(net_nodes.items(), start=1):
+        parts.extend(_netlist_net_block(code, net, nodes))
+    parts.append("  )")
+    parts.append(")")
+    return "\n".join(parts) + "\n"
+
+
+def write_critical_nets_project(
+    directory: Path,
+    project_name: str,
+    components: list[dict],
+    layers: int = 2,
+) -> dict[str, Path | list[str]]:
+    """Write a full synthetic project (board + `.kicad_pro` + `.net`) built
+    from `generate_critical_nets_board`'s explicit component list. See that
+    function for the `components` shape.
+
+    Returns `{"board", "project", "netlist", "net_names"}`.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    board_path = directory / f"{project_name}.kicad_pcb"
+    project_path = directory / f"{project_name}.kicad_pro"
+    netlist_path = directory / f"{project_name}.net"
+
+    board_text, net_names = generate_critical_nets_board(components, layers=layers)
+    board_path.write_text(board_text, encoding="utf-8")
+    project_path.write_text(_synthetic_kicad_pro_text(), encoding="utf-8")
+    netlist_path.write_text(_critical_nets_netlist_text(components), encoding="utf-8")
+    return {"board": board_path, "project": project_path, "netlist": netlist_path, "net_names": net_names}
+
+
 def write_synthetic_project(
     directory: Path,
     project_name: str = "synthetic",

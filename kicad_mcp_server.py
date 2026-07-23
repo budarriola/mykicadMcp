@@ -38,6 +38,7 @@ try:
     apply_property_position_changes,
     apply_property_position_template,
     audit_capacitor_net_voltages,
+    classify_critical_nets,
     audit_capacitor_voltages,
     audit_netclass_conformance,
     audit_schematic_integrity,
@@ -45,6 +46,7 @@ try:
     create_group,
     create_netclass,
     delete_group,
+    detect_connectors,
     diff_flip_template,
     diff_layout_by_role,
     diff_layout_template,
@@ -94,7 +96,10 @@ except Exception as exc:  # pragma: no cover - import safety
 
 try:
     from kicad_router_tool import (
+        get_drc_constraints,
         get_ratsnest,
+        route_nets,
+        unroute_nets,
     )
 except Exception as exc:  # pragma: no cover - import safety
     log_message(f"Failed to import KiCad router module: {exc}")
@@ -332,6 +337,60 @@ class KiCadMcpServer:
                     "required": ["project_path"],
                 },
                 "handler": self._tool_audit_capacitor_net_voltages,
+            },
+            "detect_kicad_critical_nets": {
+                "description": (
+                    "Classify high-speed / critical nets so the cost model and router shorten exactly "
+                    "these first. Sources, each row reporting its reason: (1) bus_frequency - member nets "
+                    "of qualified detect_kicad_buses candidates (plus CLK-token nets) mapped to a typical "
+                    "frequency via pcb_settings.json high_speed.bus_frequencies_mhz; (2) xtal - nets "
+                    "touching a crystal/resonator (ref Y*/X* or crystal/resonator/osc footprint tokens), "
+                    "always critical with the highest length weight; (3) switch_node - the inductor-to-IC "
+                    "net of a switching supply (L* component larger than switch_node.min_inductor_mm both "
+                    "axes). Per net: {critical, reason, frequency_mhz, l_crit_mm, straight_line_mm, "
+                    "multiplier, stack_up_gate} where L_crit = c x velocity_fraction x (rise_fraction/f) / 6 "
+                    "and stack_up_gate=true means straight-line length >= critical_fraction x L_crit - the "
+                    "session should ask the user whether to pause routing until impedance control / "
+                    "stack-up is configured. The resolved l_crit_table is included so every number is "
+                    "inspectable. get_kicad_trace_cost applies the multipliers to classified nets' length "
+                    "costs automatically. Read-only. Knobs: pcb_settings.json high_speed + switch_node."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string", "description": "KiCad project directory, .kicad_pro, .kicad_pcb, or .kicad_sch path."},
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_detect_critical_nets,
+            },
+            "detect_kicad_connectors": {
+                "description": (
+                    "Phase 7.14 (detection only, read-only): scan the board's own footprints/pads for "
+                    "connector candidates. A footprint qualifies when EITHER its reference starts with "
+                    "one of ref_prefixes (default from pcb_settings.json pin_swap.ref_prefixes, itself "
+                    "J/P/CN/X) OR its footprint/library name contains a connector token (conn, header, "
+                    "connector, socket, terminal - case-insensitive substring), catching connectors under "
+                    "a non-standard ref. Per candidate: ref, footprint, pin_count, matched_by "
+                    "(ref_prefix and/or footprint_token), and pins - one entry per pad with its pad "
+                    "number and the net attached right now, read straight from the board file's own pad "
+                    "(net ...) entries (ground truth, independent of any stale .net export). NEVER "
+                    "guesses swappability - which pins could safely trade places is the user's call, not "
+                    "this tool's. Never writes anything."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string", "description": "KiCad project directory, .kicad_pro, .kicad_pcb, or .kicad_sch path."},
+                        "ref_prefixes": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Override the ref-prefix candidate list (default: pcb_settings.json pin_swap.ref_prefixes, itself J/P/CN/X).",
+                        },
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_detect_connectors,
             },
             "lookup_mouser_part": {
                 "description": (
@@ -888,6 +947,88 @@ class KiCadMcpServer:
                     "required": ["project_path"],
                 },
                 "handler": self._tool_get_ratsnest,
+            },
+            "get_kicad_drc_constraints": {
+                "description": (
+                    "Resolve the project's DRC constraints into one merged table, in precedence order: "
+                    "custom .kicad_dru rules file (e.g. JLCPCB.kicad_dru.txt) > .kicad_pro net-class and "
+                    "board design-settings rules > pcb_settings.json autorouter.clearance_fallback_mm. "
+                    "Parses (rule ...) constraints - clearance, track_width, via diameter/drill/annular, "
+                    "hole-to-hole, edge clearance - with condition expressions limited to offline-evaluable "
+                    "predicates; rules whose conditions cannot be evaluated offline (pairwise B.Type/B.Net "
+                    "etc.) are listed in unsupported_rules with the reason, never silently ignored. Each "
+                    "resolved constraint carries its value plus a sources list tracing which rule/board "
+                    "setting supplied it (with the rule's layer where given). Also returns the raw "
+                    "net_classes and board_rules maps for per-net resolution. This is the single resolver "
+                    "every geometric router stage consumes (obstacle inflation, emit widths, self-check). "
+                    "Read-only; cached on .kicad_dru and .kicad_pro mtime/size."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_get_drc_constraints,
+            },
+            "route_kicad_nets": {
+                "description": (
+                    "Phase 7.3b detailed (fine, windowed) autorouter: route unrouted connections into "
+                    "exact copper. For each connection (from get_kicad_ratsnest, filtered by nets, or a "
+                    "supplied connections list, in priority-desc/airline-asc order) it builds a per-connection "
+                    "obstacle window (bbox + search_window_margin_mm, doubling up to the whole board on "
+                    "failure), pad-escapes both endpoints to the nearest legal grid node, runs an "
+                    "integer-milli-cost A* over (x,y,layer) softly constrained to the global stage's corridor "
+                    "(layer-purpose/off-direction/away-from-home/via costs), then SELF-CHECKS every proposed "
+                    "segment/via against ALL copper at netclass clearance BEFORE any write. Clearance resolves "
+                    "from the Default net-class (never a bare merged 0). Emits simplified (segment)/(via) blocks "
+                    "via top-level surgery and records their uuids in board-local autorouter_owned (undo with "
+                    "unroute_kicad_nets). Note: on plane-filled layers only pour-free channels route (full "
+                    "plane-aware routing and PathFinder rip-up are later phases; window-doubling retry only). "
+                    "write=false (default) previews per-connection routed/length/vias/layers/self-check/failures "
+                    "without touching the board - always preview first. Writes ONLY to the given project's board."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "nets": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Restrict routing to these net names; omit for every unrouted connection.",
+                        },
+                        "write": {"type": "boolean", "default": False},
+                        "allow_while_open": {"type": "boolean", "default": False},
+                        "max_ripup_iterations": {"type": "integer"},
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_route_nets,
+            },
+            "unroute_kicad_nets": {
+                "description": (
+                    "Delete autorouter-owned copper (the undo for route_kicad_nets). Removes only "
+                    "segments/vias recorded in board-local autorouter_owned - human-routed copper is never "
+                    "touched. Pass nets to restrict to specific net names; omit to remove all autorouter-owned "
+                    "copper. write=false (default) previews the uuids that would be removed without touching "
+                    "the board."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "nets": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Restrict deletion to these net names; omit to remove all autorouter-owned copper.",
+                        },
+                        "write": {"type": "boolean", "default": False},
+                        "allow_while_open": {"type": "boolean", "default": False},
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_unroute_nets,
             },
             "propose_kicad_netclass": {
                 "description": (
@@ -1668,6 +1809,29 @@ class KiCadMcpServer:
         nets = args.get("nets")
         return get_ratsnest(args["project_path"], list(nets) if nets else None)
 
+    def _tool_get_drc_constraints(self, args: dict[str, Any]) -> dict[str, Any]:
+        return get_drc_constraints(args["project_path"])
+
+    def _tool_route_nets(self, args: dict[str, Any]) -> dict[str, Any]:
+        nets = args.get("nets")
+        mri = args.get("max_ripup_iterations")
+        return route_nets(
+            args["project_path"],
+            list(nets) if nets else None,
+            write=bool(args.get("write", False)),
+            allow_while_open=bool(args.get("allow_while_open", False)),
+            max_ripup_iterations=int(mri) if mri is not None else None,
+        )
+
+    def _tool_unroute_nets(self, args: dict[str, Any]) -> dict[str, Any]:
+        nets = args.get("nets")
+        return unroute_nets(
+            args["project_path"],
+            list(nets) if nets else None,
+            write=bool(args.get("write", False)),
+            allow_while_open=bool(args.get("allow_while_open", False)),
+        )
+
     def _tool_propose_netclass(self, args: dict[str, Any]) -> dict[str, Any]:
         return propose_netclass_from_nets(args["project_path"], list(args["nets"]), args["name"])
 
@@ -1714,6 +1878,12 @@ class KiCadMcpServer:
 
     def _tool_audit_capacitor_net_voltages(self, args: dict[str, Any]) -> dict[str, Any]:
         return audit_capacitor_net_voltages(args["project_path"])
+
+    def _tool_detect_critical_nets(self, args: dict[str, Any]) -> dict[str, Any]:
+        return classify_critical_nets(args["project_path"])
+
+    def _tool_detect_connectors(self, args: dict[str, Any]) -> dict[str, Any]:
+        return detect_connectors(args["project_path"], ref_prefixes=args.get("ref_prefixes"))
 
     def _tool_lookup_mouser_part(self, args: dict[str, Any]) -> dict[str, Any]:
         return lookup_mouser_part(args["url"])

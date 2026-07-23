@@ -13,7 +13,11 @@ from pathlib import Path
 import pytest
 
 import kicad_pcb_tool as k
-from synthetic_board import generate_synthetic_board, write_synthetic_project
+from synthetic_board import (
+    generate_synthetic_board,
+    write_critical_nets_project,
+    write_synthetic_project,
+)
 
 
 def test_classify_critical_nets_bus_frequency_mapping(tmp_path: Path) -> None:
@@ -116,23 +120,192 @@ def test_critical_fraction_gate(tmp_path: Path) -> None:
 
 def test_xtal_detection_by_ref(tmp_path: Path) -> None:
     """Test XTAL nets are detected by component ref Y* or X*."""
-    # This is a placeholder - synthetic_board needs enhancement to place Y/X refs
-    # with predictable net connections for testing
+    components = [
+        {
+            "ref": "Y1",
+            "footprint": "synthetic:XTAL_2Pin",
+            "x": 10.0,
+            "y": 10.0,
+            "pads": [
+                (1, -1.0, 0.0, 0.9, 0.9, "XTAL1_A"),
+                (2, 1.0, 0.0, 0.9, 0.9, "XTAL1_B"),
+            ],
+        },
+        {
+            "ref": "U1",
+            "footprint": "synthetic:IC",
+            "x": 30.0,
+            "y": 10.0,
+            "pads": [
+                (1, 0.0, 0.0, 0.4, 0.4, "XTAL1_A"),
+                (2, 0.0, 1.0, 0.4, 0.4, "XTAL1_B"),
+            ],
+        },
+    ]
+    result_paths = write_critical_nets_project(tmp_path, "test_xtal_ref", components)
+    project_path = result_paths["board"].parent
+
+    result = k.classify_critical_nets(project_path)
+    critical_nets = result.get("critical_nets", [])
+
+    xtal_records = {net["net"]: net for net in critical_nets if net.get("reason") == "xtal"}
+    assert {"XTAL1_A", "XTAL1_B"} <= set(xtal_records.keys()), (
+        f"Expected XTAL1_A/XTAL1_B classified as xtal, got {xtal_records.keys()} "
+        f"from {critical_nets}"
+    )
+    for net in xtal_records.values():
+        assert net["critical"] is True
+        assert net["multiplier"] == 8.0  # switch_node length_weight_mult (XTAL's weight)
 
 
 def test_xtal_detection_by_footprint_token(tmp_path: Path) -> None:
     """Test XTAL nets are detected by footprint name containing xtal/crystal tokens."""
-    # Placeholder - synthetic_board needs to support custom footprints
+    components = [
+        {
+            # Ref deliberately does NOT start with Y/X, so only the footprint
+            # name's "CRYSTAL" token can trigger classification.
+            "ref": "C1",
+            "footprint": "synthetic:Crystal_HC49U_Vertical",
+            "x": 10.0,
+            "y": 10.0,
+            "pads": [
+                (1, -1.0, 0.0, 0.9, 0.9, "OSC_A"),
+                (2, 1.0, 0.0, 0.9, 0.9, "OSC_B"),
+            ],
+        },
+        {
+            "ref": "U1",
+            "footprint": "synthetic:IC",
+            "x": 30.0,
+            "y": 10.0,
+            "pads": [
+                (1, 0.0, 0.0, 0.4, 0.4, "OSC_A"),
+                (2, 0.0, 1.0, 0.4, 0.4, "OSC_B"),
+            ],
+        },
+    ]
+    result_paths = write_critical_nets_project(tmp_path, "test_xtal_footprint", components)
+    project_path = result_paths["board"].parent
+
+    result = k.classify_critical_nets(project_path)
+    critical_nets = result.get("critical_nets", [])
+
+    xtal_records = {net["net"]: net for net in critical_nets if net.get("reason") == "xtal"}
+    assert {"OSC_A", "OSC_B"} <= set(xtal_records.keys()), (
+        f"Expected OSC_A/OSC_B classified as xtal via footprint token, got "
+        f"{xtal_records.keys()} from {critical_nets}"
+    )
 
 
 def test_switch_node_detection_by_size(tmp_path: Path) -> None:
-    """Test switch nodes are detected when inductor size >= min_inductor_mm."""
-    # Placeholder - synthetic_board needs to support L components with size info
+    """Test switch nodes are detected when inductor size >= min_inductor_mm.
+
+    Uses two inductors of the same ref pattern (L*), both with one terminal
+    wired to an IC pin: L1's footprint is >= the default 2.0mm min_inductor_mm
+    on both axes (pad size 4x9mm, pads 6mm apart -> ~10x9mm bbox, mirroring
+    kiln's real SRP1038C), so its IC-connected net should qualify. L2 is a
+    tiny 0402-style footprint (well under 2.0mm on both axes) so, despite
+    also reaching an IC pin, its net should NOT qualify - isolating the size
+    gate from the IC-pin gate (covered separately below).
+    """
+    components = [
+        {
+            "ref": "L1",
+            "footprint": "synthetic:L_Inductor_Big",
+            "x": 10.0,
+            "y": 10.0,
+            "pads": [
+                (1, -3.0, 0.0, 4.0, 9.0, "L1_IN"),
+                (2, 3.0, 0.0, 4.0, 9.0, "L1_SW"),
+            ],
+        },
+        {
+            "ref": "L2",
+            "footprint": "synthetic:L_Inductor_0402",
+            "x": 30.0,
+            "y": 10.0,
+            "pads": [
+                (1, -0.35, 0.0, 0.5, 0.6, "L2_IN"),
+                (2, 0.35, 0.0, 0.5, 0.6, "L2_SW"),
+            ],
+        },
+        {
+            "ref": "U1",
+            "footprint": "synthetic:IC",
+            "x": 50.0,
+            "y": 10.0,
+            "pads": [
+                (1, 0.0, 0.0, 0.4, 0.4, "L1_SW"),
+                (2, 0.0, 1.0, 0.4, 0.4, "L2_SW"),
+            ],
+        },
+    ]
+    result_paths = write_critical_nets_project(tmp_path, "test_switch_size", components)
+    project_path = result_paths["board"].parent
+
+    result = k.classify_critical_nets(project_path)
+    critical_nets = result.get("critical_nets", [])
+    switch_nets = {net["net"] for net in critical_nets if net.get("reason") == "switch_node"}
+
+    assert "L1_SW" in switch_nets, f"Big inductor's IC-connected net should qualify, got {switch_nets}"
+    assert "L1_IN" not in switch_nets, "The non-IC-connected terminal must not be flagged"
+    assert "L2_SW" not in switch_nets, (
+        "Undersized (0402-style) inductor must not qualify even though it reaches an IC pin"
+    )
 
 
 def test_switch_node_requires_ic_pin_connection(tmp_path: Path) -> None:
-    """Test switch node detection requires one terminal to touch an IC pin."""
-    # Placeholder - synthetic_board needs L + IC pad connection
+    """Test switch node detection requires one terminal to touch an IC pin.
+
+    L1 is large enough on both axes to pass the size gate (same geometry as
+    the size test above), but BOTH terminals connect only to passive
+    components (R1/R2, not an IC) - so no net should be classified as a
+    switch node despite satisfying the size requirement.
+    """
+    components = [
+        {
+            "ref": "L1",
+            "footprint": "synthetic:L_Inductor_Big",
+            "x": 10.0,
+            "y": 10.0,
+            "pads": [
+                (1, -3.0, 0.0, 4.0, 9.0, "L1_IN"),
+                (2, 3.0, 0.0, 4.0, 9.0, "L1_SW"),
+            ],
+        },
+        {
+            "ref": "R1",
+            "footprint": "synthetic:R_0603",
+            "x": -10.0,
+            "y": 10.0,
+            "pads": [
+                (1, -0.75, 0.0, 0.9, 0.95, "L1_IN"),
+                (2, 0.75, 0.0, 0.9, 0.95, "SUPPLY"),
+            ],
+        },
+        {
+            "ref": "R2",
+            "footprint": "synthetic:R_0603",
+            "x": 30.0,
+            "y": 10.0,
+            "pads": [
+                (1, -0.75, 0.0, 0.9, 0.95, "L1_SW"),
+                (2, 0.75, 0.0, 0.9, 0.95, "LOAD"),
+            ],
+        },
+    ]
+    result_paths = write_critical_nets_project(tmp_path, "test_switch_no_ic", components)
+    project_path = result_paths["board"].parent
+
+    result = k.classify_critical_nets(project_path)
+    critical_nets = result.get("critical_nets", [])
+    switch_nets = {net["net"] for net in critical_nets if net.get("reason") == "switch_node"}
+
+    assert "L1_SW" not in switch_nets
+    assert "L1_IN" not in switch_nets
+    assert switch_nets == set(), (
+        f"No switch node should be classified without an IC-pin connection, got {switch_nets}"
+    )
 
 
 def test_get_trace_cost_applies_critical_multiplier(tmp_path: Path) -> None:
