@@ -13,7 +13,7 @@ query and edit the board.
   lookups. Requires a free `MOUSER_API_KEY` in the repo-root `.env` (see `.env.example`).
 - [kicad_ipc_tool.py](kicad_ipc_tool.py) - talks to a *running* KiCad instance over its IPC API
   (via `kicad-python`) instead of parsing files on disk; backs the live tools in Group 9 below.
-- [kicad_mcp_server.py](kicad_mcp_server.py) - the MCP server itself; registers all 79 tools and
+- [kicad_mcp_server.py](kicad_mcp_server.py) - the MCP server itself; registers all 82 tools and
   serves them over stdio or HTTP transport.
 - [requirements-mcp.txt](requirements-mcp.txt) - Python dependencies (`mcp>=1.0.0` required;
   `kicad-python>=0.7.0` optional - enables the live IPC tools, otherwise they're just left

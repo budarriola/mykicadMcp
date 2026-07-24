@@ -96,8 +96,11 @@ except Exception as exc:  # pragma: no cover - import safety
 
 try:
     from kicad_router_tool import (
+        audit_plane_islands,
         get_drc_constraints,
         get_ratsnest,
+        list_zones,
+        route_board,
         route_nets,
         unroute_nets,
     )
@@ -948,6 +951,58 @@ class KiCadMcpServer:
                 },
                 "handler": self._tool_get_ratsnest,
             },
+            "list_kicad_zones": {
+                "description": (
+                    "Phase 7.5.1 zone parser: list every BOARD-LEVEL zone (copper pour or keepout) - "
+                    "footprint-nested pad-keepout zones are excluded, only plane/board zones are "
+                    "returned. Per zone: net (empty for keepouts/no-net zones), layers (a LIST - KiCad 9 "
+                    "multi-layer zones are native on this board, e.g. mainGnd spans F.Cu/B.Cu/In1.Cu), "
+                    "uuid, name, priority (higher wins overlap), hatch (style/pitch), connect_pads "
+                    "(mode/clearance), min_thickness, fill settings (thermal_gap, thermal_bridge_width, "
+                    "smoothing, radius, and island_removal_mode - read directly, since mode 1 changes "
+                    "island-removal semantics the cost model must respect), the outline polygon, and "
+                    "filled_polygon blocks (per layer) WHEN PRESENT - never fabricated; a zone that "
+                    "hasn't been filled in KiCad simply has none. On kiln this finds six zones: mainGnd "
+                    "(GND_Main, F/B/In1.Cu), safty_gnd (GND_Safty, priority 1), main12v, main3.3, "
+                    "3.3v_safty (all In2.Cu), and an unnamed-net antenna keepout. Read-only; cached on "
+                    "board mtime/size. Supersedes the Phase 7.3 connectivity-only zone-fill stopgap."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_list_zones,
+            },
+            "audit_kicad_plane_islands": {
+                "description": (
+                    "Phase 7.5.2 (fill model) + 7.5.3 (islands & attachment-point costing): per "
+                    "net-owning board zone/layer, report fill_source ('kicad' when the zone carries "
+                    "real filled_polygon data - true for all six kiln zones - else 'estimated': the "
+                    "outline rasterized at autorouter.grid_mm, with higher-priority-zone overlap and "
+                    "clearance-inflated foreign copper subtracted, split into connected components), "
+                    "component_count, and per component its role (mainland - the component with the "
+                    "most same-net pad/via attachments; island; orphan - 0 attachments, dead copper; "
+                    "or will_be_removed when the zone's island_removal_mode is 1, since KiCad deletes "
+                    "such islands on refill and they are never costed/stitched), its attachment list, "
+                    "area_mm2, current cost (island_base/attachment_count, orphan_island at 0 "
+                    "attachments, 0.0 for the mainland - all from pcb_settings.json's plane block), a "
+                    "warn flag below island_min_attachments_warn, and for costed islands the cheapest "
+                    "stitching-via position found (nearest point to the mainland component) with its "
+                    "projected new attachment count and cost. Keepout/no-net zones are excluded. "
+                    "Read-only; does not place anything (that's Phase 7.5.6)."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_audit_plane_islands,
+            },
             "get_kicad_drc_constraints": {
                 "description": (
                     "Resolve the project's DRC constraints into one merged table, in precedence order: "
@@ -971,6 +1026,42 @@ class KiCadMcpServer:
                     "required": ["project_path"],
                 },
                 "handler": self._tool_get_drc_constraints,
+            },
+            "route_kicad_board": {
+                "description": (
+                    "Phase 7.17 - the ONE command to route the board (also a CLI: "
+                    "`python kicad_router_tool.py route <project> [--write] [--nets ...] [--effort ...]`). "
+                    "A thin orchestrator over the ratsnest -> global (7.3a) -> detailed (7.3b, incl. rip-up) "
+                    "pipeline (it duplicates no routing logic - route_kicad_nets already runs that whole "
+                    "pipeline). Reports what was unrouted before, then routed/failed counts, routed length, "
+                    "vias, and rip-up stats. `effort` (quick|balanced|best) currently tunes rip-up "
+                    "aggressiveness only (quick=single pass; balanced=config default; best=aggressive) and "
+                    "gains meaning when the 7.6 optimizer lands. Plane-aware routing (7.5), whole-board "
+                    "optimization (7.6), and stitching (7.5.6) are declared TODO pipeline hooks (M4), not yet "
+                    "wired - the report's `pipeline` block says so; the signature will not change when they "
+                    "land. write=false (default) previews without touching the board; reversible via "
+                    "unroute_kicad_nets."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "nets": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Restrict routing to these net names; omit for every unrouted connection.",
+                        },
+                        "write": {"type": "boolean", "default": False},
+                        "effort": {
+                            "type": "string",
+                            "enum": ["quick", "balanced", "best"],
+                            "default": "balanced",
+                        },
+                        "allow_while_open": {"type": "boolean", "default": False},
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_route_board,
             },
             "route_kicad_nets": {
                 "description": (
@@ -1809,8 +1900,24 @@ class KiCadMcpServer:
         nets = args.get("nets")
         return get_ratsnest(args["project_path"], list(nets) if nets else None)
 
+    def _tool_list_zones(self, args: dict[str, Any]) -> dict[str, Any]:
+        return list_zones(args["project_path"])
+
+    def _tool_audit_plane_islands(self, args: dict[str, Any]) -> dict[str, Any]:
+        return audit_plane_islands(args["project_path"])
+
     def _tool_get_drc_constraints(self, args: dict[str, Any]) -> dict[str, Any]:
         return get_drc_constraints(args["project_path"])
+
+    def _tool_route_board(self, args: dict[str, Any]) -> dict[str, Any]:
+        nets = args.get("nets")
+        return route_board(
+            args["project_path"],
+            list(nets) if nets else None,
+            write=bool(args.get("write", False)),
+            effort=str(args.get("effort", "balanced")),
+            allow_while_open=bool(args.get("allow_while_open", False)),
+        )
 
     def _tool_route_nets(self, args: dict[str, Any]) -> dict[str, Any]:
         nets = args.get("nets")

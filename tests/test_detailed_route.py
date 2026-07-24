@@ -221,3 +221,162 @@ def test_router_tools_registered() -> None:
     for name in ("route_kicad_nets", "unroute_kicad_nets"):
         assert callable(tools[name]["handler"])
         assert "project_path" in tools[name]["inputSchema"]["properties"]
+
+
+# --------------------------------------------------------------------------- #
+# Step 4 - rip-up & reroute (negotiated congestion), on a synthetic congestion
+# board (the real kiln board has no natural single-lane rip-up scenario cheap
+# enough to route in pure Python, so these use a small forced-congestion board).
+#
+# Board model: a horizontal GND "wall" at y=15 on BOTH copper layers with 1.4 mm
+# gaps; routing is pinned to F.Cu (allowed_layers) so the wall is a true planar
+# barrier a via cannot bypass. Nets cross top<->bottom only through a gap.
+# --------------------------------------------------------------------------- #
+
+from synthetic_board import (  # noqa: E402
+    _HEADER_TEMPLATE, _layer_stack_lines, _net_table, _synthetic_kicad_pro_text,
+)
+
+_HDR2 = _HEADER_TEMPLATE.format(layer_lines=_layer_stack_lines(2))
+
+
+def _pad_block(ref: str, x: float, y: float, net: str, uid: str) -> str:
+    return (f'    (footprint "synthetic:PAD"\n        (layer "F.Cu")\n        (uuid "{uid}")\n'
+            f'        (at {x} {y})\n'
+            f'        (property "Reference" "{ref}" (at 0 -1) (layer "F.SilkS"))\n'
+            f'        (property "Value" "P" (at 0 1) (layer "F.Fab"))\n'
+            f'        (pad "1" smd rect (at 0 0) (size 0.6 0.6) (layers "F.Cu" "F.Paste" "F.Mask") (net "{net}"))\n'
+            f'    )\n')
+
+
+def _seg_block(x1: float, y1: float, x2: float, y2: float, layer: str, net: str, uid: str) -> str:
+    return (f'    (segment\n        (start {x1} {y1})\n        (end {x2} {y2})\n'
+            f'        (width 0.2)\n        (layer "{layer}")\n        (net "{net}")\n        (uuid "{uid}")\n    )\n')
+
+
+def _wall_with_gaps(y: float, x0: float, x1: float, gap_centers: list[float], halfgap: float) -> list[str]:
+    """GND wall segments on F.Cu + B.Cu spanning [x0, x1] at height `y`, leaving a
+    `2*halfgap`-wide opening centred on each gap center."""
+    segs: list[str] = []
+    x = x0
+    for i, gc in enumerate(sorted(gap_centers)):
+        if gc - halfgap > x:
+            segs.append(_seg_block(x, y, gc - halfgap, y, "F.Cu", "GND", f"wall{i}fF"))
+            segs.append(_seg_block(x, y, gc - halfgap, y, "B.Cu", "GND", f"wall{i}fB"))
+        x = gc + halfgap
+    if x < x1:
+        segs.append(_seg_block(x, y, x1, y, "F.Cu", "GND", "wallzF"))
+        segs.append(_seg_block(x, y, x1, y, "B.Cu", "GND", "wallzB"))
+    return segs
+
+
+def _write_congestion_project(directory, pads, walls, nets, overrides=None):
+    """Write a minimal single-layer-routed congestion project (board + pro +
+    board_local priorities + pcb_settings pinning routing to F.Cu)."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    parts = [_HDR2, _net_table(nets + ["GND"])]
+    for i, (ref, x, y, net) in enumerate(pads):
+        parts.append(_pad_block(ref, x, y, net, f"pad{i:04d}"))
+    parts.extend(walls)
+    parts.append(")\n")
+    (directory / "cong.kicad_pcb").write_text("".join(parts), encoding="utf-8")
+    (directory / "cong.kicad_pro").write_text(_synthetic_kicad_pro_text(), encoding="utf-8")
+    if overrides:
+        pcb.save_board_local(directory, {"version": 1, "net_overrides": overrides})
+    (directory / "pcb_settings.json").write_text(
+        json.dumps({"autorouter": {"allowed_layers": ["F.Cu"]}}), encoding="utf-8")
+    pcb._invalidate_board_cache(directory / "cong.kicad_pcb")
+    return directory
+
+
+def _by_net(res):
+    return {c["net"]: c for c in res["connections"]}
+
+
+def test_ripup_reroutes_earlier_autorouter_connection(tmp_path: Path) -> None:
+    """NETF cannot route without rip-up (its only gap is taken by the earlier,
+    higher-priority NETG and its second gap is beyond window reach); with rip-up
+    NETF rips NETG, takes the gap, and NETG RE-ROUTES to the far gap - both end
+    routed. Proves step 4 rips autorouter-owned copper and re-routes the ripped
+    set (corridor choice changed)."""
+    pads = [("G1", 10, 5, "NETG"), ("G2", 60, 25, "NETG"),
+            ("F1", 11, 10, "NETF"), ("F2", 9, 20, "NETF")]
+    walls = _wall_with_gaps(15.0, 0.0, 80.0, [10.0, 72.0], 0.7)
+    proj = _write_congestion_project(
+        tmp_path / "rip", pads, walls, ["NETG", "NETF"],
+        overrides={"NETG": {"priority": 10}, "NETF": {"priority": 0}})
+
+    res = router.route_nets(proj, write=False)
+    assert res["ripup_active"] is True
+    conns = _by_net(res)
+
+    # Without rip-up NETF has no route; with rip-up BOTH route.
+    assert conns["NETG"]["routed"] is True
+    assert conns["NETF"]["routed"] is True
+    assert res["summary"]["connections_routed"] == 2
+
+    # Rip-up actually happened: NETF ripped an earlier connection to place itself.
+    rip = res["ripup"]
+    assert rip["iterations"] >= 1
+    assert rip["connections_ripped"] >= 1
+    assert rip["congestion_escalations"] >= 1
+    assert conns["NETF"].get("ripped_to_place"), "NETF records the owner(s) it ripped"
+
+    # NETG's re-route uses the FAR gap (x~72): its corridor choice changed, so it
+    # is a genuinely different (longer) path than a straight NETG-first route.
+    assert conns["NETG"]["length_mm"] > conns["NETF"]["length_mm"]
+    assert conns["NETG"]["self_check"]["passed"] is True
+    assert conns["NETF"]["self_check"]["passed"] is True
+
+    # Determinism: a second preview is byte-identical.
+    res2 = router.route_nets(proj, write=False)
+    assert json.dumps(res["connections"], sort_keys=True) == json.dumps(res2["connections"], sort_keys=True)
+
+    # Write path: both nets' copper is emitted and recorded as autorouter-owned.
+    wr = router.route_nets(proj, write=True)
+    assert wr["written"] is True
+    assert wr["summary"]["connections_routed"] == 2
+    owned = pcb.load_board_local(proj)["data"]["autorouter_owned"]
+    assert len(owned["segments"]) == wr["summary"]["segments_emitted"]
+    owned_nets = {r["net"] for r in owned["records"]}
+    assert {"NETG", "NETF"} <= owned_nets
+
+    # Emitted geometry is deterministic (uuid-stripped) across write runs.
+    import re
+    def _geo(txt):
+        return sorted(re.findall(
+            r"\(segment\s+\(start ([\-\d.]+) ([\-\d.]+)\)\s+\(end ([\-\d.]+) ([\-\d.]+)\)", txt))
+    geo1 = _geo((proj / "cong.kicad_pcb").read_text(encoding="utf-8"))
+    router.unroute_nets(proj, write=True)
+    router.route_nets(proj, write=True)
+    geo2 = _geo((proj / "cong.kicad_pcb").read_text(encoding="utf-8"))
+    assert geo1 == geo2 and len(geo1) >= 2
+
+
+def test_human_copper_is_never_ripped(tmp_path: Path) -> None:
+    """A net blocked SOLELY by human/board copper (a solid GND wall with no gap)
+    FAILS with the blocker named - the router never rips human copper to make
+    room, and performs zero rip-up iterations."""
+    pads = [("HH1", 20, 5, "NETHH"), ("HH2", 20, 25, "NETHH")]
+    walls = (_wall_with_gaps(15.0, 0.0, 40.0, [], 0.7)  # solid F.Cu+B.Cu wall, no gaps
+             )
+    proj = _write_congestion_project(tmp_path / "human", pads, walls, ["NETHH"])
+
+    gnd_before = (proj / "cong.kicad_pcb").read_text(encoding="utf-8").count('(net "GND")')
+
+    res = router.route_nets(proj, write=True)  # write=True proves nothing human is deleted
+    conns = _by_net(res)
+    rec = conns["NETHH"]
+
+    assert rec["routed"] is False
+    assert rec["failure"]["reason"] == "unreachable_in_window"
+    # the blocker is NAMED and it is the human GND wall.
+    assert rec["failure"]["nearest_blocker"]["net"] == "GND"
+    # NOTHING was ripped (human copper is not rippable), no rip-up iterations.
+    assert res["ripup"]["iterations"] == 0
+    assert res["ripup"]["connections_ripped"] == 0
+    assert res["summary"]["connections_routed"] == 0
+    # the human GND copper is still fully present on the board.
+    gnd_after = (proj / "cong.kicad_pcb").read_text(encoding="utf-8").count('(net "GND")')
+    assert gnd_after == gnd_before

@@ -35,11 +35,12 @@ For whoever (human or AI) picks this up next:
   M0 and M1 are fully done (docs page `10-netclasses-and-buses.md` — note:
   verify tool counts by instantiating `KiCadMcpServer`, not by grepping; a
   grep-count once came back wrong).
-  **79 MCP tools registered; full 144-test pytest suite green** (fixtures,
+  **82 MCP tools registered; full 173-test pytest suite green** (fixtures,
   golden parser tests, writer round-trip, synthetic board/project
   + multi-drop SPI generators, kicad-cli acceptance, corridor/deviation,
-  ratsnest, global-route, detailed-route, DRC-constraint, critical-net,
-  connector tests; `pytest.ini`
+  ratsnest, global-route, detailed-route, plane-routing, route-board,
+  zone-parser, plane-island, DRC-constraint, critical-net, connector tests;
+  `pytest.ini`
   registers the `slow` marker used by the kiln global-route smoke). Each
   landed phase is collapsed to a short "LANDED" anchor section in
   place, kept because later phases reference it. All subagent work above was
@@ -119,20 +120,45 @@ For whoever (human or AI) picks this up next:
     multipliers ≥ per-kind minimum) — add a docstring line with 7.3b;
     (b) bundle endpoints search all-layer start/goal sets, skipping the
     entry-via cost — 7.3b's exact geometry corrects it.
-- **Session 2026-07-23 (3-way burst, all coordinator-reviewed): 7.3b core
-  landed, 7.14 detection landed, M6 item 17 (a)+(b) landed.** See the 7.3b
-  stage-2 anchor, the 7.14 anchor, and Phase 9 anchor for what landed +
-  residuals. Full suite 144 green, 79 tools, all coordinator-verified against
-  the tree (concurrent edits to `kicad_mcp_server.py`/`kicad_pcb_tool.py`
-  integrated cleanly).
-- **Next work when resumed:** finish 7.3b — **step 4 rip-up & reroute**
-  (PathFinder negotiated congestion; currently stubbed, only window-doubling
-  retry is active), **plane-aware routing (7.5.4)** so plane-net via-drops
-  through pours stop failing (needs Phase 7.5 zone model, M4), **7.12
-  neck-down** riding the pad-escape stub, and lifting the 60 mm / 400k-node
-  window cap toward whole-board (needs numpy/accel, M5). Then step 12
-  (viewer). Also open: M6 item 17 (c) Flow B stack-up-gate question, and
-  7.14's optimizer pin-swap move + pause-the-user protocol (both wait on 7.6).
+- **Session 2026-07-23 (coordinator-reviewed): 7.3b core landed, 7.14 detection
+  landed, M6 item 17 (a)+(b) landed, M3 docs pass landed, then 7.3b step-4
+  rip-up landed.** See the 7.3b stage-2 anchor (incl. its rip-up sub-anchor),
+  the 7.14 anchor, and Phase 9 anchor for what landed + residuals. Full suite
+  146 green, 79 tools, all coordinator-verified against the tree (concurrent
+  edits to `kicad_mcp_server.py`/`kicad_pcb_tool.py` integrated cleanly).
+  Then (coordinator-implemented directly, agents being rate-limited):
+  **§7.17 one-command `route_board` minimal version LANDED** — MCP tool
+  `route_kicad_board` + `python kicad_router_tool.py route` CLI, 80 tools, 6
+  new tests, measured on kiln (Current3 routes 1.7257 mm; MOSI correctly fails
+  pending M4 planes). See §7.17 anchor, build-order 11h, Flow B step 5.
+  Then **Phase 7.5.1 zone parser + `list_kicad_zones` LANDED** (Sonnet agent,
+  coordinator-verified): 81 tools, 159-test suite green, six kiln zones parsed
+  (mainGnd multi-layer F/B/In1.Cu, safty_gnd, antenna, 3 In2.Cu planes), the
+  7.3 stopgap parser retired, and the `get_ratsnest`=39 guard holds. See the
+  7.5.1 anchor. Then **Phase 7.5.2 fill + 7.5.3 `audit_kicad_plane_islands`
+  LANDED** (Sonnet, coordinator-verified): 82 tools, 165-test suite green,
+  kiln fill_source all "kicad", 31 costed islands / 1 orphan on safty_gnd F.Cu,
+  39-guard holds. See the 7.5.2/7.5.3 anchor. Then **Phase 7.5.4 plane-aware
+  routing LANDED** (Sonnet, coordinator-verified): plane moves in the detailed
+  A* for zone-owning nets, 82 tools, full 173-test suite green (my own
+  `-p no:randomly` run — the agent's transient "172" did not reproduce),
+  signal-net parity confirmed (Current3 unchanged), 39-guard holds. See the
+  7.5.4 anchor for the residuals (estimated-fill path not wired; heuristic not
+  cost-optimal for plane states; kiln proof is synthetic).
+- **Next work when resumed:** (1) **Phase 7.5.5 propose/create/modify planes**
+  (`propose_kicad_plane`/`create_kicad_plane`/`modify_kicad_plane` — the plane
+  WRITERS, dry-run/write/lock discipline, uuid-anchored s-expr surgery, only
+  autorouter-owned zones mutable), then **7.5.6 stitching pass** +
+  `remove_kicad_stitching_vias` + its ask-before-routing rule (last in M4).
+  (2) Two small 7.5.4 residuals: wire the 7.5.2 estimated-fill fallback into the
+  plane router, and relabel `route_board`/`route_kicad_nets`
+  `pipeline.plane_aware_routing` from `not_implemented` to `partial`. (3) A docs
+  row for
+  `route_kicad_board` on `11-autorouter.md` (README/CLAUDE bump 79→81). (3)
+  Finish 7.3b's remaining bits: 7.12 neck-down, direction-aware pad escape,
+  whole-board windowing (numpy/accel, M5). Then step 12 (viewer). Still open:
+  M6 item 17 (c) Flow B stack-up-gate question, and 7.14's optimizer pin-swap
+  move + pause-the-user protocol (both wait on 7.6).
 - **Nothing has been committed** in either repo as of this snapshot — review the
   working tree before assuming git history matches this file.
 - Verify claims against the code (`kicad_pcb_tool.py`, `kicad_mcp_server.py`,
@@ -616,7 +642,7 @@ path); **detailed routing** turns each choice into exact geometry. All Python.
    moves cost `step` x layer-purpose multiplier; turns add `direction_change`;
    layer changes add `via` and need via-sized clearance on both layers; octile
    heuristic. Plane moves per 7.5.4.
-4. **Rip-up & reroute (negotiated congestion) — STILL STUBBED (see stage-2
+4. **Rip-up & reroute (negotiated congestion) — LANDED 2026-07-23 (see stage-2
    anchor).** PathFinder-style on failure:
    raise `congestion` on contested cells, rip only **autorouter-owned** copper
    plus the failed path's blockers among them, re-run from the global stage for
@@ -659,15 +685,38 @@ board-local `autorouter_owned`.
 missing connections 39→38 (net went unrouted→routed); kicad-cli DRC
 223→223 (NEW=0); `unroute_nets` removed all 5 segments, connectivity back to 39.
 
-**Still open in 7.3b (do NOT treat 7.3b as closed):** step 4 rip-up (only
-window-doubling retry is active, `ripup_active:false`, `max_ripup_iterations`
-inert); **plane-aware routing (7.5.4)** — plane-net via-drops through pours
-currently *fail* rather than emit DRC-violating copper (needs Phase 7.5 zone
-model, M4); **7.12 neck-down** (not applied); pad escape lands on nearest free
-node (not direction-aware); termination is on the `to` point (not "any same-net
-copper"); window doubling is **capped at 60 mm span / 400k-node budget**, not
-whole-board (a whole-kiln 0.2 mm 4-layer raster ~2.3M×4 nodes is infeasible in
-pure Python — lift with numpy/accel, M5).
+**Step 4 rip-up & reroute LANDED 2026-07-23** (PathFinder negotiated
+congestion): `_Obst` gained an `owner` field (None = human/board copper, never
+rippable; int = autorouter connection id); `_FineWindow` obstacles are
+ref-counted so rip-up clears **only** the ripped copper's cells incrementally
+(no mid-run full rebuild); `_fine_astar` takes a soft board-global congestion
+field escalated on contested cells; `route_nets`' worklist loop rips only
+rippable copper on the failed path, names the blockers, self-checks the freed
+route, escalates congestion, re-queues ripped nets corridor-free (their path
+may change), bounded by `autorouter.max_ripup_iterations` with a `displaced_by`
+guard for termination. Reports `ripup_active:true` + `ripup` stats. **Measured
+(synthetic GND-wall congestion board):** NETF rips NETG, takes the near gap
+(13.81 mm); NETG re-routes to the far gap (82.52 mm — corridor choice changed);
+both self-check clean, kicad-cli DRC NEW=0; two write/unroute cycles
+byte-identical (deterministic); a net blocked only by solid GND copper fails
+with `nearest_blocker.net=="GND"` and GND intact (human copper never ripped).
+2 tests added (146 suite total). **Rip-up residuals (accepted, in-code):**
+self-check clearance failures are hard failures, not demoted back to rip-up;
+incremental window patching is within the failing net's window (each ripped net
+rebuilds its own per-connection window — there is no full-board window, so the
+"no full rebuild" contract still holds); congestion cell mapping is
+nearest-node between global/window grids (≤½-cell off when unaligned — fine for
+a soft field).
+
+**Still open in 7.3b (do NOT treat 7.3b as closed):** **plane-aware routing
+(7.5.4)** — plane-net via-drops through pours currently *fail* rather than emit
+DRC-violating copper (needs Phase 7.5 zone model, M4); **7.12 neck-down** (not
+applied); pad escape lands on nearest free node (not direction-aware);
+termination is on the `to` point (not "any same-net copper"); window doubling
+is **capped at 60 mm span / 400k-node budget**, not whole-board (a whole-kiln
+0.2 mm 4-layer raster ~2.3M×4 nodes is infeasible in pure Python — lift with
+numpy/accel, M5). Demoting self-check failures back into the rip-up loop is
+also open.
 
 **Stage 1 LANDED 2026-07-21** (anchor): `kicad_router_tool.py` exists with
 `build_connectivity` (union-find islands per net) + `get_ratsnest` → tool
@@ -764,15 +813,55 @@ The board already has six zones (`mainGnd` on F/B/In1.Cu, `safty_gnd` at priorit
 this board; it's how its power distribution actually works. All plane costs live in
 `pcb_settings.json` under `plane` (see 6.1).
 
-**7.5.1 Zone parser.** `_parse_zones(board_path)` (cached like the others): per
-zone — `net`, `layers` (KiCad 9 multi-layer zones — present on this board), `uuid`,
-`name`, `priority`, `hatch`/`connect_pads`/`min_thickness`/`fill` settings, outline
-`polygon` points, and `filled_polygon` blocks when present. Exposed as
-`list_kicad_zones`. **Must supersede and delete the connectivity-only stopgap
-`_parse_zone_fills`/`_FillRaster` in `kicad_router_tool.py`** (added by 7.3
-stage 1 so plane nets don't false-split; no thermal-spoke/`connect_pads`/
-island-removal semantics) — port `get_ratsnest` onto the real zone model and
-keep its kiln result at 39 connections.
+**7.5.1 Zone parser — LANDED 2026-07-23** (anchor; Sonnet agent,
+coordinator-verified). `_parse_zones(board_path)` + `_parse_zones_cached`
+(`_zone_cache` keyed by mtime,size) in `kicad_router_tool.py`, per zone: `net`,
+`layers` (KiCad 9 multi-layer — returned as a LIST), `uuid`, `name`,
+`priority`, `hatch`/`connect_pads`/`min_thickness`/`fill`,
+`island_removal_mode`, outline `polygon` points, and `filled_polygon` blocks
+when present. Exposed as tool **`list_kicad_zones`** (81 tools). 7 tests in
+`tests/test_zones.py`. Measured on kiln — the six known zones parse exactly:
+mainGnd (GND_Main, [F.Cu,B.Cu,In1.Cu], prio 0), safty_gnd (GND_Safty,
+[F/B/In1.Cu], prio 1), antenna (no net, all 4 Cu, prio 0), 3.3v_safty
+(3.3v_Safty, [In2.Cu], prio 2), main3.3 (3.3V_Main, [In2.Cu], prio 3), main12v
+(12V_Main, [In2.Cu], prio 4); every zone `island_removal_mode 0`.
+**Stopgap supersession — deviation recorded:** the stopgap *parser*
+`_parse_zone_fills` was deleted and replaced by a thin per-net fill index that
+sources from `_parse_zones_cached` (the authoritative model). `_FillRaster` was
+**retained** (not deleted as the original text said) — it is a generic scanline
+polygon rasterizer, not a zone parser, and is reused by the connectivity model
+and the detailed router's obstacle model. `get_ratsnest` on kiln still returns
+**39 missing connections** (regression guard verified), so the false-split fix
+is preserved. Still-not-done here (7.5.2+): thermal-spoke / real fill
+estimation / island semantics.
+
+**7.5.2 + 7.5.3 — LANDED 2026-07-23** (anchor; Sonnet agent,
+coordinator-verified). Fill model + islands + `audit_plane_islands` →
+tool **`audit_kicad_plane_islands`** (82 tools) in `kicad_router_tool.py`.
+**7.5.2 fill:** uses KiCad's own `filled_polygon` blocks per (zone uuid, layer)
+as authoritative components (each block is already one connected component);
+when absent, estimates by rasterizing the outline at `grid_mm`, subtracting
+higher-priority-zone cells and clearance-inflated foreign copper, then 8-conn
+flood-fill (`_FillRaster.from_cells`). Every layer labeled
+`fill_source: "kicad" | "estimated"` — kiln reports `"kicad"` throughout
+(verified). **7.5.3 islands:** attachments = same-net pads (thermal-gap
+tolerance) + same-net vias inside a component; most-attachments component =
+mainland, rest = islands; mainland cost 0, island `island_base/N`, 0
+attachments → `orphan_island`; warns below `island_min_attachments_warn`. A
+mode-1 (`island_removal_mode`) zone reports non-mainland components as
+`will_be_removed` and never costs/stitches them (synthetic-tested; kiln is all
+mode 0). Each costed island carries a `suggested_stitching_via` (nearest
+boundary-pair to mainland + projected cost) — position only, no placement
+(that's 7.5.6). 6 tests in `tests/test_plane_islands.py`. **Measured on kiln
+(a real finding to hand-check against KiCad's zone-fill view): 31 costed
+islands, total island cost ≈ 1912.30, and 1 ORPHAN island (0 attachments) on
+`safty_gnd` F.Cu.** mainGnd F.Cu does NOT form a single mainland — 22 island
+components, 14 of them single-attachment (flagged). `get_ratsnest`=39 holds.
+Estimation-path limits (kiln never hits them): higher-priority subtraction uses
+the raw outline not a recursive fill; track segments approximated as sampled
+circles — reasonable approximations, not bugs.
+
+The full 7.5.2/7.5.3 spec is kept below as reference for 7.5.4+ consumers:
 
 **7.5.2 Fill model.** Authoritative fills are KiCad's ("Fill All Zones", `B`) — we
 never fabricate `filled_polygon` blocks. For costing, use the file's
@@ -797,13 +886,44 @@ Tool: `audit_kicad_plane_islands` — per zone/layer: component count, area, eac
 island's attachment list and current cost, plus the cheapest stitching-via
 positions that would lower it (see 7.6 move (d)).
 
-**7.5.4 Plane-aware routing.** For a net that owns a zone (GND_Main, 12V_Main, …),
-A* gains plane moves: a connection may complete by dropping a via into fill
-(`attachment_via` + `via` cost), then traversing fill cells at `plane_step` (island
-cells at `plane_step` x current island factor, so paths prefer the mainland but may
-buy into an island — and the via that does so *becomes* an attachment, cheapening
-that island for every later path in the same run). This is why kiln's GND/12V nets
-should mostly stop being traces at all.
+**7.5.4 Plane-aware routing — LANDED 2026-07-23** (anchor; Sonnet agent,
+coordinator-verified). Wired into `_fine_astar`, `_route_to_emit`, and
+`route_nets`/`_route_core` in `kicad_router_tool.py`. `route_nets` builds a
+per-net plane model once (`_plane_components_for`, over `_zone_fill_index_cached`
++ `_component_attachments`): per layer, the net's own fill split into components
+with a cost factor (mainland 1.0, island `island_base/attachments`, orphan
+`orphan_island`). `_route_core` threads `plane_layers` (this net's model, or
+`None` for non-plane nets) + `goal_planes` into every `_fine_astar` call; in the
+search, a move onto the net's own fill costs `plane_step × factor` (not the
+normal step/layer/direction cost), a via onto fill adds `attachment_via`, and
+`is_goal` accepts any node inside a `goal_planes` component. `_route_to_emit`
+drops segments whose both endpoints ride the fill (plane traversal emits no
+copper — only the via(s) + real stubs are written). **Signal-net parity is by
+construction:** every plane branch is gated on `plane_layers`/`goal_planes is
+not None`, which is `None` for any net that doesn't own a zone (verified —
+Current3 unchanged at 1.7257 mm / 0 vias / B.Cu).
+
+**Correctness fix made during the work:** `goal_planes` is restricted to
+components whose `layer ∈ goal_layers` — an unrestricted (X/Y-only) match let a
+search terminate on the wrong physical layer with ZERO copper emitted, silently
+"solving" a cross-layer connection without dropping the needed via.
+
+**Measured (synthetic board — no fast naturally-failing-then-fixed kiln
+candidate found in budget; kiln plane nets either already route or fail on
+dense-copper `unreachable_in_window`, an open pad-escape/neck-down issue):** net
+`PWR`, B.Cu whole-board zone, B.Cu pad → F.Cu pad 16 mm away routes with 1 via
+at the F.Cu pad, `length_mm=0` (plane-riding copper not emitted), self-check
+clean, kicad-cli DRC NEW=0, unconnected 1→0. 8 tests in
+`tests/test_plane_routing.py`; full suite 173 green; `get_ratsnest`=39 holds.
+
+**Residuals (accepted, documented in-code):** (a) only KiCad-filled zones feed
+the plane model — the 7.5.2 "estimated" fill fallback is NOT wired into routing
+yet; (b) `_fine_astar`'s distance-only heuristic (pre-existing) is not
+admissible for a plane-discounted state, so the router returns a valid /
+deterministic / DRC-safe path but not always the global cost optimum; (c) the
+`route_board`/`route_kicad_nets` `pipeline` report still labels
+`plane_aware_routing: not_implemented` — update that string to "partial" now
+that it is wired.
 
 **7.5.5 Creating and moving planes.** Same dry-run/write/lock discipline as every
 writer; zone outlines are uuid-anchored s-expr surgery like `delete_group`:
@@ -1378,6 +1498,70 @@ Measure the router against real human routing, not just synthetic stress.
   completion, DRC-clean") and the hand-vs-auto comparison tables join the
   M4/M5 reports.
 
+### 7.17 One command to route the board (CLI **and** MCP, one implementation)
+
+**Minimal version LANDED 2026-07-23** (anchor): `route_board(project_path,
+nets=None, write=False, effort="balanced", allow_while_open=False)` in
+`kicad_router_tool.py` — a thin orchestrator (no duplicated routing logic):
+Stage 0 `get_ratsnest` for the unrouted-before report, then `route_nets` (which
+already runs ratsnest→`global_route`→detailed A*+rip-up) over the unrouted/
+`nets`-selected connections, rolled into one report (`unrouted_before`,
+`routed`/`failed`, `total_routed_length_mm`, `vias_emitted`, `ripup` stats,
+per-connection list, and a `pipeline` block that honestly marks
+plane_aware_routing / whole_board_optimization / stitching as
+`not_implemented (M4)`). `effort` maps to rip-up only for now (quick=0,
+balanced=config default, best=20) — stated in the report `notes`. Registered as
+MCP tool **`route_kicad_board`** (80 tools) and as a **CLI**: `python
+kicad_router_tool.py route <project> [--write] [--nets ...]
+[--effort quick|balanced|best] [--json]` (+ an `unroute` subcommand), both thin
+skins over the one `route_board` function. 6 tests in
+`tests/test_route_board.py` (dry-run leaves the board byte-identical; write
+routes + connectivity drops + reversible via unroute; CLI smoke; effort
+validation; pipeline-hooks-not-faked guard). **Measured on scratch kiln:**
+`route_board(nets=['/SaftyProcessor/Current3'])` → routed 1, 1.7257 mm, B.Cu,
+0 vias; `/MainControler/MOSI` correctly **fails** (needs a plane via-drop —
+M4). **Remaining (the signature does not change as these land):** wire planes
+(7.5, M4), whole-board optimize + effort presets + decision auto-pick (7.6,
+M4), stitching (7.5.6, M4); and a docs row on `11-autorouter.md`.
+
+**Requirement:** there must be a single "route the board" command a user can run
+either from the command line or as one MCP tool call — the whole Flow B pipeline
+behind one entry point, not a sequence the caller has to orchestrate by hand.
+
+- **One function, two front-ends.** A single `route_board(project_path, ...)` in
+  `kicad_router_tool.py` runs the end-to-end pipeline: resolve prereqs (net
+  classes / confirmed buses if present — else route with defaults and say so),
+  `build_connectivity`/ratsnest → global route (7.3a) → detailed route (7.3b)
+  over all unrouted (or `nets=`-selected) connections → (when available)
+  plane-aware routing (7.5) and whole-board optimization (7.6) → stitching pass
+  last (7.5.6). It is a thin orchestrator over the existing functions — **no
+  routing logic is duplicated in it**; the CLI and MCP tool are both skins on
+  this one call, exactly like the "one session mechanism, not two" discipline in
+  7.6.
+- **MCP tool `route_kicad_board`** (function `route_board`). Rides the same
+  resumable session mechanism as `optimize_kicad_board` (chunk/resume/`awaiting_decision`),
+  so a big board's full route survives tool timeouts; a small board completes in
+  one call. `write=False` (preview: per-net length/vias/layers, board score,
+  failures, SVG) is the default; `write=True` is the explicit confirmed apply.
+- **CLI entry point** in `kicad_router_tool.py`'s `__main__` (same pattern as
+  `kicad_pcb_tool.py`'s existing CLI):
+  `python kicad_router_tool.py route <project_path> [--write] [--nets ...]
+  [--effort quick|balanced|best] [--open-viewer]`. Dry-run by default; prints the
+  same report the MCP preview returns; `--write` applies after the preview. The
+  CLI drives the session loop to completion in-process and auto-answers 7.7
+  decision pauses with the optimizer's best-scored default (a headless CLI run
+  has no interactive AI in the loop — it records each auto-pick in the decision
+  log exactly as a `defer` would), so a scripted/CI route is one shell command.
+- **Honest scope by milestone:** a **minimal `route_board` ships with M3** wrapping
+  just ratsnest→global→detailed (the pieces that exist) — already a usable
+  one-command router for pour-free nets; it **grows** to include planes (M4),
+  optimization + effort presets + decision auto-pick (M4), and acceleration
+  (M5) as those land, without changing its signature or the two front-ends. The
+  build-order item records which stages are wired in at each milestone.
+- Documented on `docs/mcp-tools/11-autorouter.md` (the route→review→write
+  workflow) **and** in README/CLAUDE.md's "Common Tasks" as the headline
+  "route the board" command.
+
 ---
 
 ## Phase 8 — LANDED 2026-07-21 (reference anchor; only its M2 docs item remains, in the build order)
@@ -1496,10 +1680,9 @@ they stay listed until 7.3b closes.
 
 | Tool | Function | Writes? |
 |------|----------|---------|
+| `route_kicad_board` (7.17 minimal LANDED; also a CLI entry; planes/optimize/stitching pending) | `route_board` | **yes (board + board_local.json)** |
 | `route_kicad_nets` (core landed; rip-up/plane/neck-down pending) | `route_nets` | **yes (board + board_local.json)** |
 | `unroute_kicad_nets` (landed) | `unroute_nets` | **yes (board + board_local.json)** |
-| `list_kicad_zones` | `list_zones` | no |
-| `audit_kicad_plane_islands` | `audit_plane_islands` | no |
 | `propose_kicad_plane` | `propose_plane` | no |
 | `create_kicad_plane` | `create_plane` | **yes (board + board_local.json)** |
 | `modify_kicad_plane` | `modify_plane` | **yes (board + board_local.json)** |
@@ -1526,9 +1709,14 @@ new `docs/mcp-tools/11-autorouter.md` (Group 11: Autorouter & Detailed
 Routing), and `detect_kicad_critical_nets` + `detect_kicad_connectors` added
 to page 10; README + CLAUDE.md synced to **79 tools / 11 groups**. The
 autorouter page honestly marks rip-up, plane-aware routing, and neck-down as
-planned-not-implemented. **Remaining docs debt:** the `route_kicad_nets` page
-must be revised when 7.3b closes (rip-up + plane + neck-down land), and future
-Phase 7 tools add rows as they land)
+planned-not-implemented. **Docs sync LANDED 2026-07-23 (Haiku):**
+`route_kicad_board` (7.17, + CLI), `list_kicad_zones` (7.5.1), and
+`audit_kicad_plane_islands` (7.5.2/7.5.3) now have full rows on
+`11-autorouter.md`; README + CLAUDE.md synced to **82 tools / 11 groups**
+(CLAUDE.md gained "route the board" + zone/island Common-Tasks entries).
+**Remaining docs debt:** the `route_kicad_nets`/`route_kicad_board` pages get
+revised as 7.5.4 plane-aware routing and 7.12 neck-down land (they change what
+routes vs. fails), and future Phase 7 tools add rows as they land)
 - Extend `docs/mcp-tools/10-netclasses-and-buses.md` (or the autorouter page,
   as fits) as each remaining tool in the summary table above lands (same
   per-tool format).
@@ -1574,10 +1762,14 @@ Phase 7 tools add rows as they land)
    consent + exclusions (7.14, validated loudly); and, per area containing
    existing stitching vias, whether to remove them before routing (7.5.6).
 4. `get_kicad_ratsnest` → what's unrouted; `open_kicad_route_viewer` to watch.
-5. `optimize_kicad_board` (or plain `route_kicad_nets` for a quick single pass) —
-   chunk by chunk; answer `awaiting_decision` pauses via `decide_kicad_route`;
+5. **The one command:** `route_kicad_board` (MCP) or `python
+   kicad_router_tool.py route <project>` (CLI) runs steps 4–6 of this flow end
+   to end (7.17). Under the hood it is `optimize_kicad_board` (or plain
+   `route_kicad_nets` for a quick single pass) — chunk by chunk; answer
+   `awaiting_decision` pauses via `decide_kicad_route`;
    plane proposals touching hand-made zones and pin-swap proposals go to the
-   **user**, not the AI. Iterates until the 7.15 plateau rule fires.
+   **user**, not the AI. Iterates until the 7.15 plateau rule fires. (The CLI
+   auto-picks decision pauses and runs headless.)
 6. Stitching pass runs last (7.5.6), then: review the dry-run diff, per-net
    costs, decision log, SVG/viewer →
    `write=True` (backup taken automatically if adopted copper changed).
@@ -1661,24 +1853,38 @@ landed 2026-07-21 — see their anchors; remaining:):
     **core** (obstacle windows + pad escape + fine A* + self-check +
     emit/unroute + the 7.11 kicad-cli acceptance gate) all LANDED — see the
     7.3 stage-1/stage-2 and 7.3a anchors; `route_kicad_nets`/`unroute_kicad_nets`
-    registered, integer milli-cost quantization done. **Remaining to close 7.3b:**
-    step 4 rip-up & reroute (currently window-doubling retry only), 7.12
+    registered, integer milli-cost quantization done. **Step 4 rip-up & reroute
+    LANDED 2026-07-23** (negotiated congestion, owner-tagged obstacles,
+    incremental window clears, deterministic, human copper never ripped — see
+    the stage-2 anchor). **Remaining to close 7.3b:** 7.12
     neck-down on the pad-escape stub, direction-aware pad escape, "any same-net
-    copper" termination, and lifting the 60 mm / 400k-node window cap toward
+    copper" termination, demoting self-check failures into the rip-up loop, and
+    lifting the 60 mm / 400k-node window cap toward
     whole-board (needs the memory planner + numpy/multi-core waves — those slip
     to M5's accel work; the cpu tier remains the reference everything else must
     match). Plane-aware via-drops through pours need M4's 7.5 zone model.
+11h. **[HEADLINE] Phase 7.17 minimal `route_board` — LANDED 2026-07-23** (see
+    the 7.17 anchor): the one-command router (MCP tool `route_kicad_board` +
+    `python kicad_router_tool.py route <project>` CLI), a thin orchestrator over
+    ratsnest→global→detailed, `write=False` default, 6 tests, measured on kiln.
+    It grows to add planes (M4), optimization/effort/decision auto-pick (M4),
+    and accel (M5) without changing its signature. Still owed: a docs row on
+    `11-autorouter.md`.
 12. Phase 7.9 viewer — developed against a recorded JSONL event file as soon as
     7.3b emits events.
 
 **M4 — Planes + whole-board optimization:**
-13. Phase 7.5 plane engine — zone parser/`list_kicad_zones` (supersedes the 7.3
-    stage-1 zone-fill stopgap), then fill estimation
-    + `audit_kicad_plane_islands` (validated against KiCad's own fills on the six
-    existing zones), then plane-aware routing, then propose/create/modify
+13. Phase 7.5 plane engine — zone parser/`list_kicad_zones` + 7.5.2 fill +
+    7.5.3 `audit_kicad_plane_islands` + 7.5.4 plane-aware routing all **LANDED
+    2026-07-23** (see the 7.5.1, 7.5.2/7.5.3, and 7.5.4 anchors; kiln: 31
+    islands, 1 orphan on safty_gnd F.Cu; plane moves in the detailed A*, signal
+    parity by construction). **Remaining:** 7.5.5 propose/create/modify
     (writers last), then the 7.5.6 stitching pass +
     `remove_kicad_stitching_vias` + its ask-before-routing interaction rule
-    (stitching is last in the run order AND last in this milestone).
+    (stitching is last in the run order AND last in this milestone). Plus the
+    7.5.4 residuals: wire the estimated-fill fallback into routing, and relabel
+    the `route_board`/`route_kicad_nets` `pipeline.plane_aware_routing` from
+    `not_implemented` to `partial`.
 14. Phase 7.6 optimizer + 7.7 decision protocol — greedy first, SA once greedy is
     trusted; sessions/resume before decisions (7.7 rides the session mechanism);
     7.7 verified with a scripted decider (canned answers) before a live AI sits

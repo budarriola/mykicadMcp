@@ -276,6 +276,270 @@ all autorouter-owned copper.
 }
 ```
 
+## `route_kicad_board`
+
+**Phase 7.17 — The Headline Board Router**
+
+The one-command orchestrator to route an entire board. Thin wrapper that calls the routing
+pipeline stages (ratsnest → global → detailed) in sequence and rolls their results into a
+single comprehensive report. No routing logic of its own — it calls existing functions
+(`get_kicad_ratsnest`, `route_kicad_nets`) and synthesizes their outputs.
+
+`effort` controls rip-up aggressiveness only (for now):
+- `"quick"` — single pass, no rip-up (`max_ripup_iterations=0`)
+- `"balanced"` — default strategy (KiCad's pcb_settings config)
+- `"best"` — aggressive rip-up (`max_ripup_iterations=20`)
+
+Higher efforts become more meaningful when Phase 7.6 (whole-board optimizer) lands; that is
+documented honestly in the report's `notes`.
+
+**NOT YET IMPLEMENTED (Marked as M4 Hooks):**
+- Plane-aware routing (Phase 7.5)
+- Whole-board optimization (Phase 7.6)
+- Stitching pass (Phase 7.5.6)
+
+The report's `pipeline` block lists each stage with its status, transparently marking not-yet-wired
+stages so callers know what's actually running.
+
+**write=false** (default) previews the full result without touching the board; `write=true` emits
+copper and records ownership for undo.
+
+**CLI usage:** `python kicad_router_tool.py route <project> [--write] [--nets ...] [--effort quick|balanced|best]`
+
+**Args:** `project_path`, `nets` (optional array of net names; omit to route all unrouted),
+`write` (default false), `effort` (default "balanced"), `allow_while_open` (default false)
+
+**Example output (excerpt):**
+```json
+{
+  "command": "route_board",
+  "board_path": "path/to/kiln.kicad_pcb",
+  "effort": "balanced",
+  "write": false,
+  "written": false,
+  "unrouted_before": 87,
+  "unrouted_nets_before": ["/MainControler/CLK", "/Power/VBUS", ...],
+  "airline_before_mm": 2341.5,
+  "routed": 82,
+  "failed": 5,
+  "total_routed_length_mm": 2450.75,
+  "vias_emitted": 142,
+  "ripup": {
+    "iterations": 3,
+    "connections_ripped": 12,
+    "congestion_escalations": 2
+  },
+  "pipeline": {
+    "ratsnest": "done",
+    "global_route": "done",
+    "detailed_route": "done",
+    "rip_up": "active",
+    "plane_aware_routing": "not_implemented (Phase 7.5, M4)",
+    "whole_board_optimization": "not_implemented (Phase 7.6, M4)",
+    "stitching": "not_implemented (Phase 7.5.6, M4)"
+  },
+  "notes": [
+    "Minimal route_board (Phase 7.17): ratsnest -> global -> detailed only; planes/optimizer/stitching are M4 TODO hooks and do not run yet.",
+    "effort currently maps only to rip-up aggressiveness (quick=0, balanced=config default, best=20)."
+  ]
+}
+```
+
+## `list_kicad_zones`
+
+**Phase 7.5.1 — Zone Inspection (Read-Only)**
+
+Parse every board-level copper zone and keepout zone (no footprint-nested zones; those are pad
+keepouts and not planes). Returns the zone name, net, copper-layer list (always an array; KiCad 9
+multi-layer zones are native on this board, e.g. `mainGnd` spans `F.Cu`, `In1.Cu`, `B.Cu`),
+uuid, priority, hatch settings, `connect_pads` mode/clearance, `min_thickness`, fill settings
+(including `island_removal_mode` — every zone on this board allows islands, so downstream
+costing must not assume single-component fills), the zone's outline `polygon`, and `filled_polygon`
+blocks when present (never fabricated — that is Phase 7.5.2's job; the filled data is the model
+input only).
+
+**Keepout zones** (no net) and copper zones (net-owning) are both listed. A multi-layer zone
+contributes one entry with `layers` as a list; its outline polygon is shared across all layers.
+
+**Read-only; no parameters beyond project_path.**
+
+**Args:** `project_path`
+
+**Example output (excerpt — single zone):**
+```json
+{
+  "board_path": "path/to/kiln.kicad_pcb",
+  "zone_count": 6,
+  "zones": [
+    {
+      "uuid": "12345678-abcd-1234-abcd-123456789abc",
+      "name": "mainGnd",
+      "net": "GND_Main",
+      "layers": ["F.Cu", "In1.Cu", "B.Cu"],
+      "priority": 0,
+      "hatch": {"style": "edge", "pitch": 0.5},
+      "connect_pads": {"mode": "solid", "clearance": 0.2},
+      "min_thickness": 0.2,
+      "fill": {
+        "enabled": true,
+        "island_removal_mode": 0,
+        "smoothing": "none"
+      },
+      "island_removal_mode": 0,
+      "keepout": null,
+      "polygon": [
+        {"x": 10.0, "y": 20.0},
+        {"x": 100.0, "y": 20.0},
+        {"x": 100.0, "y": 80.0},
+        {"x": 10.0, "y": 80.0}
+      ],
+      "filled_polygon": [
+        {
+          "layer": "F.Cu",
+          "pts": [
+            {"x": 10.2, "y": 20.2},
+            {"x": 15.5, "y": 20.2},
+            ...
+          ]
+        },
+        {
+          "layer": "In1.Cu",
+          "pts": [...]
+        }
+      ]
+    }
+  ]
+}
+```
+
+## `audit_kicad_plane_islands`
+
+**Phase 7.5.2/7.5.3 — Fill Model & Island Costing (Read-Only)**
+
+Comprehensive fill and island analysis per net-owning zone/layer. For every zone carrying a net
+(keepout/no-net zones excluded):
+
+1. **Fill Source** — `"kicad"` when the zone carries real `filled_polygon` data from a KiCad
+   board file; `"estimated"` when the zone is missing filled data (never filled in KiCad, or a
+   synthetic board — the outline is rasterized at the router grid, higher-priority zones and
+   foreign-net copper are subtracted, and what remains is flood-filled into connected components).
+
+2. **Components** — Per zone/layer: the mainland (largest/most attachments), islands (secondary
+   components), orphans (zero attachments), and `will_be_removed` (when `island_removal_mode == 1`,
+   meaning KiCad deletes them on refill — never costed or offered stitching).
+
+3. **Attachments** — Per component: same-net pads reaching it (thermal or solid `connect_pads` both
+   bridge via the same contact-reach tolerance used for thermal-relief gaps) plus same-net vias
+   landing on that layer inside the component. Attachment count drives island costing.
+
+4. **Costing** — Per island: cost = `island_base / attachment_count`. Orphans cost `orphan_island`
+   (fixed penalty for zero attachments). Mainland costs 0. Islands below `island_min_attachments_warn`
+   are flagged. For every costed island, `suggested_stitching_via` proposes the nearest via position
+   to the mainland component with the new attachment count and projected cost after stitching.
+
+5. **Warnings** — Zones/islands with low attachment counts are listed for review.
+
+Plane settings (`island_base`, `orphan_island`, `island_min_attachments_warn`) and autorouter grid
+are read from `pcb_settings.json` or defaults.
+
+**Read-only; no parameters beyond project_path.**
+
+**Args:** `project_path`
+
+**Example output (excerpt):**
+```json
+{
+  "board_path": "path/to/kiln.kicad_pcb",
+  "plane_settings": {
+    "plane_step": 0.05,
+    "island_base": 40.0,
+    "orphan_island": 1000.0,
+    "island_min_attachments_warn": 2
+  },
+  "zones": [
+    {
+      "uuid": "12345678-abcd-1234-abcd-123456789abc",
+      "name": "mainGnd",
+      "net": "GND_Main",
+      "priority": 0,
+      "island_removal_mode": 0,
+      "layers": [
+        {
+          "layer": "F.Cu",
+          "fill_source": "kicad",
+          "component_count": 3,
+          "components": [
+            {
+              "role": "mainland",
+              "attachment_count": 47,
+              "attachments": [
+                {
+                  "kind": "pad",
+                  "reference": "U1",
+                  "pad": "1",
+                  "position": {"x": 50.5, "y": 60.25}
+                },
+                {
+                  "kind": "via",
+                  "uuid": "via-uuid-1",
+                  "position": {"x": 55.0, "y": 65.0}
+                }
+              ],
+              "area_mm2": 150.25,
+              "cost": 0.0,
+              "warn": false
+            },
+            {
+              "role": "island",
+              "attachment_count": 3,
+              "attachments": [...],
+              "area_mm2": 8.5,
+              "cost": 13.3333,
+              "warn": false,
+              "suggested_stitching_via": {
+                "position": {"x": 72.1, "y": 58.3},
+                "nearest_mainland_point": {"x": 70.5, "y": 60.0},
+                "distance_to_mainland_mm": 2.8,
+                "projected_attachment_count": 4,
+                "projected_cost": 10.0
+              }
+            },
+            {
+              "role": "orphan",
+              "attachment_count": 0,
+              "attachments": [],
+              "area_mm2": 1.2,
+              "cost": 1000.0,
+              "warn": true,
+              "suggested_stitching_via": {
+                "position": {"x": 15.0, "y": 35.0},
+                "nearest_mainland_point": {"x": 18.5, "y": 35.0},
+                "distance_to_mainland_mm": 3.5,
+                "projected_attachment_count": 1,
+                "projected_cost": 40.0
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "island_count": 12,
+    "orphan_island_count": 2,
+    "total_island_cost": 187.45,
+    "warnings": [
+      {
+        "zone": "mainGnd",
+        "layer": "F.Cu",
+        "attachment_count": 1,
+        "role": "island"
+      }
+    ]
+  }
+}
+```
+
 ---
 
 ## Autorouter Architecture & Cost Model
