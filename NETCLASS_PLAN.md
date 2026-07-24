@@ -1836,6 +1836,10 @@ synthetic-only projects), and `kicad-cli pcb drc` acceptance tests (KiCad
 10.0.4 loads generated boards; auto-skip if kicad-cli absent). 35 tests
 passing under `mykicadMcp\.venv`. Only non-automated bit: a literal pcbnew-GUI
 screenshot — the kicad-cli DRC load exercises the same board reader.
+**Parallel by default (added 2026-07-23):** `pytest.ini` sets `addopts = -n auto`
+(pytest-xdist — see `requirements-dev.txt`); the suite is parallel-safe (per-test
+tmp/scratch dirs, per-worker-process parse caches), ~2m40s vs ~8m serial on 24
+cores. Override with `-n0` for serial/debugging.
 
 **M1 — Net classes end-to-end (Flow A works) — DONE 2026-07-21** (code:
 Phases 1, 2, 3, 6-stubbed, 4 — see their anchors; docs pass landed:

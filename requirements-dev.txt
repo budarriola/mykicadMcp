@@ -1,0 +1,7 @@
+# Test/development dependencies (the MCP server itself stays zero-dependency;
+# these are only needed to RUN the test suite).
+#
+#   pip install -r requirements-dev.txt
+#
+pytest>=7.0
+pytest-xdist>=3.0   # parallel test execution (`-n auto`, enabled by default in pytest.ini)
