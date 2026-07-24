@@ -4850,6 +4850,7 @@ DEFAULT_PCB_SETTINGS: dict[str, Any] = {
     },
     "autorouter": {
         "grid_mm": 0.2,
+        "max_grid_mm": 1.0,
         "global_grid_mm": 2.0,
         "search_window_margin_mm": 8.0,
         "clearance_fallback_mm": 0.2,

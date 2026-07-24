@@ -35,12 +35,13 @@ For whoever (human or AI) picks this up next:
   M0 and M1 are fully done (docs page `10-netclasses-and-buses.md` — note:
   verify tool counts by instantiating `KiCadMcpServer`, not by grepping; a
   grep-count once came back wrong).
-  **82 MCP tools registered; full 173-test pytest suite green** (fixtures,
+  **83 MCP tools registered; full 195-test pytest suite green** (1 slow
+  real-kiln benchmark skipped unless `KICAD_BENCHMARK_REAL=1`; fixtures,
   golden parser tests, writer round-trip, synthetic board/project
   + multi-drop SPI generators, kicad-cli acceptance, corridor/deviation,
   ratsnest, global-route, detailed-route, plane-routing, route-board,
-  zone-parser, plane-island, DRC-constraint, critical-net, connector tests;
-  `pytest.ini`
+  zone-parser, plane-island, benchmark, DRC-constraint, critical-net, connector
+  tests; runs in parallel (`-n auto`, pytest-xdist); `pytest.ini`
   registers the `slow` marker used by the kiln global-route smoke). Each
   landed phase is collapsed to a short "LANDED" anchor section in
   place, kept because later phases reference it. All subagent work above was
@@ -145,6 +146,25 @@ For whoever (human or AI) picks this up next:
   signal-net parity confirmed (Current3 unchanged), 39-guard holds. See the
   7.5.4 anchor for the residuals (estimated-fill path not wired; heuristic not
   cost-optimal for plane states; kiln proof is synthetic).
+- **Session 2026-07-24: first real-board route (reverted by user) + benchmark.**
+  `route_board(write=True)` on the REAL kiln did 3/39 with degenerate geometry
+  (user reverted it) — see the ⭐ findings section. **Phase 7.16
+  `benchmark_kicad_autoroute` LANDED** (Sonnet, coordinator-verified): 83 tools,
+  179-test suite green; scores the router vs the hand-routed baseline (kiln:
+  human 8552.276 vs auto 8568.267, `matched_or_beat_human:false`). This is now
+  the router acceptance gate. **Then adaptive-grid window fix LANDED** (Sonnet,
+  coordinator-verified): 83 tools, 187-test suite green, node budget now fits
+  39/39 kiln connections. **BUT it exposed the real #1 blocker — the
+  `_FineWindow` O(cells × zone_edges) zone-distance perf makes real routes
+  impractically slow (route_board would now HANG on the real board).** See the
+  ⭐ findings section. **Then the zone-distance perf fix LANDED** (Sonnet,
+  coordinator-verified): spatial edge bucketing (parity-exact via
+  `_min_dist_to_edges_ref`); a zone-heavy GND_Main conn routes in 9.7 s vs never.
+  Routes now finish. **Real benchmark then RAN to completion (~10 min): 4/39
+  (10.26%), score 8568.267 vs human 8552.276 (still worse), 1 DRC violation.**
+  The 35 failures are now `unreachable_in_window` (genuine dense-board
+  pathfinding), not budget — closing that gap is Opus-class whole-board
+  optimization (7.6), not a bounded Sonnet patch. See ⭐ findings.
 - **Next work when resumed:** (1) **Phase 7.5.5 propose/create/modify planes**
   (`propose_kicad_plane`/`create_kicad_plane`/`modify_kicad_plane` — the plane
   WRITERS, dry-run/write/lock discipline, uuid-anchored s-expr surgery, only
@@ -164,6 +184,203 @@ For whoever (human or AI) picks this up next:
 - Verify claims against the code (`kicad_pcb_tool.py`, `kicad_mcp_server.py`,
   `tests/`) rather than trusting this snapshot if they disagree — and then fix
   this file.
+
+## ⭐ Real-board routing findings & the hand-routed baseline (2026-07-24)
+
+> **ENABLER found 2026-07-24 (user suggestion, PROVEN): KiCad can fill zones and
+> run DRC headlessly — use it as the authority instead of estimating.**
+> `kicad-cli pcb drc --refill-zones --save-board <board>` (KiCad 10.0.4 on this
+> box) recomputes ALL zone fills and saves the board, no GUI/IPC session — tested
+> on a scratch kiln copy (fills rewritten, board saved). KiCad's DRC also
+> reported **"Found 39 unconnected items" = our `get_ratsnest` 39** (independent
+> validation of our connectivity model). KiCad's bundled Python
+> (`.../KiCad/10.0/bin/python.exe`) also has `pcbnew` 10.0.4 with `ZONE_FILLER`
+> for programmatic fills. **How this helps (wire it in — bounded Sonnet task,
+> AFTER the 7.8 agent frees `kicad_router_tool.py`):**
+> - Add a `refill_zones_with_kicad(board_path)` helper (invoke the CLI; auto-skip
+>   if kicad-cli absent) so the plane-aware router gets AUTHORITATIVE fills after
+>   placing plane vias — directly fixes the plane-stub / `len=0` defects (the
+>   router currently reasons over estimated/stale fills). Supersedes much of the
+>   §7.5.2 "estimated fill" fallback for the real-board path.
+> - Use KiCad's "unconnected items" count as an authoritative completion metric in
+>   the benchmark (cross-check vs `get_ratsnest`).
+> - The §7.11 DRC gate should run WITH `--refill-zones` so plane-through-fill
+>   connections are checked on real fills, not stale ones.
+>
+> **More kicad-cli capabilities worth wiring in (KiCad 10.0.4, all verified
+> headless 2026-07-24):**
+> - **`sch export netlist` regenerates the netlist FROM the schematic** (verified
+>   on `kiln.kicad_sch`) — this can RETIRE the netlist-staleness guards that
+>   `detect_buses` (3c), `audit_capacitor_net_voltages` (8), corridor roles (5),
+>   and `classify_critical_nets` (9) all carry: instead of cross-checking a
+>   possibly-stale `.net` against board pads and warning, just regenerate the
+>   fresh netlist on demand. Highest-leverage after refill (touches the most
+>   tools). Formats: kicadsexpr (default), kicadxml, spice, ….
+> - **`pcb export ipcd356`** — the board's real net→pad connectivity as a standard
+>   IPC-D-356 netlist (verified): an INDEPENDENT connectivity oracle to validate
+>   `build_connectivity`/`get_ratsnest` against (already corroborated: KiCad DRC's
+>   "39 unconnected" == our ratsnest 39).
+> - **`pcb export svg`** (per-layer) — route/board visualization for `write=False`
+>   previews and an alternative/complement to the 7.9 tkinter viewer.
+> - **`sch erc`** — authoritative Electrical Rules Check; complements the Phase 8
+>   schematic audits. **`pcb export stats`/`pos`** — quick board metrics /
+>   component placement.
+> These are bounded Sonnet tasks (each an MCP tool + `kicad-cli` shell-out with
+> auto-skip when absent), queued behind the in-flight 7.8 work to avoid
+> `kicad_router_tool.py` edit collisions.
+
+> **REQUIRED CONSTRAINT (user, 2026-07-24) — LANDED 2026-07-24: filled zones are
+> used AS ROUTABLE PLANES only for POWER/GROUND nets** (3.3V, 5V, 3V3, GND, 12V,
+> VCC, VDD, and the like — `_net_kind(net)=="power"`), never for signal nets. The
+> gate is one early return in `_plane_components_for` (kicad_router_tool.py):
+> `if _pcb._net_kind(net, None, power_patterns) != "power": return None`, so a
+> signal net that owns a fill gets NO plane moves and routes as ordinary copper.
+> Tested by `test_signal_net_fill_is_not_used_as_plane` (signal fill → emitted
+> length ≈ full airline, the inverse of the GND plane case) plus the GND-renamed
+> full-pipeline plane tests; parity/white-box tests pass plane args explicitly so
+> are unaffected. 196-test suite green.
+>
+> **Deliberate divergence from the originally-planned location (do NOT "fix" this
+> back):** the gate was placed at the PLANE-ROUTER consumer (`_plane_components_for`),
+> NOT at `_zone_fill_index_cached` as first sketched. Gating the shared fill index
+> itself would ALSO strip signal-net fills from OBSTACLE collection — and a signal
+> net's copper pour must still block other nets (else the router threads copper
+> straight through it → DRC violations). A signal fill must remain an obstacle
+> while never being a routable plane FOR ITSELF; only the plane-router consumer
+> distinguishes those, so that is where the gate belongs. Bonus: connectivity/
+> ratsnest is untouched, so `get_ratsnest`=39 is preserved by construction (kiln's
+> five net-owning zones — GND_Main, GND_Safty, 12V_Main, 3.3V_Main, 3.3v_Safty —
+> are all power nets anyway). If a genuinely-power net's name doesn't match on some
+> board, extend `power_net_patterns`, don't loosen the gate.
+
+
+> **User decision 2026-07-24:** the no-Opus-subagent rule is **lifted for the
+> deep routing-capability / whole-board-optimizer work** (the `unreachable_in_window`
+> pathfinding gap and Phase 7.6) — that is genuinely Opus-class and won't fall
+> out of Sonnet patches. Bounded quality fixes still go to Sonnet.
+
+
+First `route_board(write=True)` run on the REAL kiln board. The user **reverted
+it** — the output was not usable. What we learned (this is now the top driver of
+router work):
+
+- **THE GOAL (user-stated):** the autorouter must do **as well or better than the
+  user's hand-routed board**, judged by the Phase 6 board score, *ignoring the
+  nets they have not routed yet.* **Baseline to beat — hand-routed kiln
+  `get_trace_cost` board total = 8552.28** (length 5851.9, vias 1475.0,
+  deviation 44.4, layer_span 568.0, layer_penalty 612.9; 39 connections still
+  unrouted by hand). The scoring tool already exists (`get_kicad_trace_cost`) —
+  no new tool needed to measure the baseline.
+- **TIMELINE EXPECTATION (user, 2026-07-24): do NOT expect routing to match hand
+  quality until everything else is done.** `matched_or_beat_human` is the
+  END-STATE finish line after the full pipeline lands (7.8 acceleration → the
+  7.6 whole-board optimizer → geometry/plane-via cleanup → …), NOT a per-step
+  gate. Judge each intermediate piece on its own incremental merit — completion
+  %, parity, DRC-clean, speed — and let the score converge toward 8552.28 as the
+  pipeline completes. Don't over-optimize any single step to beat the baseline
+  prematurely.
+- **STANDING DIRECTIVE (user, 2026-07-24): use multicore/multiprocessing for
+  heavy tasks WHENEVER POSSIBLE.** BFS/search is slow serially; this box is
+  24-thread + 111 GB RAM ≫ the 2 GB GPU, so CPU parallelism is the dominant
+  lever. The ~39 board connections are largely independent → route them in
+  parallel across cores (a BFS *within* one window is sequential; many run
+  concurrently). Also parallelizable: rasterization tiles, clearance
+  self-checks, fill/island labeling. Use stdlib `multiprocessing`; workers only
+  COMPUTE, all state commits happen in the parent in canonical order so results
+  are bit-identical for any worker count (workers=1 vs N is a parity test). This
+  is the 7.8 "Multi-core CPU" piece and has been folded into the in-flight 7.8
+  agent's scope (alongside numpy); `autorouter.cpu.workers` (0=auto=cores−1).
+  Apply the same parallel-where-independent instinct to any future heavy tool.
+  **Do NOT measure/confirm speedups (user, 2026-07-24):** apply perf
+  optimizations on engineering judgment; skip before/after timing runs and the
+  ~10-min speed benchmarks. This does NOT relax correctness — parity
+  (cpu-vs-numpy, workers=1-vs-N), full suite green, and determinism are
+  CORRECTNESS gates and stay. Just stop spending cycles proving things are
+  faster.
+- **Result was 3 of 39 routed, and even those 3 were bad.** Three concrete
+  defects, in priority order:
+  1. **`window_too_large` fails 35/39.** The pure-Python detailed A* window cap
+     (`_MAX_WINDOW_SPAN_MM=60` / `_MAX_WINDOW_NODES=400k` at 0.2 mm grid) can't
+     reach any connection spanning more than ~55 mm — i.e. every real long haul
+     (SPI bus, power rails). **This is the #1 blocker: without it the router is
+     useless on a real board.** Fix path: adaptive/coarser detailed grid for
+     long connections (fine only near pads), and/or the M5 numpy/accel tier.
+     Not a naive cap bump — that blows pure-Python runtime.
+  2. **Emitted geometry is degenerate.** `/SaftyProcessor/Current3` (1.5 mm
+     straight airline) came out as a **5-segment grid-snapped squiggle**. Needs
+     exact pad-anchor termination + collinear/45° simplification, and probably a
+     larger grid with exact stubs rather than 0.2 mm gridding of the whole path.
+     (Ties to the open 7.3b residuals: "pad escape lands on nearest free node,
+     not direction-aware"; "termination is on the `to` point.")
+  3. **Plane nets routed as surface stubs with 0 vias.** `3.3V_Main`/`GND_Main`
+     are In2.Cu-plane nets — their pads should **drop a via into the plane**, but
+     the router laid a pointless tiny surface trace. 7.5.4's plane-via path is
+     not being *preferred* (the documented non-admissible-heuristic gap) — plane
+     nets must favor via-to-plane over a surface hop.
+- **Measurement loop — DONE:** Phase 7.16 `benchmark_kicad_autoroute` LANDED
+  2026-07-24 (see its anchor). It CONFIRMED the numbers on kiln: human 8552.276
+  vs auto 8568.267 (**worse by +15.99, 3/39 routed, 1 new DRC violation** = the
+  plane-stub defect). `comparison.matched_or_beat_human` is the acceptance gate
+  for every router change from here.
+- **Adaptive grid LANDED 2026-07-24, and it EXPOSED the real #1 blocker.**
+  `_choose_grid`/`_window_node_count` + `autorouter.max_grid_mm` (1.0) in
+  `kicad_router_tool.py`: per-connection grid coarsens (up to 1.0 mm) so the
+  window fits the 400k-node budget — **39/39 kiln connections now fit** (grids
+  ~0.26–0.48 mm for the long nets), short connections unchanged (byte-identical),
+  187-test suite green, self-check unchanged (grid-independent), determinism
+  held. BUT: **fitting the node budget did NOT make kiln routable** — the agent
+  could not finish a single real kiln A* route in a practical time budget. Root
+  cause (pre-existing, now the bottleneck): **`_FineWindow.obstacle_cells` /
+  `_min_dist_to_edges` is O(cells × zone_edges)** — every grid cell does exact
+  edge-distance tests against the big zone-pour polygons, which dominates
+  runtime in kiln's zone-heavy areas (~mins per connection; the 27-min benchmark
+  only finished because 35/39 fail-fast). Adaptive grid converted those
+  fast-failures into slow routes, so `route_board` on the real board would now
+  HANG rather than fail fast until this is fixed. **So do NOT re-run route_board
+  on the real board yet.**
+- **Zone-distance perf fix LANDED 2026-07-24** (Sonnet, coordinator-verified):
+  `_FineWindow` now spatially buckets zone/obstacle edges so per-cell distance
+  is sub-linear in `zone_edges`, with `_min_dist_to_edges_ref` kept as the
+  parity reference (exact, not approximate — results byte-identical).
+  **Verified: a zone-heavy `GND_Main` connection that previously would not
+  finish now routes in 9.7 s** on a scratch copy. This unblocks real routing.
+- **Real benchmark now COMPLETES (2026-07-24, ~10 min):
+  `benchmark_kicad_autoroute(kiln, complete_only, quick)` = 4/39 (10.26%),
+  post score 8568.267 vs human 8552.276 (still +15.99 worse),
+  `matched_or_beat_human:false`, 1 new DRC violation.** So the infra work
+  (perf + adaptive grid) fixed HANGING/`window_too_large` but only unlocked
+  ONE more connection. **The 35 failures are now `unreachable_in_window`** — A*
+  runs fast but genuinely can't thread pad-to-pad through the existing
+  hand-routed copper + pours (verified on CLK/MISO/SDA/12V/5V/IC2-FB). This is
+  real routing difficulty, not a budget artifact.
+- **⚠️ USER DIRECTION 2026-07-24 — Phase 7.8 acceleration was the PREREQUISITE;
+  it landed 2026-07-24, but PARTIALLY DISPROVED its own premise (see the 7.8
+  LANDED anchor).** The hypothesis was: `unreachable_in_window` is a pure-Python
+  limit (A* can't afford a FINE grid over a LARGE window → `_choose_grid`
+  coarsens to ~0.3–0.5 mm → a coarse grid can't thread kiln's dense pin fields →
+  unreachable), so numpy would make large fine-grid windows tractable and remove
+  the coarsening. **What we found:** the numpy per-window wavefront relaxes the
+  WHOLE window many sweeps (cost-insensitive), which is *slower* than
+  output-sensitive A* on these windows — it does NOT make a 400k-cell fine
+  window tractable. numpy's real value is batched whole-board fields (GPU/M5),
+  and 7.8's delivered win on this box is **multi-core across independent
+  connections**. So the fine-grid `unreachable_in_window` limit is **still open**
+  and needs a smarter SEARCH/WINDOW strategy (fine grid only near pads,
+  hierarchical windows, plane-aware admissible heuristic), not more vectorization
+  — that is the next Opus-permitted task.
+- **Reprioritization (updated per user):** (1) ✅ 7.16 benchmark, (2) ✅ adaptive
+  grid, (3) ✅ zone-distance perf, (4) ✅ Phase 7.8 (numpy parity tier +
+  multi-core independent-connection routing; parity suite is the gate) — LANDED
+  2026-07-24, premise-corrected (numpy backend is NOT the fine-grid lever;
+  multi-core is the delivered win). **NOW (5): the fine-grid PATHFINDING revisit**
+  — the still-open `unreachable_in_window` fix, via a smarter search/window
+  strategy (fine grid only near pads, hierarchical windows, or a plane-aware
+  admissible heuristic), NOT more vectorization. This is the prerequisite for
+  beating 8552.276, and is Opus-permitted. Bounded Sonnet quality fixes still
+  available in parallel where they don't touch the search: the power-net fill
+  gate, KiCad-refill/netlist-regen integration, plane-via (defect #3, the 1 DRC
+  violation), and geometry simplification (defect #2). `benchmark` is the
+  standing gate throughout.
 
 ## How to work this plan (living document — keep it current)
 
@@ -1070,8 +1287,38 @@ call/return cycle; the AI never draws geometry. Contract:
   hand-made-zone confirmations (7.5.5), and `pcb_settings.json` itself — the AI
   cannot reweight the cost model mid-run.
 
-### 7.8 Acceleration tiers — numpy and GPU (all three shipped; quality-identical
-by construction; sized for boards far larger than kiln)
+### 7.8 Acceleration tiers — numpy and GPU
+
+> **LANDED 2026-07-24 (numpy tier + multi-core), coordinator-verified — with a
+> premise correction.** Shipped in `kicad_router_accel.py` (`fine_wavefront`, a
+> byte-identical numpy integer-field wavefront) behind `_resolve_backend` /
+> `_fine_search`; multi-core independent-connection routing in
+> `_run_independent_routes` (`autorouter.cpu.workers`, 0=auto=cores−1), workers
+> compute only and the parent commits in canonical owner order so the board is
+> bit-identical for ANY worker count. Parity gate `tests/test_backend_parity.py`
+> (5 constructions: plain, cross-layer via, plane bypass, plane termination,
+> unreachable) asserts numpy == cpu geometry byte-for-byte. numpy is a HARD
+> dependency (accel imports it at load; the parity test errors, not skips, if
+> absent). 195-test suite green.
+>
+> **⚠️ Premise correction (important — supersedes the "7.8 fixes the fine-grid
+> limit" hypothesis above at §"USER DIRECTION 2026-07-24"):** the numpy per-window
+> wavefront is a full-window Jacobi/Bellman-Ford relaxation — O(window_cells ×
+> sweeps), cost-INsensitive to path length — so it is *strictly slower* than the
+> output-sensitive cpu A* on the router's many small windows. It does **not** make
+> a large FINE-grid window tractable; relaxing a 400k-cell window many times is
+> worse, not better, than A* refusing it. Hence **`"auto"` resolves to `cpu`**
+> (A*), and numpy stays as the parity oracle / large-batch-field tier. **The real,
+> delivered 7.8 payoff is multi-core parallelism across independent connections,
+> not the numpy backend.** Consequently `unreachable_in_window` on kiln's dense
+> pin fields is STILL OPEN: beating 8552.276 needs the fine-grid *pathfinding*
+> revisit (a smarter search/window strategy — e.g. fine grid only near pads,
+> hierarchical windows, or a plane-aware admissible heuristic), which is the next
+> Opus-permitted task, NOT more numpy. Batched whole-board wavefronts (where the
+> vectorization actually pays off) remain the GPU/M5 story below.
+
+_Design vision (numpy + GPU, all three tiers; quality-identical by construction;
+sized for boards far larger than kiln):_
 
 Three interchangeable backends behind one interface, selected by
 `autorouter.acceleration` (`"auto"` probes best-available at startup). **All
@@ -1232,8 +1479,15 @@ Interplay with the rest:
 - Memory bound: each replica holds an in-memory model diff, so `replicas`
   auto-caps by available RAM on big boards (same planner as the GPU budget).
 
-`numpy`/`cupy`/`torch` stay **commented-out** in `requirements-mcp.txt` exactly
-like `kicad-python` — absent, everything still runs on `cpu`; the run report
+**Dependency policy — REVISED 2026-07-24 (user decision): `numpy` is a HARD
+REQUIRED dependency**, listed uncommented in `requirements-mcp.txt`. The router
+does NOT carry a "cpu fallback when numpy is absent" runtime path — numpy is a
+trivial pip install, so working around its absence is wasted complexity; a
+missing `import numpy` is a hard install error, which is correct. The pure-Python
+`cpu` search survives ONLY as the test-time **parity oracle** the numpy tier is
+proven against (and an explicit `acceleration:"cpu"` selection for that test) —
+not as a graceful-degradation fallback. `cupy`/`torch` (GPU) remain optional
+(commented-out) since a CUDA GPU genuinely may be absent. The run report still
 names the backend, batch sizes, worker/replica counts, demotion counts, and
 peak memory used.
 
@@ -1482,6 +1736,28 @@ default — consent-gated anyway).
 
 ### 7.16 Benchmark harness — other people's boards vs. the autorouter
 
+**LANDED 2026-07-24** (anchor; Sonnet agent, coordinator-verified).
+`benchmark_autoroute(source_board, mode="complete_only"|"strip_and_reroute",
+effort=…)` → tool `benchmark_kicad_autoroute` (83 tools) in
+`kicad_router_tool.py` — a thin orchestrator over `get_ratsnest` + `route_board`
++ `get_trace_cost` + the kicad-cli DRC gate; source board NEVER written
+(scratch copy only, asserted). Result dict: `human`
+(score/board_totals/unrouted/layer-lengths), `auto`
+(routed/failed/completion_pct/added length+vias/post-score), `drc`
+(baseline/post/`new_violation_count`), `comparison`
+(`human_score_total`/`post_score_total`/`delta_total`/`matched_or_beat_human`/
+`verdict` — first-class), `route_report`, `runtime_seconds`. 6 fast tests on a
+synthetic project + 1 real-kiln test gated behind `KICAD_BENCHMARK_REAL=1`
+(the parallel default run does not deselect `slow`, so the real run is env-gated
+to stay out of the 2m24s suite). **Measured on real kiln (`complete_only`):
+human 8552.276 vs auto post 8568.267 — auto is WORSE by +15.99, 3/39 routed
+(7.69%), 1 NEW DRC violation** (a `3.3V_Main` surface stub 0.269 mm from the
+`mainGnd` zone — the exact "plane nets as surface stubs" defect). Runtime ~27
+min for 39 connections (35 fail fast on `window_too_large`). `strip_and_reroute`
+verified on the synthetic fixture only — a from-zero real-kiln reroute is
+impractically slow until the window-budget fix lands. **This is now the
+acceptance gate for router work: the goal is `matched_or_beat_human: true`.**
+
 Measure the router against real human routing, not just synthetic stress.
 `benchmark_autoroute(source_board, mode)` → tool `benchmark_kicad_autoroute`
 (scratch copies only; the source board is never written):
@@ -1694,7 +1970,6 @@ they stay listed until 7.3b closes.
 | `adopt_kicad_routing` | `adopt_routing` | **yes (board_local.json)** |
 | `seed_kicad_routing_from_board` | `seed_routing_from_board` | **yes (board + board_local.json)** |
 | `remove_kicad_stitching_vias` | `remove_stitching_vias` | **yes (board + board_local.json)** |
-| `benchmark_kicad_autoroute` | `benchmark_autoroute` | no (scratch copies + report files) |
 
 Each registered in `self.tools` with `inputSchema` + a `_tool_*` handler, exactly
 like the existing entries.
@@ -1714,9 +1989,11 @@ planned-not-implemented. **Docs sync LANDED 2026-07-23 (Haiku):**
 `audit_kicad_plane_islands` (7.5.2/7.5.3) now have full rows on
 `11-autorouter.md`; README + CLAUDE.md synced to **82 tools / 11 groups**
 (CLAUDE.md gained "route the board" + zone/island Common-Tasks entries).
-**Remaining docs debt:** the `route_kicad_nets`/`route_kicad_board` pages get
-revised as 7.5.4 plane-aware routing and 7.12 neck-down land (they change what
-routes vs. fails), and future Phase 7 tools add rows as they land)
+**Remaining docs debt (as of 2026-07-24, 83 tools):** `benchmark_kicad_autoroute`
+(7.16) has no docs row yet and README/CLAUDE.md now lag at 82 → bump to 83; the
+`route_kicad_nets`/`route_kicad_board` pages get revised as 7.5.4 plane-aware
+routing and 7.12 neck-down land (they change what routes vs. fails), and future
+Phase 7 tools add rows as they land)
 - Extend `docs/mcp-tools/10-netclasses-and-buses.md` (or the autorouter page,
   as fits) as each remaining tool in the summary table above lands (same
   per-tool format).
@@ -1930,9 +2207,11 @@ landed 2026-07-21 — see their anchors; remaining:):
     the 7.14 anchor). Remaining: the optimizer swap move + pause-and-ask-the-user
     protocol (after 7.6) and the session-layer exclusion prompt that calls the
     landed validator.
-20. Phase 7.16 benchmark harness + corpus (`benchmark_kicad_autoroute`) —
-    after 7.3b for `strip_and_reroute`; corpus targets attach to M4/M5
-    acceptance.
+20. Phase 7.16 benchmark harness (`benchmark_kicad_autoroute`) — **LANDED
+    2026-07-24** (see anchor; kiln complete_only: human 8552.276 vs auto
+    8568.267, 3/39, `matched_or_beat_human:false` — the acceptance gate). The
+    openly-licensed corpus (`benchmarks/boards/`) is still TODO; kiln itself is
+    the working benchmark for now.
 21. Optional Phase 5 refinements recorded in its anchor: per-station polyline
     centerline (S-shaped bundles read slightly high today) and
     equidistant-trunk splitting.

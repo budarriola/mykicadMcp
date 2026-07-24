@@ -73,7 +73,7 @@ _LAYER_TYPES_2 = {"F.Cu": "signal", "B.Cu": "signal"}
 
 
 def _open_window(layers: list[str], layer_types: dict[str, str], cols: int, rows: int,
-                  grid: float = 1.0, net: str = "PWR") -> "router._FineWindow":
+                  grid: float = 1.0, net: str = "GND") -> "router._FineWindow":
     win = router._FineWindow(0.0, 0.0, (cols - 1) * grid, (rows - 1) * grid,
                               grid, layers, layer_types, net)
     win.build([], 0.1, 0.3, 0.2, 0.2)  # no obstacles anywhere
@@ -160,7 +160,7 @@ def test_plane_route_used_when_it_is_the_only_option() -> None:
     limited) cost comparison discussed above."""
     layers = ["F.Cu", "B.Cu"]
     layer_types = {"F.Cu": "signal", "B.Cu": "signal"}
-    win = router._FineWindow(0.0, 0.0, 10.0, 1.0, 1.0, layers, layer_types, "PWR")
+    win = router._FineWindow(0.0, 0.0, 10.0, 1.0, 1.0, layers, layer_types, "GND")
     wall0 = router._Obst("seg", "OBS", frozenset(["F.Cu"]), 0.4, 2.0, 0.0, 8.0, 0.0, owner=None)
     wall1 = router._Obst("seg", "OBS", frozenset(["F.Cu"]), 0.4, 2.0, 1.0, 8.0, 1.0, owner=None)
     win.build([wall0, wall1], 0.1, 0.3, 0.2, 0.2)
@@ -244,18 +244,19 @@ def _zone_block(net: str, layer: str, uid: str, name: str,
             f'    )\n')
 
 
-def _write_plane_project(directory: Path) -> Path:
-    """A 20x20mm 2-layer board: net PWR owns a filled zone on B.Cu covering
-    the whole area; pad A (PWR, B.Cu) sits directly on it; pad B (PWR, F.Cu)
+def _write_plane_project(directory: Path, net: str = "GND") -> Path:
+    """A 20x20mm 2-layer board: `net` owns a filled zone on B.Cu covering
+    the whole area; pad A (`net`, B.Cu) sits directly on it; pad B (`net`, F.Cu)
     is 16mm away and needs a via drop onto the plane to join. No obstacles -
     this is a plumbing/correctness proof for the full pipeline, not a
-    fails-without-planes maze (see the module docstring)."""
+    fails-without-planes maze (see the module docstring). Defaults to the power
+    net GND; pass a signal name to exercise the power-net fill gate."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    parts = [_HDR2, _net_table(["PWR"])]
-    parts.append(_pad_block("A1", 2.0, 10.0, "B.Cu", "PWR", "pad-a-0001"))
-    parts.append(_pad_block("B1", 18.0, 10.0, "F.Cu", "PWR", "pad-b-0001"))
-    parts.append(_zone_block("PWR", "B.Cu", "zone-pwr-0001", "pwr_plane", 0.0, 0.0, 20.0, 20.0))
+    parts = [_HDR2, _net_table([net])]
+    parts.append(_pad_block("A1", 2.0, 10.0, "B.Cu", net, "pad-a-0001"))
+    parts.append(_pad_block("B1", 18.0, 10.0, "F.Cu", net, "pad-b-0001"))
+    parts.append(_zone_block(net, "B.Cu", "zone-pwr-0001", "pwr_plane", 0.0, 0.0, 20.0, 20.0))
     parts.append(")\n")
     (directory / "plane.kicad_pcb").write_text("".join(parts), encoding="utf-8")
     (directory / "plane.kicad_pro").write_text(_synthetic_kicad_pro_text(), encoding="utf-8")
@@ -269,7 +270,7 @@ def test_route_nets_uses_plane_for_cross_layer_pad(tmp_path: Path) -> None:
     rats = router.get_ratsnest(proj)
     assert rats["summary"]["total_connections"] == 1
     conn = rats["connections"][0]
-    assert conn["net"] == "PWR"
+    assert conn["net"] == "GND"
 
     res = router.route_nets(proj, write=True)
     rec = res["connections"][0]
@@ -298,6 +299,31 @@ def test_route_nets_uses_plane_for_cross_layer_pad(tmp_path: Path) -> None:
     res2 = router.route_nets(proj, write=True)
     assert res2["connections"][0]["routed"] is True
     assert router.get_ratsnest(proj)["summary"]["total_connections"] == 0
+
+
+def test_signal_net_fill_is_not_used_as_plane(tmp_path: Path) -> None:
+    """Power-net fill gate (user, 2026-07-24): filled zones provide plane moves
+    ONLY for power/ground nets. The exact same board as the GND test above but
+    with a SIGNAL net ("SDA", which matches no power pattern) owning the B.Cu
+    fill must NOT ride the plane: the connection still routes (no obstacles), but
+    as ordinary copper, so its emitted length is a LARGE fraction of the airline
+    - not the tiny stub the GND plane case emits (where length << airline)."""
+    proj = _write_plane_project(tmp_path / "plane_sig", net="SDA")
+
+    rats = router.get_ratsnest(proj)
+    conn = rats["connections"][0]
+    assert conn["net"] == "SDA"
+
+    res = router.route_nets(proj, write=True)
+    rec = res["connections"][0]
+    assert rec["routed"] is True
+    assert rec["self_check"]["passed"] is True
+    # The plane is gated OFF for this signal net, so the cross-layer run is real
+    # copper (the whole ~16mm airline), NOT dropped as plane-riding travel. This
+    # is the exact inverse of the GND assertion `length_mm < airline` above.
+    assert rec["length_mm"] >= 0.5 * conn["airline_length_mm"], (
+        "a signal net's own fill must NOT be used as a routable plane"
+    )
 
 
 def test_route_nets_plane_preview_is_deterministic(tmp_path: Path) -> None:

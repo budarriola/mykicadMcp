@@ -28,7 +28,12 @@ from __future__ import annotations
 import heapq
 import json
 import math
+import os
 import re
+import shutil
+import subprocess
+import tempfile
+import time
 import uuid as _uuid
 from pathlib import Path
 from typing import Any
@@ -2893,6 +2898,101 @@ _MAX_WINDOW_SPAN_MM = 60.0
 # Guard against a pathological window: if node*layer count exceeds this, the
 # window is refused (reported as a failure) instead of built.
 _MAX_WINDOW_NODES = 400_000
+# NOTE (7.8): the numpy tier vectorizes the whole-window field and COULD afford a
+# much larger fine-grid window before `_choose_grid` coarsens. We deliberately do
+# NOT raise the budget for numpy: (1) the budget selects the grid, so an equal
+# budget is what keeps cpu and numpy route-level bit-identical (parity); (2) it
+# was measured NOT to help on kiln - 35/39 unrouted connections are walled by
+# foreign copper at clearance and have NO DRC-legal corridor at any grid/window
+# (cost-free BFS at 0.2 mm over a 60 mm-margin window connects only the same 4/39
+# as the coarse grid). Kept documented here rather than shipped as a non-improving
+# behavior change.
+
+
+def _resolve_backend(settings: dict[str, Any]) -> str:
+    """Resolve `autorouter.acceleration` to a concrete backend.
+
+    numpy is a hard dependency (the accel module imports it unconditionally and
+    the parity test exercises it every run), but it is NOT the default per-window
+    pathfinder: the numpy wavefront relaxes the WHOLE window for many sweeps
+    (Jacobi / Bellman-Ford), whereas the cpu A* is output-sensitive and only
+    expands toward the goal. The detailed router runs many small windows, where
+    A* is decisively faster, so "auto" resolves to "cpu". Choose "numpy"
+    explicitly for the vectorized field backend (parity oracle / large-window
+    experiments)."""
+    accel = str(settings.get("autorouter", {}).get("acceleration", "auto")).lower()
+    if accel in ("cpu", "numpy"):
+        return accel
+    return "cpu"  # "auto"/"hybrid"/anything else -> output-sensitive A*
+
+
+def _fine_search(backend: str, win: "_FineWindow", *args: Any, **kwargs: Any):
+    """Dispatch one windowed detailed search to the selected backend. Both
+    backends return byte-identical geometry (7.8 parity); `cpu` is the reference
+    pure-Python A*, `numpy` the vectorized integer-field wavefront."""
+    if backend == "numpy":
+        import kicad_router_accel as _accel
+        return _accel.fine_wavefront(win, *args, **kwargs)
+    return _fine_astar(win, *args, **kwargs)
+
+# Deterministic grid-growth factor used by `_choose_grid`'s refinement loop
+# (see its docstring). Kept well below 2x so the chosen grid tracks the node
+# budget closely instead of overshooting to a much coarser resolution than
+# necessary.
+_GRID_GROWTH_FACTOR = 1.05
+_GRID_CHOICE_MAX_STEPS = 200
+
+
+def _window_node_count(span_x: float, span_y: float, grid: float, n_layers: int) -> int:
+    """Node count `_FineWindow` would allocate for a window of this span at
+    this grid - mirrors `_FineWindow.__init__`'s `cols`/`rows` formula exactly
+    (including its `ceil(...) + 1` and `max(2, ...)` floors) so the estimate
+    used to CHOOSE a grid always matches what gets built."""
+    cols = max(2, int(math.ceil(span_x / grid)) + 1)
+    rows = max(2, int(math.ceil(span_y / grid)) + 1)
+    return cols * rows * max(1, n_layers)
+
+
+def _choose_grid(span_x: float, span_y: float, n_layers: int,
+                  base_grid: float, max_grid: float, budget: int) -> float:
+    """Adaptive detailed-grid selection (7.9 anchor): the coarsest-as-needed,
+    fine-as-possible `grid_mm` for ONE connection's window, as a pure,
+    deterministic function of its span/layer-count/budget only.
+
+    - SHORT connections (window fits the budget at `base_grid`, the board's
+      `autorouter.grid_mm`) get `base_grid` back UNCHANGED - this is what
+      keeps every existing short-connection route byte-identical: the window
+      building / A* / self-check code downstream never learns the grid was
+      "chosen" adaptively when nothing needed to change.
+    - LONG connections that would blow the node budget at `base_grid` are
+      coarsened just enough to fit: an analytic lower bound
+      (`sqrt(span_x * span_y * n_layers / budget)`), then refined UPWARD in
+      small deterministic `_GRID_GROWTH_FACTOR` steps against the EXACT
+      `_window_node_count` formula (the analytic bound can undershoot because
+      of the `ceil(...) + 1` node-count floor at small col/row counts), never
+      finer than `base_grid` and never coarser than `max_grid`
+      (`autorouter.max_grid_mm`).
+    - If even `max_grid` cannot fit the budget, `max_grid` is returned anyway;
+      the caller's existing `_MAX_WINDOW_NODES` check (run against whatever
+      grid comes back) is what turns that into the `window_too_large` failure
+      - grid selection itself never fails.
+
+    Same span/budget in => same grid out, always: no randomness, no
+    board-global state, no iteration-order dependence.
+    """
+    base_grid = max(base_grid, 1e-6)
+    max_grid = max(max_grid, base_grid)
+    if _window_node_count(span_x, span_y, base_grid, n_layers) <= budget:
+        return base_grid
+    needed = math.sqrt(max(span_x, 1e-9) * max(span_y, 1e-9) * max(1, n_layers) / budget)
+    grid = min(max(needed, base_grid), max_grid)
+    steps = 0
+    while (grid < max_grid
+           and _window_node_count(span_x, span_y, grid, n_layers) > budget
+           and steps < _GRID_CHOICE_MAX_STEPS):
+        grid = min(grid * _GRID_GROWTH_FACTOR, max_grid)
+        steps += 1
+    return grid
 
 
 def _resolve_route_rules(project_path: str | Path, settings: dict[str, Any]) -> dict[str, Any]:
@@ -3146,14 +3246,86 @@ def _clip_polygon_edges(pts: list[tuple[float, float]], bx0: float, by0: float,
     return edges
 
 
-def _min_dist_to_edges(px: float, py: float,
-                       edges: list[tuple[float, float, float, float]]) -> float:
+def _min_dist_to_edges_ref(px: float, py: float,
+                           edges: list[tuple[float, float, float, float]]) -> float:
+    """Reference (linear-scan) min point-to-edge distance. O(len(edges)) per
+    call; kept byte-for-byte as the correctness oracle for
+    `_ZoneEdgeGrid.min_dist` - see test_zone_distance_perf.py."""
     best = math.inf
     for (x1, y1, x2, y2) in edges:
         d = _dist_point_segment(px, py, x1, y1, x2, y2)
         if d < best:
             best = d
     return best
+
+
+# Back-compat alias (kept in case anything outside this module imports the
+# old name directly); the hot path below uses `_ZoneEdgeGrid` instead.
+_min_dist_to_edges = _min_dist_to_edges_ref
+
+
+class _ZoneEdgeGrid:
+    """Uniform-grid spatial index over a window's already-clipped zone edges.
+
+    `obstacle_cells` already restricts `zedges` to the edges whose bbox
+    intersects the window+halo (`_clip_polygon_edges`), but a zone fill can
+    still contribute hundreds of nearby edges (thermal-relief cutouts,
+    serpentine pour boundaries) and every grid cell in the window used to be
+    tested against every one of them - O(cells x zone_edges). This buckets
+    those edges into cells of side `reach` (the largest distance threshold any
+    query in this window will ever compare against) so a query point only
+    needs to scan the single bucket its own cell falls in.
+
+    Correctness argument (why one bucket is always enough, not neighbors too):
+    each edge is inserted into every bucket that its bounding box, padded by
+    `reach` on all sides, overlaps. If the true distance from query point P to
+    edge E is <= reach, then P lies within E's bbox padded by `reach` (the
+    closest point of E to P is inside E's bbox, and P is within `reach` of
+    it). P's own bucket cell therefore overlaps that padded bbox (they share
+    the point P), so E was necessarily inserted into P's bucket during
+    construction. Hence any edge that could be <= reach from P is present in
+    P's single bucket - no neighbor-bucket scan is needed. Edges farther than
+    `reach` may or may not appear in a bucket (an over-approximation is fine);
+    they are still tested exactly if present, so distances returned are exact
+    whenever they are < reach, which is all obstacle_cells ever compares
+    against."""
+
+    __slots__ = ("cell", "inv", "minx", "miny", "buckets")
+
+    def __init__(self, edges: list[tuple[float, float, float, float]], reach: float) -> None:
+        cell = max(reach, 1e-6)
+        self.cell = cell
+        self.inv = 1.0 / cell
+        if edges:
+            self.minx = min(min(x1, x2) for (x1, y1, x2, y2) in edges)
+            self.miny = min(min(y1, y2) for (x1, y1, x2, y2) in edges)
+        else:
+            self.minx = self.miny = 0.0
+        buckets: dict[tuple[int, int], list[tuple[float, float, float, float]]] = {}
+        inv = self.inv
+        minx, miny = self.minx, self.miny
+        for (x1, y1, x2, y2) in edges:
+            bx0 = int(math.floor((min(x1, x2) - cell - minx) * inv))
+            bx1 = int(math.floor((max(x1, x2) + cell - minx) * inv))
+            by0 = int(math.floor((min(y1, y2) - cell - miny) * inv))
+            by1 = int(math.floor((max(y1, y2) + cell - miny) * inv))
+            for by in range(by0, by1 + 1):
+                for bx in range(bx0, bx1 + 1):
+                    buckets.setdefault((bx, by), []).append((x1, y1, x2, y2))
+        self.buckets = buckets
+
+    def min_dist(self, px: float, py: float) -> float:
+        bx = int(math.floor((px - self.minx) * self.inv))
+        by = int(math.floor((py - self.miny) * self.inv))
+        edges = self.buckets.get((bx, by))
+        if not edges:
+            return math.inf
+        best = math.inf
+        for (x1, y1, x2, y2) in edges:
+            d = _dist_point_segment(px, py, x1, y1, x2, y2)
+            if d < best:
+                best = d
+        return best
 
 
 # --------------------------------------------------------------------------- #
@@ -3246,16 +3418,22 @@ class _FineWindow:
         for l in ob_layers:
             track_cells.setdefault(l, set())
         zedges: list[tuple[float, float, float, float]] | None = None
+        zgrid: _ZoneEdgeGrid | None = None
         if ob.kind == "zone" and ob.pts:
             zedges = _clip_polygon_edges(
                 ob.pts, wminx - big, wminy - big, wmaxx + big, wmaxy + big)
+            # `big` bounds every distance this window will ever compare a zone
+            # edge against below (via_reach, track_reach <= big), so a grid
+            # bucketed at that size lets each cell test only its own bucket -
+            # see `_ZoneEdgeGrid` for the exactness argument.
+            zgrid = _ZoneEdgeGrid(zedges, big)
         for iy in range(iy0, iy1 + 1):
             for ix in range(ix0, ix1 + 1):
                 px, py = self.node_xy(ix, iy)
                 if zedges is not None:
                     assert ob.raster is not None
                     inside = ob.raster.covers(px, py, 0.0)
-                    dmin = 0.0 if inside else _min_dist_to_edges(px, py, zedges)
+                    dmin = 0.0 if inside else zgrid.min_dist(px, py)
                     if dmin < via_reach:
                         via_cells.add((ix, iy))
                     if dmin < track_reach:
@@ -3342,8 +3520,203 @@ class _FineWindow:
 
 
 # --------------------------------------------------------------------------- #
-# Fine A* over (cx, cy, layer)
+# Fine detailed search - shared integer-milli cost model + deterministic
+# field backtrace (used identically by the cpu A*, the numpy wavefront tier,
+# and the reconstruction, so every backend is bit-identical by construction).
 # --------------------------------------------------------------------------- #
+
+# Sentinel "unreachable" cost for the integer cost field (well below int64 max
+# so accumulating a few relaxation sweeps onto it can never overflow or wrap).
+_FINE_INF = 1 << 60
+
+
+def _build_fine_cost(
+    win: "_FineWindow", net_kind: str, weights: _Weights,
+    layer_purpose: dict[str, Any], directions: dict[str, Any],
+    home_layer: str | None, corridor_cells: set[tuple[int, int]] | None,
+    congestion: dict[tuple[int, int, str], int] | None,
+    plane_layers: dict[str, list[dict[str, Any]]] | None,
+    goal_planes: dict[str, list[dict[str, Any]]] | None,
+    plane_step: float, attachment_via_cost: float,
+    goal_cell: tuple[int, int], goal_layers: set[str],
+) -> dict[str, Any]:
+    """The ONE integer-milli cost model for the fine detailed search.
+
+    Returns a dict of pure closures (`planar`, `via`, `heuristic`, `is_goal`,
+    `plane_factor`, plus `li`/`step_milli_per_unit`). The cpu A* (`_fine_astar`),
+    the deterministic backtrace (`_fine_backtrace`), and the numpy wavefront
+    (`kicad_router_accel.fine_wavefront`) ALL cost moves through this single
+    source of truth, so their integer cost fields are bit-identical - which is
+    what makes the deterministic reconstruction pick the same path on every
+    backend (7.8 parity)."""
+    g = win.grid
+    lp_kind = layer_purpose.get(net_kind, {})
+    layers = win.layers
+    li = {name: i for i, name in enumerate(layers)}
+    layer_types = win.layer_types
+    min_lp = min([float(lp_kind.get(layer_types[l], 1.0)) for l in layers] or [1.0])
+    step_milli_per_unit = weights.q(weights.step * min_lp)
+    gx, gy = goal_cell
+    cong = congestion or None
+    plane = plane_layers or None
+    plane_goal = goal_planes or None
+    _pf_cache: dict[tuple[int, int, str], float | None] = {}
+
+    def plane_factor(ix: int, iy: int, layer: str) -> float | None:
+        if plane is None:
+            return None
+        key = (ix, iy, layer)
+        if key in _pf_cache:
+            return _pf_cache[key]
+        val: float | None = None
+        comps = plane.get(layer)
+        if comps:
+            nx, ny = win.node_xy(ix, iy)
+            for c in comps:
+                if c["raster"].covers(nx, ny, 0.0):
+                    val = c["factor"]
+                    break
+        _pf_cache[key] = val
+        return val
+
+    def heuristic(cx: int, cy: int) -> int:
+        ax, ay = abs(cx - gx), abs(cy - gy)
+        octile = (ax + ay) + (_SQRT2 - 2.0) * min(ax, ay)
+        return int(math.floor(octile * step_milli_per_unit))
+
+    def planar(ncx: int, ncy: int, layer: str, di: int, prev_d: int) -> int | None:
+        """Integer milli-cost of the planar move in direction `di` INTO
+        (ncx,ncy,layer) arriving from a state whose incoming heading was
+        `prev_d` (-1 = none). None => the target is a hard obstacle."""
+        if (ncx, ncy) in win.blocked_track[layer] and not (ncx == gx and ncy == gy):
+            return None
+        dx, dy = _MOVES[di]
+        dist_units = _SQRT2 if (dx and dy) else 1.0
+        dist_mm = dist_units * g
+        extra = 0.0
+        pf = plane_factor(ncx, ncy, layer)
+        if pf is not None:
+            base = weights.step * dist_units * plane_step * pf
+        else:
+            base = weights.step * dist_units * float(lp_kind.get(layer_types[layer], 1.0))
+            base *= _direction_factor(weights, directions.get(layer), dx, dy)
+            if home_layer is not None and layer != home_layer:
+                extra += weights.away_from_home_per_mm * dist_mm
+        if corridor_cells is not None and (ncx, ncy) not in corridor_cells:
+            extra += weights.off_corridor * dist_mm
+        if prev_d != -1 and di != prev_d:
+            extra += weights.direction_change
+        move_milli = weights.q(base + extra)
+        if cong is not None:
+            move_milli += cong.get((ncx, ncy, layer), 0)
+        return move_milli
+
+    def via(ix: int, iy: int, to_layer: str) -> int | None:
+        """Integer milli-cost of a via hop landing on `to_layer` at (ix,iy).
+        None => a via cannot be placed at this cell (via-blocked)."""
+        if (ix, iy) in win.blocked_via:
+            return None
+        via_base = weights.via * weights.through_via
+        if plane_factor(ix, iy, to_layer) is not None:
+            via_base += attachment_via_cost
+        move_milli = weights.q(via_base)
+        if cong is not None:
+            move_milli += cong.get((ix, iy, to_layer), 0)
+        return move_milli
+
+    def is_goal(cx: int, cy: int, layer: str) -> bool:
+        if cx == gx and cy == gy and layer in goal_layers:
+            return True
+        if plane_goal is not None:
+            comps = plane_goal.get(layer)
+            if comps:
+                nx, ny = win.node_xy(cx, cy)
+                for c in comps:
+                    if c["raster"].covers(nx, ny, 0.0):
+                        return True
+        return False
+
+    return {
+        "planar": planar, "via": via, "heuristic": heuristic, "is_goal": is_goal,
+        "plane_factor": plane_factor, "li": li,
+        "step_milli_per_unit": step_milli_per_unit, "goal_cell": goal_cell,
+        "goal_layers": goal_layers,
+    }
+
+
+def _fine_backtrace(
+    win: "_FineWindow", model: dict[str, Any],
+    cost_get: "Callable[[tuple[int, int, str, int]], int | None]",
+    goal_state: tuple[int, int, str, int],
+    start_states: list[tuple[int, int, str, int]],
+) -> list[tuple[int, int, str]]:
+    """Deterministic path reconstruction from the OPTIMAL integer cost field.
+
+    `cost_get(state)` returns the field cost of a `(cx,cy,layer,dir)` state
+    (None if unreached). Walking backward from `goal_state`, at each step it
+    picks - among every predecessor that TIGHTLY explains the current state's
+    optimal cost (`cost_get(pred) + edge_cost(pred->cur) == cost_get(cur)`) -
+    the one the cpu A* heap would have committed first: min key
+    `(cost(pred) + heuristic(pred), cost(pred), px, py, layer_index, pred_dir)`.
+
+    This is a pure function of the (bit-identical) field, so the cpu dict field
+    and the numpy array field reconstruct byte-identical geometry - the 7.8
+    parity guarantee. Returns the list of `(cx,cy,layer)` nodes (consecutive
+    duplicate cells from via hops collapsed), same shape `_route_to_emit`
+    consumes."""
+    planar = model["planar"]
+    via = model["via"]
+    heuristic = model["heuristic"]
+    li = model["li"]
+    layers = win.layers
+    start_set = set(start_states)
+
+    rev: list[tuple[int, int, str]] = []
+    cur: tuple[int, int, str, int] | None = goal_state
+    seen: set[tuple[int, int, str, int]] = set()
+    while cur is not None:
+        cx, cy, layer, d = cur
+        if not rev or rev[-1] != (cx, cy, layer):
+            rev.append((cx, cy, layer))
+        if cur in start_set or cur in seen:
+            break
+        seen.add(cur)
+        cur_cost = cost_get(cur)
+        best_key: tuple[int, ...] | None = None
+        best_pred: tuple[int, int, str, int] | None = None
+        # Planar predecessor: `cur` was entered by a planar move whose heading
+        # equals cur's stored `d` (so the source cell is fixed); the incoming
+        # heading of that source (pd) is unknown, enumerate it.
+        if d != -1:
+            dx, dy = _MOVES[d]
+            px, py = cx - dx, cy - dy
+            if win.in_bounds(px, py):
+                for pd in range(-1, 8):
+                    pv = cost_get((px, py, layer, pd))
+                    if pv is None:
+                        continue
+                    mc = planar(cx, cy, layer, d, pd)
+                    if mc is None or pv + mc != cur_cost:
+                        continue
+                    key = (pv + heuristic(px, py), pv, px, py, li[layer], pd)
+                    if best_key is None or key < best_key:
+                        best_key, best_pred = key, (px, py, layer, pd)
+        # Via predecessor: entered by a via onto `layer`, heading preserved.
+        mc_via = via(cx, cy, layer)
+        if mc_via is not None:
+            for other in layers:
+                if other == layer:
+                    continue
+                pv = cost_get((cx, cy, other, d))
+                if pv is None or pv + mc_via != cur_cost:
+                    continue
+                key = (pv + heuristic(cx, cy), pv, cx, cy, li[other], d)
+                if best_key is None or key < best_key:
+                    best_key, best_pred = key, (cx, cy, other, d)
+        cur = best_pred
+    rev.reverse()
+    return rev
+
 
 def _fine_astar(
     win: _FineWindow,
@@ -3398,42 +3771,16 @@ def _fine_astar(
     are None (every signal-net call, and any plane-net call whose goal does not
     already touch its own fill), every branch below that checks them is False
     and the search is byte-identical to the pre-7.5.4 behaviour (parity)."""
-    cong = congestion or None
-    plane = plane_layers or None
-    plane_goal = goal_planes or None
-    _plane_factor_cache: dict[tuple[int, int, str], float | None] = {}
-
-    def _plane_factor(ix: int, iy: int, layer: str) -> float | None:
-        """The (mainland=1.0 / island / orphan) cost factor for node (ix, iy)
-        on `layer`, from THIS net's own plane fill - None when the net has no
-        plane, `layer` carries none of its fill, or the node isn't on it."""
-        if plane is None:
-            return None
-        key = (ix, iy, layer)
-        if key in _plane_factor_cache:
-            return _plane_factor_cache[key]
-        val: float | None = None
-        comps = plane.get(layer)
-        if comps:
-            nx, ny = win.node_xy(ix, iy)
-            for c in comps:
-                if c["raster"].covers(nx, ny, 0.0):
-                    val = c["factor"]
-                    break
-        _plane_factor_cache[key] = val
-        return val
-    g = win.grid
-    lp_kind = layer_purpose.get(net_kind, {})
+    model = _build_fine_cost(
+        win, net_kind, weights, layer_purpose, directions, home_layer,
+        corridor_cells, congestion, plane_layers, goal_planes, plane_step,
+        attachment_via_cost, goal_cell, goal_layers)
+    planar = model["planar"]
+    via = model["via"]
+    heuristic = model["heuristic"]
+    is_goal = model["is_goal"]
+    li = model["li"]
     layers = win.layers
-    li = {name: i for i, name in enumerate(layers)}
-    min_lp = min([float(lp_kind.get(win.layer_types[l], 1.0)) for l in layers] or [1.0])
-    step_milli_per_unit = weights.q(weights.step * min_lp)
-    gx, gy = goal_cell
-
-    def heuristic(cx: int, cy: int) -> int:
-        ax, ay = abs(cx - gx), abs(cy - gy)
-        octile = (ax + ay) + (_SQRT2 - 2.0) * min(ax, ay)
-        return int(math.floor(octile * step_milli_per_unit))
 
     start_states = [(start_cell[0], start_cell[1], l, -1) for l in start_layers
                     if start_cell not in win.blocked_track.get(l, set())]
@@ -3446,25 +3793,11 @@ def _fine_astar(
         return None
 
     best_g: dict[tuple[int, int, str, int], int] = {}
-    came: dict[tuple[int, int, str, int], tuple[int, int, str, int] | None] = {}
     heap: list[tuple[int, int, int, int, int, int]] = []
     for (sx, sy, l, d) in start_states:
         st = (sx, sy, l, d)
         best_g[st] = 0
-        came[st] = None
         heapq.heappush(heap, (heuristic(sx, sy), 0, sx, sy, li[l], d))
-
-    def is_goal(cx: int, cy: int, layer: str) -> bool:
-        if cx == gx and cy == gy and layer in goal_layers:
-            return True
-        if plane_goal is not None:
-            comps = plane_goal.get(layer)
-            if comps:
-                nx, ny = win.node_xy(cx, cy)
-                for c in comps:
-                    if c["raster"].covers(nx, ny, 0.0):
-                        return True
-        return False
 
     expansions = 0
     goal_state: tuple[int, int, str, int] | None = None
@@ -3485,70 +3818,31 @@ def _fine_astar(
             ncx, ncy = cx + dx, cy + dy
             if not win.in_bounds(ncx, ncy):
                 continue
-            if (ncx, ncy) in win.blocked_track[layer] and not (ncx == gx and ncy == gy):
+            move_milli = planar(ncx, ncy, layer, di, d)
+            if move_milli is None:
                 continue
-            dist_units = _SQRT2 if (dx and dy) else 1.0
-            dist_mm = dist_units * g
-            extra = 0.0
-            move_plane_factor = _plane_factor(ncx, ncy, layer)
-            if move_plane_factor is not None:
-                # Plane traversal (7.5.4): riding the net's own fill costs
-                # plane_step x island-factor per mm INSTEAD of the normal
-                # step/layer-purpose/direction/away-from-home cost - the plane
-                # is nearly free copper, not a trace. off_corridor/turn still
-                # apply (soft nudges, never block a shortcut through the fill).
-                base = weights.step * dist_units * plane_step * move_plane_factor
-            else:
-                base = weights.step * dist_units * float(lp_kind.get(win.layer_types[layer], 1.0))
-                base *= _direction_factor(weights, directions.get(layer), dx, dy)
-                if home_layer is not None and layer != home_layer:
-                    extra += weights.away_from_home_per_mm * dist_mm
-            if corridor_cells is not None and (ncx, ncy) not in corridor_cells:
-                extra += weights.off_corridor * dist_mm
-            if d != -1 and di != d:
-                extra += weights.direction_change
-            move_milli = weights.q(base + extra)
-            if cong is not None:
-                move_milli += cong.get((ncx, ncy, layer), 0)
             ng = gc + move_milli
             nst = (ncx, ncy, layer, di)
             if nst not in best_g or ng < best_g[nst]:
                 best_g[nst] = ng
-                came[nst] = st
                 heapq.heappush(heap, (ng + heuristic(ncx, ncy), ng, ncx, ncy, layer_i, di))
 
         # via moves - layer change at the same node; needs a clear via cell.
-        if (cx, cy) not in win.blocked_via:
-            for other in layers:
-                if other == layer:
-                    continue
-                via_base = weights.via * weights.through_via
-                if _plane_factor(cx, cy, other) is not None:
-                    # Attachment via (7.5.4): entering/leaving this net's own
-                    # plane fill through a via costs the usual via PLUS the
-                    # flat attachment_via surcharge.
-                    via_base += attachment_via_cost
-                move_milli = weights.q(via_base)
-                if cong is not None:
-                    move_milli += cong.get((cx, cy, other), 0)
-                ng = gc + move_milli
-                nst = (cx, cy, other, d)
-                if nst not in best_g or ng < best_g[nst]:
-                    best_g[nst] = ng
-                    came[nst] = st
-                    heapq.heappush(heap, (ng + heuristic(cx, cy), ng, cx, cy, li[other], d))
+        for other in layers:
+            if other == layer:
+                continue
+            move_milli = via(cx, cy, other)
+            if move_milli is None:
+                break  # via-blocked at this cell: no via to ANY layer from here
+            ng = gc + move_milli
+            nst = (cx, cy, other, d)
+            if nst not in best_g or ng < best_g[nst]:
+                best_g[nst] = ng
+                heapq.heappush(heap, (ng + heuristic(cx, cy), ng, cx, cy, li[other], d))
 
     if goal_state is None:
         return None
-    rev: list[tuple[int, int, str]] = []
-    cur: tuple[int, int, str, int] | None = goal_state
-    while cur is not None:
-        cx, cy, layer, _d = cur
-        if not rev or rev[-1] != (cx, cy, layer):
-            rev.append((cx, cy, layer))
-        cur = came[cur]
-    rev.reverse()
-    return rev
+    return _fine_backtrace(win, model, best_g.get, goal_state, start_states)
 
 
 # --------------------------------------------------------------------------- #
@@ -3884,6 +4178,265 @@ def _obstacles_from_emit(net: str, segments: list[dict[str, Any]], vias: list[di
     return obs
 
 
+# --------------------------------------------------------------------------- #
+# 7.8 multi-core: the per-connection detailed search extracted as a stateless,
+# picklable unit of work. `ctx` bundles every immutable routing input (obstacles,
+# weights, rules, layer info, plane components, backend...); `_route_one` reads
+# ONLY from `ctx` + its explicit arguments and mutates nothing shared, so it runs
+# identically in the parent or in a spawned worker process. All state commits
+# (placement, congestion, owned-copper bookkeeping) stay in the parent, in
+# canonical order — so the result is bit-identical for any worker count.
+# --------------------------------------------------------------------------- #
+
+def _finalize_core(
+    ctx: dict[str, Any], net: str, win: "_FineWindow",
+    path: list[tuple[int, int, str]], from_xy: tuple[float, float],
+    to_xy: tuple[float, float], active_obstacles: list["_Obst"], margin: float,
+    plane_layers: dict[str, list[dict[str, Any]]] | None,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Fine path -> (rec-updates, segments, vias, violations); rec-updates None
+    when the exact self-check rejects the path. Stateless (reads only `ctx`)."""
+    rules = ctx["rules"]
+    routable_layers = ctx["routable_layers"]
+    tw = ctx["tw"]
+    segments, vias = _route_to_emit(win, path, from_xy, to_xy, plane_layers)
+    violations = _self_check(net, segments, vias, active_obstacles, rules, ctx["via_radius"])
+    if violations:
+        return None, segments, vias, violations
+    length = sum(math.hypot(s["x2"] - s["x1"], s["y2"] - s["y1"]) for s in segments)
+    layers_used = sorted({s["layer"] for s in segments},
+                         key=lambda l: routable_layers.index(l) if l in routable_layers else 999)
+    est_cost = (length * float(tw.get("length_mm", 1.0)) + len(vias) * float(tw.get("via", 5.0)))
+    rec_updates = {
+        "routed": True, "length_mm": round(length, 4), "via_count": len(vias),
+        "layers": layers_used, "segment_count": len(segments),
+        "window_margin_mm": margin, "grid_mm": win.grid,
+        "est_phase6_cost": round(est_cost, 4),
+        "self_check": {"passed": True, "violation_count": 0},
+    }
+    return rec_updates, segments, vias, []
+
+
+def _route_one(
+    ctx: dict[str, Any], conn: dict[str, Any], active_obstacles: list["_Obst"],
+    congestion: dict[tuple[int, int, str], int], use_corridor: bool = True,
+) -> dict[str, Any]:
+    """Window-doubling detailed search + self-check for ONE connection against a
+    GIVEN obstacle set + congestion field. Pure function of (ctx, conn,
+    active_obstacles, congestion, use_corridor) — emits nothing, mutates nothing
+    shared. The parent worklist owns placement/rip-up. Returns the `out` record
+    (including the last `_FineWindow` for in-place rip-up)."""
+    net = conn["net"]
+    net_kind = _pcb._net_kind(net, None, ctx["power_patterns"])
+    from_xy, to_xy = _conn_endpoints(conn)
+    gkey = (net, round(from_xy[0], 3), round(from_xy[1], 3),
+            round(to_xy[0], 3), round(to_xy[1], 3))
+    gconn = ctx["global_by_key"].get(gkey)
+    home_layer = gconn.get("home_layer") if gconn else None
+    routable_layers = ctx["routable_layers"]
+    routable_set = ctx["routable_set"]
+    grid = ctx["grid"]
+    backend = ctx["backend"]
+    weights = ctx["weights"]
+    from_item_layers = (conn.get("from") or {}).get("layers") or conn.get("from_layers") or routable_layers
+    to_item_layers = (conn.get("to") or {}).get("layers") or conn.get("to_layers") or routable_layers
+    start_layers = [l for l in from_item_layers if l in routable_set] or routable_layers
+    goal_layers = set(l for l in to_item_layers if l in routable_set) or set(routable_layers)
+
+    plane_layers = ctx["plane_by_net"].get(net)
+    goal_planes: dict[str, list[dict[str, Any]]] | None = None
+    if plane_layers:
+        goal_planes = {}
+        for layer, comps in plane_layers.items():
+            if layer not in goal_layers:
+                continue
+            hits = [c for c in comps if c["raster"].covers(to_xy[0], to_xy[1], grid)]
+            if hits:
+                goal_planes[layer] = hits
+        if not goal_planes:
+            goal_planes = None
+
+    result_rec: dict[str, Any] = {
+        "net": net, "net_kind": net_kind,
+        "from_point": {"x": round(from_xy[0], 4), "y": round(from_xy[1], 4)},
+        "to_point": {"x": round(to_xy[0], 4), "y": round(to_xy[1], 4)},
+        "airline_length_mm": conn.get("airline_length_mm"),
+        "home_layer": home_layer, "routed": False,
+        "length_mm": 0.0, "via_count": 0, "layers": [],
+        "self_check": None, "failure": None,
+    }
+    out: dict[str, Any] = {
+        "routed": False, "net": net, "net_kind": net_kind, "rec": result_rec,
+        "segments": [], "vias": [], "win": None, "from_xy": from_xy, "to_xy": to_xy,
+        "s_cell": None, "g_cell": None, "start_layers": start_layers,
+        "goal_layers": goal_layers, "home_layer": home_layer, "corridor": None,
+        "plane_layers": plane_layers, "goal_planes": goal_planes,
+    }
+
+    board_bbox = ctx["board_bbox"]
+    board_min = ctx["board_min"]
+    layer_types = ctx["layer_types"]
+    rules = ctx["rules"]
+    track_half = ctx["track_half"]
+    via_radius = ctx["via_radius"]
+    max_grid_mm = ctx["max_grid_mm"]
+    max_window_nodes = ctx["max_window_nodes"]
+    layer_purpose = ctx["layer_purpose"]
+    directions = ctx["directions"]
+    coarse_grid = ctx["coarse_grid"]
+    coarse_min = ctx["coarse_min"]
+    plane_step = ctx["plane_step"]
+    attachment_via_cost = ctx["attachment_via_cost"]
+
+    margin = ctx["base_margin"]
+    win: _FineWindow | None = None
+    for _attempt in range(4):  # window doubling
+        minx = max(min(from_xy[0], to_xy[0]) - margin, board_bbox[0] - grid)
+        miny = max(min(from_xy[1], to_xy[1]) - margin, board_bbox[1] - grid)
+        maxx = min(max(from_xy[0], to_xy[0]) + margin, board_bbox[2] + grid)
+        maxy = min(max(from_xy[1], to_xy[1]) + margin, board_bbox[3] + grid)
+        win_grid = _choose_grid(maxx - minx, maxy - miny, len(routable_layers),
+                                grid, max_grid_mm, max_window_nodes)
+        win = _FineWindow(minx, miny, maxx, maxy, win_grid, routable_layers, layer_types, net)
+        if win.cols * win.rows * max(1, len(routable_layers)) > max_window_nodes:
+            result_rec["failure"] = {"reason": "window_too_large",
+                                     "detail": f"window {win.cols}x{win.rows} exceeds node budget",
+                                     "window_margin_mm": margin, "grid_mm": win_grid}
+            out["win"] = None
+            return out
+        win.build(active_obstacles, track_half, via_radius, rules["clearance"], rules["edge_clearance"])
+        s_cell = win.nearest_free(from_xy[0], from_xy[1], start_layers) or win.cell_of(*from_xy)
+        g_cell = win.nearest_free(to_xy[0], to_xy[1], list(goal_layers)) or win.cell_of(*to_xy)
+        corridor = _corridor_from_global(win, gconn, coarse_grid, coarse_min) if use_corridor else None
+        win_cong = _project_congestion(win, congestion, board_min[0], board_min[1], grid)
+        out.update({"win": win, "s_cell": s_cell, "g_cell": g_cell,
+                    "corridor": corridor, "margin": margin,
+                    "active_obstacles": active_obstacles})
+
+        path = _fine_search(backend, win, net_kind, weights, layer_purpose, directions,
+                            s_cell, start_layers, g_cell, goal_layers,
+                            home_layer, corridor, win_cong,
+                            plane_layers, goal_planes, plane_step, attachment_via_cost)
+        if path is None:
+            if margin >= _MAX_WINDOW_SPAN_MM:
+                break
+            margin = min(margin * 2.0, _MAX_WINDOW_SPAN_MM)
+            continue
+
+        rec_updates, segments, vias, violations = _finalize_core(
+            ctx, net, win, path, from_xy, to_xy, active_obstacles, margin, plane_layers)
+        if rec_updates is None:
+            result_rec["self_check"] = {"passed": False, "violations": violations[:8],
+                                        "violation_count": len(violations)}
+            result_rec["failure"] = {"reason": "self_check_failed",
+                                     "detail": "proposed copper clears the A* obstacle model "
+                                               "but not the exact clearance pass (plane-skim); "
+                                               "not demoted to rip-up"}
+            return out
+        result_rec.update(rec_updates)
+        out.update({"routed": True, "segments": segments, "vias": vias})
+        return out
+
+    # unreachable within the (doubled) window.
+    blocker = _nearest_blocker(win, active_obstacles, net, to_xy) if win is not None else None
+    result_rec["failure"] = {"reason": "unreachable_in_window",
+                             "nearest_blocker": blocker, "window_margin_mm": margin}
+    return out
+
+
+# Per-process context for the multiprocessing pool (set once by the initializer,
+# read-only thereafter). Workers only COMPUTE window -> path; never commit.
+_WORKER_CTX: dict[str, Any] | None = None
+
+
+def _worker_init(ctx: dict[str, Any]) -> None:
+    global _WORKER_CTX
+    _WORKER_CTX = ctx
+
+
+def _worker_route_independent(item: tuple[int, dict[str, Any]]) -> tuple[int, dict[str, Any]]:
+    """Route one spatially-independent connection against the BASE obstacles (no
+    placements yet, empty congestion, corridor bias on) - the Phase-A parallel
+    unit. Returns (owner, picklable-out) with the heavy `_FineWindow` stripped
+    (an independent net never needs in-place rip-up: nothing else is in its
+    window). Determinism is unaffected by which worker runs it."""
+    owner, conn = item
+    ctx = _WORKER_CTX
+    assert ctx is not None
+    out = _route_one(ctx, conn, ctx["base_obstacles"], {}, use_corridor=True)
+    return owner, {"routed": out["routed"], "net": out["net"],
+                   "segments": out["segments"], "vias": out["vias"], "rec": out["rec"]}
+
+
+def _resolve_workers(settings: dict[str, Any]) -> int:
+    """Resolve `autorouter.cpu.workers`: 0 (or <0) = auto = `cpu_count - 1`
+    (>=1). A value of 1 forces the serial reference path."""
+    import os
+    cfg = settings.get("autorouter", {}).get("cpu", {}) or {}
+    raw = cfg.get("workers", 0)
+    try:
+        raw = int(raw)
+    except (TypeError, ValueError):
+        raw = 0
+    if raw >= 1:
+        return raw
+    return max(1, (os.cpu_count() or 1) - 1)
+
+
+def _run_independent_routes(
+    ctx: dict[str, Any], items: list[tuple[int, dict[str, Any]]], workers: int,
+) -> dict[int, dict[str, Any]]:
+    """Route the independent connections, in parallel across processes when
+    `workers > 1`. Falls back to in-process serial on a single worker/item or any
+    pool error. Result is keyed by owner id and independent of worker count — the
+    caller commits in canonical order, so the board is bit-identical either way."""
+    results: dict[int, dict[str, Any]] = {}
+    if workers <= 1 or len(items) <= 1:
+        for owner, conn in items:
+            out = _route_one(ctx, conn, ctx["base_obstacles"], {}, use_corridor=True)
+            results[owner] = {"routed": out["routed"], "net": out["net"],
+                              "segments": out["segments"], "vias": out["vias"], "rec": out["rec"]}
+        return results
+    try:
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=min(workers, len(items)),
+                                 initializer=_worker_init, initargs=(ctx,)) as ex:
+            for owner, res in ex.map(_worker_route_independent, items):
+                results[owner] = res
+    except Exception:
+        # Any spawn/pickle/executor failure: fall back to the serial reference
+        # path (identical results), so a worker problem never fails the run.
+        results.clear()
+        for owner, conn in items:
+            out = _route_one(ctx, conn, ctx["base_obstacles"], {}, use_corridor=True)
+            results[owner] = {"routed": out["routed"], "net": out["net"],
+                              "segments": out["segments"], "vias": out["vias"], "rec": out["rec"]}
+    return results
+
+
+def _independent_owner_set(conns: list[dict[str, Any]], max_span: float) -> set[int]:
+    """Owner indices (canonical order) whose MAXIMUM possible search window is
+    disjoint from every earlier connection's maximum window. Such a connection's
+    route is provably independent of all others (no earlier copper can ever enter
+    its window at any doubling), so routing it against the base board in parallel
+    yields byte-identical geometry to the serial worklist. `max_span` is the
+    largest margin the doubling can reach (`_MAX_WINDOW_SPAN_MM`)."""
+    boxes: list[tuple[float, float, float, float]] = []
+    for c in conns:
+        (fx, fy), (tx, ty) = _conn_endpoints(c)
+        boxes.append((min(fx, tx) - max_span, min(fy, ty) - max_span,
+                      max(fx, tx) + max_span, max(fy, ty) + max_span))
+
+    def overlap(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
+        return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
+
+    indep: set[int] = set()
+    for i in range(len(boxes)):
+        if all(not overlap(boxes[i], boxes[j]) for j in range(i)):
+            indep.add(i)
+    return indep
+
+
 def route_nets(
     project_path: str | Path,
     nets: list[str] | None = None,
@@ -3908,6 +4461,20 @@ def route_nets(
 
     Newly emitted copper becomes an obstacle for later connections in the same
     run (so two routed nets in one call stay DRC-clean against each other).
+
+    ADAPTIVE DETAILED GRID (see `_choose_grid`): each connection's window is
+    built at the coarsest-as-needed grid that keeps `cols * rows * n_layers`
+    within `_MAX_WINDOW_NODES` - `autorouter.grid_mm` (fine, 0.2 mm default)
+    when the window already fits, coarsening deterministically (a pure
+    function of span/layers/budget) up to `autorouter.max_grid_mm` (1.0 mm
+    default) only when it doesn't. This is what lets long-haul connections
+    (a bus, a power rail spanning most of the board) route at all instead of
+    failing `window_too_large` outright; short connections are unaffected -
+    same grid, same geometry as before. The chosen grid is reported per
+    connection as `grid_mm`. Coarsening the SEARCH grid never weakens safety:
+    `_self_check` proves the emitted geometry against all copper at exact
+    netclass clearance regardless of what grid found the path, so a coarse
+    path that skims an obstacle still fails self-check and is never emitted.
 
     STEP 4 (rip-up & reroute, negotiated congestion) IS ACTIVE. When a
     connection cannot route in its window, the window's obstacle cells are
@@ -3957,7 +4524,20 @@ def route_nets(
     board_path, project_file, _ = _pcb._resolve_project_path(project_path)
     settings = _pcb.load_pcb_settings(project_path)["config"]
     autor = settings.get("autorouter", {})
+    backend = _resolve_backend(settings)
+    # The node budget is INTENTIONALLY the same for both backends: it selects the
+    # detailed grid (`_choose_grid`), so an identical budget is what guarantees
+    # cpu and numpy pick the same grid and thus route-level bit-identical geometry
+    # (7.8 parity). A larger fine-grid window was measured NOT to help kiln (35/39
+    # unrouted connections are walled by foreign copper at clearance - a finer
+    # grid/larger window cannot create a DRC-legal corridor that does not exist),
+    # so raising it for numpy would only break parity and coarsening determinism
+    # for no completion gain. See _MAX_WINDOW_NODES.
+    max_window_nodes = _MAX_WINDOW_NODES
     grid = float(autor.get("grid_mm", 0.2)) or 0.2
+    max_grid_mm = float(autor.get("max_grid_mm", 1.0)) or 1.0
+    if max_grid_mm < grid:
+        max_grid_mm = grid
     base_margin = float(autor.get("search_window_margin_mm", 8.0)) or 8.0
     if max_ripup_iterations is None:
         max_ripup_iterations = int(autor.get("max_ripup_iterations", 5))
@@ -4016,8 +4596,16 @@ def route_nets(
         per net and cached; only `_parse_zones_cached`-sourced (KiCad-filled)
         components are considered - a net whose zone has not been filled yet
         (no `filled_polygon`) gets no plane moves (documented partial: the
-        7.5.2 "estimated" island fallback is NOT wired into routing)."""
+        7.5.2 "estimated" island fallback is NOT wired into routing).
+
+        POWER-NET GATE (user, 2026-07-24): filled zones are used for plane moves
+        ONLY for power/ground nets (`_net_kind == "power"`: GND, 3V3/3.3V, 5V,
+        12V, VCC/VDD, ... per `power_net_patterns`). A signal net that happens to
+        own a fill gets no plane moves and routes as ordinary copper - a filled
+        zone is never treated as routable plane for a signal net."""
         if net not in plane_fill_index:
+            return None
+        if _pcb._net_kind(net, None, power_patterns) != "power":
             return None
         cached = _plane_components_cache.get(net)
         if cached is not None:
@@ -4082,155 +4670,28 @@ def route_nets(
     tw = settings.get("trace_cost", {}).get("weights", {})
     board_min = (board_bbox[0], board_bbox[1])
 
-    def _finalize(net: str, win: _FineWindow, path: list[tuple[int, int, str]],
-                  from_xy: tuple[float, float], to_xy: tuple[float, float],
-                  active_obstacles: list[_Obst], margin: float,
-                  plane_layers: dict[str, list[dict[str, Any]]] | None = None,
-                  ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-        """Turn a fine A* path into (rec-updates, segments, vias, violations).
-        rec-updates is None when the exact self-check rejects the path."""
-        segments, vias = _route_to_emit(win, path, from_xy, to_xy, plane_layers)
-        violations = _self_check(net, segments, vias, active_obstacles, rules, via_radius)
-        if violations:
-            return None, segments, vias, violations
-        length = sum(math.hypot(s["x2"] - s["x1"], s["y2"] - s["y1"]) for s in segments)
-        layers_used = sorted({s["layer"] for s in segments},
-                             key=lambda l: routable_layers.index(l) if l in routable_layers else 999)
-        est_cost = (length * float(tw.get("length_mm", 1.0)) + len(vias) * float(tw.get("via", 5.0)))
-        rec_updates = {
-            "routed": True, "length_mm": round(length, 4), "via_count": len(vias),
-            "layers": layers_used, "segment_count": len(segments),
-            "window_margin_mm": margin, "est_phase6_cost": round(est_cost, 4),
-            "self_check": {"passed": True, "violation_count": 0},
-        }
-        return rec_updates, segments, vias, []
+    # -- 7.8 multi-core: bundle every immutable routing input into a picklable
+    #    context so ONE stateless search function serves both the serial worklist
+    #    and the spawned workers (see module-level `_route_one`). --------------- #
+    plane_by_net = {c["net"]: _plane_components_for(c["net"]) for c in conns}
+    ctx: dict[str, Any] = {
+        "power_patterns": power_patterns, "routable_layers": routable_layers,
+        "routable_set": routable_set, "layer_types": layer_types, "grid": grid,
+        "max_grid_mm": max_grid_mm, "max_window_nodes": max_window_nodes,
+        "base_margin": base_margin, "board_bbox": board_bbox, "board_min": board_min,
+        "coarse_grid": coarse_grid, "coarse_min": coarse_min, "backend": backend,
+        "plane_step": plane_step, "attachment_via_cost": attachment_via_cost,
+        "weights": weights, "layer_purpose": layer_purpose, "directions": directions,
+        "track_half": track_half, "via_radius": via_radius, "rules": rules,
+        "global_by_key": global_by_key, "tw": tw, "plane_by_net": plane_by_net,
+        "base_obstacles": obstacles,
+    }
 
     def _route_core(conn: dict[str, Any], owner: int, use_corridor: bool = True) -> dict[str, Any]:
-        """Window-doubling fine A* + self-check for ONE connection against the
-        current placements (and the shared congestion field). Emits nothing; the
-        outer worklist owns placement/rip-up. Returns the record plus the last
-        window and search parameters so step 4 can rip-up in-place.
-
-        `use_corridor=False` drops the global-stage corridor bias - used when a
-        RIPPED net re-routes, so its corridor choice is free to change (per spec)
-        instead of being pulled back toward the gap it just lost."""
-        net = conn["net"]
-        net_kind = _pcb._net_kind(net, None, power_patterns)
-        from_xy, to_xy = _conn_endpoints(conn)
-        gkey = (net, round(from_xy[0], 3), round(from_xy[1], 3),
-                round(to_xy[0], 3), round(to_xy[1], 3))
-        gconn = global_by_key.get(gkey)
-        home_layer = gconn.get("home_layer") if gconn else None
-        # Start/goal layers are the PRECISE contact-item layers (the copper that
-        # actually lives at from_point/to_point), not the whole island's layer
-        # set - otherwise the emitted trace can land on a layer the endpoint
-        # copper never reaches and float. Fall back to island, then all routable.
-        from_item_layers = (conn.get("from") or {}).get("layers") or conn.get("from_layers") or routable_layers
-        to_item_layers = (conn.get("to") or {}).get("layers") or conn.get("to_layers") or routable_layers
-        start_layers = [l for l in from_item_layers if l in routable_set] or routable_layers
-        goal_layers = set(l for l in to_item_layers if l in routable_set) or set(routable_layers)
-
-        # 7.5.4 plane-aware routing: only for a net that owns a zone. `to_xy`
-        # is tested against each own-fill component (grid-mm tolerance, since
-        # the goal is an off-grid pad/via position) - a hit means that exact
-        # component is ALREADY the goal's own copper, so reaching it anywhere
-        # completes the connection (see `_fine_astar`'s `is_goal`). Restricted
-        # to `layer in goal_layers`: the goal's OWN item must already be
-        # reachable on THAT plane layer (e.g. a same-layer pad/via, or a via
-        # that spans the plane layer, or the goal being another zone
-        # component of the same net) - this is what makes the relaxation
-        # electrically sound. It deliberately does NOT fire when the plane
-        # layer differs from every layer the goal's real copper occupies
-        # (e.g. a pad on B.Cu only, plane on In2.Cu only): reaching the plane
-        # there is not the same copper as the pad, and completing the
-        # connection still requires an actual via landing AT the goal's own
-        # cell - i.e. that "pad awaits a plane via" case is served by the
-        # cost model (cheap plane travel + attachment_via costing) only, not
-        # by this termination relaxation (documented partial - see the
-        # `route_nets` docstring / NETCLASS_PLAN 7.5.4 anchor).
-        plane_layers = _plane_components_for(net)
-        goal_planes: dict[str, list[dict[str, Any]]] | None = None
-        if plane_layers:
-            goal_planes = {}
-            for layer, comps in plane_layers.items():
-                if layer not in goal_layers:
-                    continue
-                hits = [c for c in comps if c["raster"].covers(to_xy[0], to_xy[1], grid)]
-                if hits:
-                    goal_planes[layer] = hits
-            if not goal_planes:
-                goal_planes = None
-
-        result_rec: dict[str, Any] = {
-            "net": net, "net_kind": net_kind,
-            "from_point": {"x": round(from_xy[0], 4), "y": round(from_xy[1], 4)},
-            "to_point": {"x": round(to_xy[0], 4), "y": round(to_xy[1], 4)},
-            "airline_length_mm": conn.get("airline_length_mm"),
-            "home_layer": home_layer, "routed": False,
-            "length_mm": 0.0, "via_count": 0, "layers": [],
-            "self_check": None, "failure": None,
-        }
-        out: dict[str, Any] = {
-            "routed": False, "net": net, "net_kind": net_kind, "rec": result_rec,
-            "segments": [], "vias": [], "win": None, "from_xy": from_xy, "to_xy": to_xy,
-            "s_cell": None, "g_cell": None, "start_layers": start_layers,
-            "goal_layers": goal_layers, "home_layer": home_layer, "corridor": None,
-            "plane_layers": plane_layers, "goal_planes": goal_planes,
-        }
-
-        active_obstacles = active_obstacles_for(owner)
-        margin = base_margin
-        win: _FineWindow | None = None
-        for _attempt in range(4):  # window doubling
-            minx = max(min(from_xy[0], to_xy[0]) - margin, board_bbox[0] - grid)
-            miny = max(min(from_xy[1], to_xy[1]) - margin, board_bbox[1] - grid)
-            maxx = min(max(from_xy[0], to_xy[0]) + margin, board_bbox[2] + grid)
-            maxy = min(max(from_xy[1], to_xy[1]) + margin, board_bbox[3] + grid)
-            win = _FineWindow(minx, miny, maxx, maxy, grid, routable_layers, layer_types, net)
-            if win.cols * win.rows * max(1, len(routable_layers)) > _MAX_WINDOW_NODES:
-                result_rec["failure"] = {"reason": "window_too_large",
-                                         "detail": f"window {win.cols}x{win.rows} exceeds node budget",
-                                         "window_margin_mm": margin}
-                out["win"] = None
-                return out
-            win.build(active_obstacles, track_half, via_radius, rules["clearance"], rules["edge_clearance"])
-            s_cell = win.nearest_free(from_xy[0], from_xy[1], start_layers) or win.cell_of(*from_xy)
-            g_cell = win.nearest_free(to_xy[0], to_xy[1], list(goal_layers)) or win.cell_of(*to_xy)
-            corridor = _corridor_from_global(win, gconn, coarse_grid, coarse_min) if use_corridor else None
-            win_cong = _project_congestion(win, congestion, board_min[0], board_min[1], grid)
-            out.update({"win": win, "s_cell": s_cell, "g_cell": g_cell,
-                        "corridor": corridor, "margin": margin,
-                        "active_obstacles": active_obstacles})
-
-            path = _fine_astar(win, net_kind, weights, layer_purpose, directions,
-                               s_cell, start_layers, g_cell, goal_layers,
-                               home_layer, corridor, win_cong,
-                               plane_layers, goal_planes, plane_step, attachment_via_cost)
-            if path is None:
-                if margin >= _MAX_WINDOW_SPAN_MM:
-                    break
-                margin = min(margin * 2.0, _MAX_WINDOW_SPAN_MM)
-                continue
-
-            rec_updates, segments, vias, violations = _finalize(
-                net, win, path, from_xy, to_xy, active_obstacles, margin, plane_layers)
-            if rec_updates is None:
-                result_rec["self_check"] = {"passed": False, "violations": violations[:8],
-                                            "violation_count": len(violations)}
-                result_rec["failure"] = {"reason": "self_check_failed",
-                                         "detail": "proposed copper clears the A* obstacle model "
-                                                   "but not the exact clearance pass (plane-skim); "
-                                                   "not demoted to rip-up"}
-                return out
-            result_rec.update(rec_updates)
-            out.update({"routed": True, "segments": segments, "vias": vias})
-            return out
-
-        # unreachable within the (doubled) window.
-        blocker = _nearest_blocker(win, active_obstacles, net, to_xy) if win is not None else None
-        result_rec["failure"] = {"reason": "unreachable_in_window",
-                                 "nearest_blocker": blocker, "window_margin_mm": margin}
-        return out
+        """Serial-path wrapper: route one connection against the CURRENT
+        placements + shared congestion, via the stateless module-level
+        `_route_one`. Byte-identical to the pre-7.8 in-lined search."""
+        return _route_one(ctx, conn, active_obstacles_for(owner), congestion, use_corridor)
 
     # -- negotiated-congestion worklist -------------------------------------- #
     from collections import deque
@@ -4264,7 +4725,28 @@ def route_nets(
         }
         failures.pop(owner, None)
 
-    pending: "deque[int]" = deque(range(n_conns))
+    # -- 7.8 Phase A: route the spatially-INDEPENDENT connections in parallel -- #
+    # A connection whose maximum-possible window is disjoint from every earlier
+    # connection's is provably unaffected by any other route (no earlier copper
+    # can enter its window at any doubling), so it can be routed against the base
+    # board concurrently and committed in canonical order — bit-identical to the
+    # serial worklist for ANY worker count. Everything else stays in the serial
+    # rip-up worklist below, which sees these placements.
+    workers = _resolve_workers(settings)
+    done_in_phase_a: set[int] = set()
+    indep = _independent_owner_set(owner_conns, _MAX_WINDOW_SPAN_MM) if (workers > 1 and n_conns > 1) else set()
+    if indep:
+        items = [(owner, owner_conns[owner]) for owner in sorted(indep)]
+        results = _run_independent_routes(ctx, items, workers)
+        for owner in sorted(results):  # commit in canonical order
+            res = results[owner]
+            if res["routed"]:
+                _place(owner, res["net"], res["segments"], res["vias"], res["rec"])
+            else:
+                failures[owner] = res["rec"]
+            done_in_phase_a.add(owner)
+
+    pending: "deque[int]" = deque(i for i in range(n_conns) if i not in done_in_phase_a)
     while pending:
         owner = pending.popleft()
         core = _route_core(owner_conns[owner], owner, use_corridor=owner not in rerouted)
@@ -4288,11 +4770,11 @@ def route_nets(
             for ob in rippable:
                 win.remove_obstacle(ob)
             win_cong = _project_congestion(win, congestion, board_min[0], board_min[1], grid)
-            free_path = _fine_astar(win, core["net_kind"], weights, layer_purpose, directions,
-                                    core["s_cell"], core["start_layers"], core["g_cell"],
-                                    core["goal_layers"], core["home_layer"], core["corridor"], win_cong,
-                                    core["plane_layers"], core["goal_planes"],
-                                    plane_step, attachment_via_cost)
+            free_path = _fine_search(backend, win, core["net_kind"], weights, layer_purpose, directions,
+                                     core["s_cell"], core["start_layers"], core["g_cell"],
+                                     core["goal_layers"], core["home_layer"], core["corridor"], win_cong,
+                                     core["plane_layers"], core["goal_planes"],
+                                     plane_step, attachment_via_cost)
             if free_path is not None:
                 via_nodes = _path_via_nodes(free_path)
                 blockers: set[int] = set()
@@ -4308,8 +4790,8 @@ def route_nets(
                     for oid, pl in placements.items():
                         if oid not in blockers:
                             keep_obs.extend(pl["obstacles"])
-                    rec_updates, segments, vias, violations = _finalize(
-                        core["net"], win, free_path, core["from_xy"], core["to_xy"],
+                    rec_updates, segments, vias, violations = _finalize_core(
+                        ctx, core["net"], win, free_path, core["from_xy"], core["to_xy"],
                         keep_obs, core.get("margin", base_margin), core["plane_layers"])
                     if rec_updates is not None:
                         ripup_iterations += 1
@@ -4588,6 +5070,354 @@ def route_board(
             "(quick=0, balanced=config default, best=20).",
         ],
     }
+
+
+# =========================================================================== #
+# Phase 7.16 - Benchmark harness: score the autorouter against a human-routed
+# board, honestly.
+#
+# `benchmark_autoroute(source_board, mode)` NEVER writes `source_board` - every
+# measurement and every route happens on a fresh scratch copy
+# (`_copy_project_to_scratch`). It is a thin orchestrator over the existing
+# tools (`get_ratsnest`, `route_board`, `get_trace_cost`) plus the kicad-cli
+# DRC gate already proven out in `tests/test_detailed_route.py` - no routing
+# or scoring logic is duplicated here.
+#
+# Two modes:
+#   complete_only    - measure the HUMAN board's score/unrouted count on the
+#                       untouched scratch copy, then route_board(write=True)
+#                       only what's missing, then report completion/added
+#                       copper/vias/post-score/DRC delta.
+#   strip_and_reroute - delete ALL non-zone copper (every top-level
+#                       segment/via/arc; zones/footprints/edge-cuts are
+#                       untouched) from the scratch copy, route_board from
+#                       zero, and compare to the HUMAN ORIGINAL (measured
+#                       before stripping, same project => identical weights)
+#                       on completion/length/vias/score/per-layer/DRC/runtime.
+# =========================================================================== #
+
+_BENCHMARK_MODES = ("complete_only", "strip_and_reroute")
+
+
+def _find_kicad_cli() -> str | None:
+    """Locate kicad-cli (PATH, then standard Windows install locations) -
+    same discovery logic as `tests/test_kicad_cli_acceptance.py` /
+    `tests/test_detailed_route.py`, duplicated here (not imported from tests)
+    so this module has no test-tree dependency."""
+    on_path = shutil.which("kicad-cli") or shutil.which("kicad-cli.exe")
+    if on_path:
+        return on_path
+    candidates = list(Path("C:/Program Files/KiCad").glob("*/bin/kicad-cli.exe"))
+    candidates += list(Path("C:/Program Files (x86)/KiCad").glob("*/bin/kicad-cli.exe"))
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        candidates += list(Path(local_appdata, "Programs", "KiCad").glob("*/bin/kicad-cli.exe"))
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _drc_violations(cli: str, board_path: Path, report_path: Path) -> list[dict[str, Any]] | None:
+    try:
+        subprocess.run(
+            [cli, "pcb", "drc", "--format", "json", "--severity-all", str(board_path), "-o", str(report_path)],
+            capture_output=True, text=True, timeout=180,
+        )
+        return json.loads(report_path.read_text(encoding="utf-8")).get("violations", [])
+    except Exception:  # pragma: no cover - defensive (missing/broken cli, timeout)
+        return None
+
+
+def _violation_sig(v: dict[str, Any]) -> tuple:
+    return (
+        v.get("type"),
+        v.get("severity"),
+        tuple(sorted(item.get("description", "") for item in v.get("items", []))),
+    )
+
+
+def _new_violations(baseline: list[dict[str, Any]], post: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Multiset difference: a post violation is NEW only if it isn't matched by
+    a baseline one of the same signature (type/severity/item descriptions) -
+    the same logic `test_kicad_cli_drc_no_new_violations` proved out."""
+    remaining: dict[tuple, int] = {}
+    for v in baseline:
+        sig = _violation_sig(v)
+        remaining[sig] = remaining.get(sig, 0) + 1
+    new: list[dict[str, Any]] = []
+    for v in post:
+        sig = _violation_sig(v)
+        if remaining.get(sig, 0) > 0:
+            remaining[sig] -= 1
+        else:
+            new.append(v)
+    return new
+
+
+def _drc_report(board_path: Path, report_dir: Path, tag: str) -> dict[str, Any]:
+    """Run the kicad-cli DRC gate, auto-skipping (not failing) when kicad-cli
+    isn't found anywhere on this machine."""
+    cli = _find_kicad_cli()
+    if cli is None:
+        return {"available": False, "violations": None, "violation_count": None}
+    violations = _drc_violations(cli, board_path, report_dir / f"drc_{tag}.json")
+    if violations is None:
+        return {"available": False, "violations": None, "violation_count": None}
+    return {"available": True, "violations": violations, "violation_count": len(violations)}
+
+
+def _copy_project_to_scratch(source_project: str | Path, scratch_dir: str | Path) -> Path:
+    """Copy the board/.kicad_pro/.net (+ pcb_settings.json / board_local.json,
+    when present) that `source_project` resolves to into `scratch_dir`, under
+    their original filenames. `source_project` is NEVER written - every file
+    handle this opens on it is read-only (`shutil.copy2`)."""
+    board_path, project_file, netlist_path = _pcb._resolve_project_path(source_project)
+    scratch_dir = Path(scratch_dir)
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    candidates = [
+        board_path,
+        project_file,
+        netlist_path,
+        board_path.parent / "pcb_settings.json",
+        board_path.with_name(f"{board_path.stem}.board_local.json"),
+    ]
+    for src in candidates:
+        if src.exists():
+            shutil.copy2(src, scratch_dir / src.name)
+    return scratch_dir
+
+
+def _layer_lengths_mm(project_path: str | Path) -> dict[str, float]:
+    """Copper length per layer (mm) - the per-layer utilization metric."""
+    board_path, _, _ = _pcb._resolve_project_path(project_path)
+    tracks = _pcb._parse_tracks_cached(board_path)
+    lengths: dict[str, float] = {}
+    for seg in tracks["segments"] + tracks["arcs"]:
+        lengths[seg["layer"]] = lengths.get(seg["layer"], 0.0) + seg["length"]
+    return {name: round(val, 3) for name, val in sorted(lengths.items())}
+
+
+def _strip_non_zone_copper(project_path: str | Path, write: bool = True) -> dict[str, Any]:
+    """Delete every top-level `(segment ...)`/`(via ...)`/`(arc ...)` block -
+    i.e. ALL non-zone copper. Zone fill polygons live inside their own
+    `(zone ...)` block, not as separate top-level segment/via/arc entries, so
+    this is a complete "strip everything except the pours" - footprints,
+    zones, and edge-cuts are never touched. `write=False` previews the count
+    without touching the board (mirrors `unroute_nets`' preview discipline)."""
+    board_path, _, _ = _pcb._resolve_project_path(project_path)
+    tracks = _pcb._parse_tracks_cached(board_path)
+    uuids = {t["uuid"] for t in tracks["segments"] + tracks["vias"] + tracks["arcs"] if t.get("uuid")}
+    removed = 0
+    if write and uuids:
+        text = _pcb._read_text(board_path)
+        text, removed = _delete_blocks_by_uuid(text, uuids)
+        with board_path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        _pcb._invalidate_board_cache(board_path)
+    return {"board_path": str(board_path), "candidates": len(uuids), "removed": removed, "written": write}
+
+
+def _score_comparison(human_total: float, post_total: float, label: str) -> dict[str, Any]:
+    delta_total = round(post_total - human_total, 3)
+    beat = delta_total <= 0
+    verdict = (
+        f"{label}: auto matched/beat human (post {post_total} <= human {human_total})"
+        if beat
+        else f"{label}: auto WORSE than human by {delta_total} (post {post_total} > human {human_total})"
+    )
+    return {
+        "human_score_total": human_total,
+        "post_score_total": post_total,
+        "delta_total": delta_total,
+        "matched_or_beat_human": beat,
+        "verdict": verdict,
+    }
+
+
+def _drc_comparison(baseline_drc: dict[str, Any], post_drc: dict[str, Any]) -> dict[str, Any]:
+    new_violation_count = None
+    new_violations = None
+    if baseline_drc["available"] and post_drc["available"]:
+        new_violations = _new_violations(baseline_drc["violations"], post_drc["violations"])
+        new_violation_count = len(new_violations)
+    return {
+        "baseline": {"available": baseline_drc["available"], "violation_count": baseline_drc["violation_count"]},
+        "post": {"available": post_drc["available"], "violation_count": post_drc["violation_count"]},
+        "new_violation_count": new_violation_count,
+        "new_violations": new_violations[:10] if new_violations else new_violations,
+    }
+
+
+def _benchmark_complete_only(scratch_path: Path, effort: str) -> dict[str, Any]:
+    board_path, _, _ = _pcb._resolve_project_path(scratch_path)
+
+    # HUMAN measurement: the untouched scratch copy, before auto touches it.
+    human_rats = get_ratsnest(scratch_path)
+    human_score = _pcb.get_trace_cost(scratch_path)["board_totals"]
+    human_layers = _layer_lengths_mm(scratch_path)
+    unrouted_before = human_rats["summary"]["total_connections"]
+    baseline_drc = _drc_report(board_path, scratch_path, "baseline")
+
+    t0 = time.perf_counter()
+    route_report = route_board(scratch_path, write=True, effort=effort)
+    runtime_seconds = round(time.perf_counter() - t0, 3)
+
+    post_score = _pcb.get_trace_cost(scratch_path)["board_totals"]
+    post_layers = _layer_lengths_mm(scratch_path)
+    post_rats = get_ratsnest(scratch_path)
+    post_drc = _drc_report(board_path, scratch_path, "post")
+
+    routed_count = route_report["routed"]
+    completion_pct = round(100.0 * routed_count / unrouted_before, 2) if unrouted_before else 100.0
+
+    return {
+        "effort": effort,
+        "runtime_seconds": runtime_seconds,
+        "human": {
+            "score": human_score,
+            "unrouted_connections_before": unrouted_before,
+            "airline_mm_before": human_rats["summary"]["total_airline_mm"],
+            "layer_lengths_mm": human_layers,
+        },
+        "auto": {
+            "routed": routed_count,
+            "failed": route_report["failed"],
+            "completion_pct": completion_pct,
+            "total_routed_length_mm": route_report["total_routed_length_mm"],
+            "vias_emitted": route_report["vias_emitted"],
+            "unrouted_connections_after": post_rats["summary"]["total_connections"],
+            "score": post_score,
+            "layer_lengths_mm": post_layers,
+        },
+        "drc": _drc_comparison(baseline_drc, post_drc),
+        "comparison": _score_comparison(human_score["total"], post_score["total"], "complete_only"),
+        "route_report": route_report,
+        "notes": [
+            "complete_only measures the human score BEFORE auto touches anything, "
+            "then routes only the connections the human left unrouted; the post "
+            "score therefore covers the human's own copper PLUS whatever the "
+            "autorouter added on top - a 'did the combined board get worse' "
+            "comparison, not a from-scratch replay (see strip_and_reroute for that).",
+        ],
+    }
+
+
+def _benchmark_strip_and_reroute(scratch_path: Path, effort: str) -> dict[str, Any]:
+    board_path, _, _ = _pcb._resolve_project_path(scratch_path)
+
+    # HUMAN ORIGINAL measurement, taken before any stripping.
+    human_score = _pcb.get_trace_cost(scratch_path)["board_totals"]
+    human_layers = _layer_lengths_mm(scratch_path)
+    baseline_drc = _drc_report(board_path, scratch_path, "baseline")
+
+    strip_report = _strip_non_zone_copper(scratch_path, write=True)
+    stripped_rats = get_ratsnest(scratch_path)
+    total_connections_needed = stripped_rats["summary"]["total_connections"]
+
+    t0 = time.perf_counter()
+    route_report = route_board(scratch_path, write=True, effort=effort)
+    runtime_seconds = round(time.perf_counter() - t0, 3)
+
+    post_score = _pcb.get_trace_cost(scratch_path)["board_totals"]
+    post_layers = _layer_lengths_mm(scratch_path)
+    post_rats = get_ratsnest(scratch_path)
+    post_drc = _drc_report(board_path, scratch_path, "post")
+
+    routed_count = route_report["routed"]
+    completion_pct = (
+        round(100.0 * routed_count / total_connections_needed, 2) if total_connections_needed else 100.0
+    )
+
+    return {
+        "effort": effort,
+        "runtime_seconds": runtime_seconds,
+        "strip": strip_report,
+        "human": {
+            "score": human_score,
+            "layer_lengths_mm": human_layers,
+        },
+        "auto": {
+            "routed": routed_count,
+            "failed": route_report["failed"],
+            "total_connections_needed": total_connections_needed,
+            "completion_pct": completion_pct,
+            "total_routed_length_mm": route_report["total_routed_length_mm"],
+            "vias_emitted": route_report["vias_emitted"],
+            "unrouted_connections_after": post_rats["summary"]["total_connections"],
+            "score": post_score,
+            "layer_lengths_mm": post_layers,
+        },
+        "drc": _drc_comparison(baseline_drc, post_drc),
+        "comparison": _score_comparison(human_score["total"], post_score["total"], "strip_and_reroute"),
+        "route_report": route_report,
+        "notes": [
+            "strip_and_reroute deletes ALL non-zone copper (every top-level "
+            "segment/via/arc) then routes the whole board from zero - a "
+            "from-scratch replay compared against the human original "
+            "(measured before stripping, same project/pcb_settings.json so "
+            "the Phase 6 weights are identical on both sides).",
+        ],
+    }
+
+
+def benchmark_autoroute(
+    source_board: str | Path,
+    mode: str = "complete_only",
+    effort: str = "balanced",
+    scratch_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Phase 7.16 - the benchmark harness: score `route_board` against a
+    human-routed board (the user-stated north star: "as well or better than
+    my hand-routed board", judged by the `get_trace_cost` board score).
+
+    `source_board` is NEVER written - it is only ever read through
+    `_copy_project_to_scratch`, which copies the whole project (board +
+    `.kicad_pro` + `.net` + `pcb_settings.json`/board-local state, when
+    present) into a fresh scratch directory (a new `tempfile.mkdtemp()` unless
+    `scratch_dir` is given) before anything measures or routes.
+
+    `mode="complete_only"` (default, the primary acceptance metric): the HUMAN
+    board's score/unrouted-connection count is measured on the untouched
+    scratch copy, then `route_board(write=True)` routes only what the human
+    left unrouted; reports completion %, copper length/vias added, the
+    post-route board score, and the kicad-cli DRC delta (baseline vs post,
+    new-violation count - auto-skipped, never failed, when kicad-cli isn't on
+    this machine).
+
+    `mode="strip_and_reroute"`: deletes ALL non-zone copper from the scratch
+    copy (every top-level segment/via/arc - zones/footprints/edge-cuts are
+    untouched), reroutes the whole board from zero, and compares the
+    rerouted board to the HUMAN ORIGINAL (measured before stripping) on
+    completion %, total length, via count, Phase 6 board score (identical
+    weights both sides - same project), per-layer copper utilization, DRC
+    violation count, and runtime.
+
+    Returns a hand-vs-auto comparison dict; `comparison.matched_or_beat_human`
+    (bool) and `comparison.verdict` (str) are the first-class pass/fail
+    fields callers should check first.
+    """
+    mode = (mode or "complete_only").lower()
+    if mode not in _BENCHMARK_MODES:
+        raise ValueError(f"mode must be one of {_BENCHMARK_MODES}; got {mode!r}")
+
+    source_board_path, _, _ = _pcb._resolve_project_path(source_board)
+    owns_scratch = scratch_dir is None
+    scratch_path = Path(scratch_dir) if scratch_dir else Path(tempfile.mkdtemp(prefix="kicad_benchmark_"))
+    _copy_project_to_scratch(source_board, scratch_path)
+    board_path, _, _ = _pcb._resolve_project_path(scratch_path)
+
+    if mode == "complete_only":
+        result = _benchmark_complete_only(scratch_path, effort=effort)
+    else:
+        result = _benchmark_strip_and_reroute(scratch_path, effort=effort)
+
+    result["command"] = "benchmark_autoroute"
+    result["mode"] = mode
+    result["source_board"] = str(source_board_path)
+    result["scratch_board"] = str(board_path)
+    result["scratch_owned"] = owns_scratch
+    return result
 
 
 # --------------------------------------------------------------------------- #

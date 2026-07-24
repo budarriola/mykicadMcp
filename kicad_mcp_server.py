@@ -97,6 +97,7 @@ except Exception as exc:  # pragma: no cover - import safety
 try:
     from kicad_router_tool import (
         audit_plane_islands,
+        benchmark_autoroute,
         get_drc_constraints,
         get_ratsnest,
         list_zones,
@@ -1121,6 +1122,49 @@ class KiCadMcpServer:
                 },
                 "handler": self._tool_unroute_nets,
             },
+            "benchmark_kicad_autoroute": {
+                "description": (
+                    "Phase 7.16 - score route_board against a human-routed board (the user's north star: "
+                    "'as well or better than my hand-routed board', judged by the get_kicad_trace_cost board "
+                    "score). NEVER writes source_board - it is only ever copied (board + .kicad_pro + .net + "
+                    "pcb_settings.json/board-local state, when present) into a fresh scratch directory before "
+                    "anything measures or routes. mode='complete_only' (default, primary acceptance metric): "
+                    "measures the HUMAN board's score/unrouted-connection count on the untouched scratch copy, "
+                    "then route_board(write=True) routes only what the human left unrouted, then reports "
+                    "completion %, copper length/vias added, the post-route board score, and the kicad-cli DRC "
+                    "delta (baseline vs post new-violation count; auto-skipped, never failed, when kicad-cli "
+                    "isn't on this machine). mode='strip_and_reroute': deletes ALL non-zone copper from the "
+                    "scratch copy (every top-level segment/via/arc - zones/footprints/edge-cuts untouched), "
+                    "reroutes the whole board from zero, and compares to the HUMAN ORIGINAL (measured before "
+                    "stripping) on completion %, length, vias, Phase 6 board score (identical weights both "
+                    "sides), per-layer utilization, DRC violation count, and runtime. Returns a hand-vs-auto "
+                    "comparison dict; comparison.matched_or_beat_human (bool) and comparison.verdict (str) are "
+                    "the first-class pass/fail fields. Full-kiln runs are slow (route_board detailed A* is "
+                    "pure-Python) - prefer a small project for quick checks."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "source_board": {"type": "string", "description": "Project path/directory to benchmark - never written."},
+                        "mode": {
+                            "type": "string",
+                            "enum": ["complete_only", "strip_and_reroute"],
+                            "default": "complete_only",
+                        },
+                        "effort": {
+                            "type": "string",
+                            "enum": ["quick", "balanced", "best"],
+                            "default": "balanced",
+                        },
+                        "scratch_dir": {
+                            "type": "string",
+                            "description": "Optional explicit scratch directory; omit for a fresh tempfile.mkdtemp().",
+                        },
+                    },
+                    "required": ["source_board"],
+                },
+                "handler": self._tool_benchmark_autoroute,
+            },
             "propose_kicad_netclass": {
                 "description": (
                     "Propose a net-class definition from a confirmed net list (a detect_kicad_buses "
@@ -1937,6 +1981,14 @@ class KiCadMcpServer:
             list(nets) if nets else None,
             write=bool(args.get("write", False)),
             allow_while_open=bool(args.get("allow_while_open", False)),
+        )
+
+    def _tool_benchmark_autoroute(self, args: dict[str, Any]) -> dict[str, Any]:
+        return benchmark_autoroute(
+            args["source_board"],
+            mode=str(args.get("mode", "complete_only")),
+            effort=str(args.get("effort", "balanced")),
+            scratch_dir=args.get("scratch_dir"),
         )
 
     def _tool_propose_netclass(self, args: dict[str, Any]) -> dict[str, Any]:
