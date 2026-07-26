@@ -2995,6 +2995,93 @@ def _choose_grid(span_x: float, span_y: float, n_layers: int,
     return grid
 
 
+# Tight window (mm) used by the escape-refinement attempts so the FINEST grid
+# fits a small window even when the base-margin window is too big for it - a
+# clearance-sealed pad breakout in a dense pin field needs a fine grid, not room.
+_ESCAPE_MARGIN_MM = 3.0
+
+
+def _route_attempts(
+    from_xy: tuple[float, float], to_xy: tuple[float, float],
+    board_bbox: tuple[float, float, float, float], base_grid: float,
+    min_grid: float, max_grid: float, base_margin: float, n_layers: int,
+    budget: int,
+) -> list[tuple[float, float]]:
+    """Ordered `(margin_mm, grid_mm)` attempts for one connection's windowed
+    detailed search.
+
+    The FIRST attempt is EXACTLY the legacy `(base_margin, adaptive-grid)` pair,
+    so every connection that already routes on attempt 1 is byte-identical - the
+    whole ladder below it only runs on FAILURE. The ladder interleaves two
+    orthogonal escapes from an `unreachable_in_window`:
+      * FINER grids (down to `min_grid`) - the real fix for a pad escape sealed
+        off by clearance inflation in a dense pin field: at 0.2 mm no grid node
+        lands in the sub-0.2 mm channel a hand route threads; a 0.1/0.05 mm grid
+        puts a node there. This is why widening the margin alone (the old loop)
+        never helped these - the block is LOCAL to the pad, not a lack of room.
+      * WIDER margins - the classic detour-room escape for a genuinely boxed
+        route, unchanged from before.
+    Every candidate whose node*layer count would exceed `budget` is dropped, so
+    a finer grid is only ever tried at a margin small enough to afford it (hence
+    the tight `_ESCAPE_MARGIN_MM` attempts, which let `min_grid` fit even when
+    the base-margin window cannot). Pure function of its inputs; deterministic."""
+    min_grid = max(min_grid, 1e-6)
+    base_grid = max(base_grid, min_grid)
+    max_grid = max(max_grid, base_grid)
+
+    def span(margin: float) -> tuple[float, float]:
+        minx = max(min(from_xy[0], to_xy[0]) - margin, board_bbox[0] - base_grid)
+        miny = max(min(from_xy[1], to_xy[1]) - margin, board_bbox[1] - base_grid)
+        maxx = min(max(from_xy[0], to_xy[0]) + margin, board_bbox[2] + base_grid)
+        maxy = min(max(from_xy[1], to_xy[1]) + margin, board_bbox[3] + base_grid)
+        return maxx - minx, maxy - miny
+
+    # margin schedule: base, 2x, 4x, ... up to the cap (the legacy doubling).
+    margins = [base_margin]
+    while margins[-1] < _MAX_WINDOW_SPAN_MM:
+        margins.append(min(margins[-1] * 2.0, _MAX_WINDOW_SPAN_MM))
+
+    attempts: list[tuple[float, float]] = []
+
+    def adaptive_at(margin: float) -> tuple[float, float]:
+        sx, sy = span(margin)
+        return (round(margin, 6), round(_choose_grid(sx, sy, n_layers, base_grid, max_grid, budget), 6))
+
+    def fine_at(margin: float) -> list[tuple[float, float]]:
+        """Grids FINER than base, down to `min_grid`, that fit `budget` at this
+        margin's span. Returns [] when none fit (e.g. a long net whose window is
+        large even at the tight margin) - so a fine grid is only ever tried where
+        it is cheap, and a failed fine search never explores a huge window."""
+        sx, sy = span(margin)
+        out: list[tuple[float, float]] = []
+        g = base_grid
+        while g > min_grid + 1e-9:
+            g = max(g / 2.0, min_grid)
+            if _window_node_count(sx, sy, g, n_layers) <= budget:
+                out.append((round(margin, 6), round(g, 6)))
+            else:
+                break
+        return out
+
+    # 1) legacy attempt 1 first (parity): base margin, adaptive grid.
+    attempts.append(adaptive_at(base_margin))
+    # 2) FINE-grid escapes at a TIGHT window - the dense-pad-breakout workhorse,
+    #    cheap because the window is small (and auto-skipped for long nets whose
+    #    window can't be small: fine_at returns [] when nothing fits the budget).
+    attempts.extend(fine_at(_ESCAPE_MARGIN_MM))
+    # 3) the classic wider-margin COARSE ladder (detour room for a boxed route).
+    for m in margins[1:]:
+        attempts.append(adaptive_at(m))
+
+    seen: set[tuple[float, float]] = set()
+    ordered: list[tuple[float, float]] = []
+    for a in attempts:
+        if a not in seen:
+            seen.add(a)
+            ordered.append(a)
+    return ordered
+
+
 def _resolve_route_rules(project_path: str | Path, settings: dict[str, Any]) -> dict[str, Any]:
     """Resolve the width / clearance / via geometry the router emits and checks
     against, honoring the 7.11 anchor's rule that clearance must not come from a
@@ -3054,17 +3141,26 @@ class _Obst:
     skipped by the caller (same-net copper is free)."""
 
     __slots__ = ("kind", "net", "layers", "half", "x1", "y1", "x2", "y2",
-                 "raster", "pts", "minx", "miny", "maxx", "maxy", "is_edge", "owner")
+                 "raster", "pts", "minx", "miny", "maxx", "maxy", "is_edge", "owner",
+                 "via_transparent")
 
     def __init__(self, kind: str, net: str, layers: frozenset[str], half: float,
                  x1: float, y1: float, x2: float, y2: float,
                  raster: "_FillRaster | None" = None, is_edge: bool = False,
                  pts: list[tuple[float, float]] | None = None,
-                 owner: int | None = None) -> None:
+                 owner: int | None = None, via_transparent: bool = False) -> None:
         self.kind = kind      # "seg" | "pt" | "zone" | "edge"
         self.net = net
         self.layers = layers
         self.half = half
+        # via_transparent: a foreign POWER/GND plane fill yields an ANTI-PAD around
+        # a via that crosses it, so it does NOT block a via by itself (it still
+        # blocks a same-layer TRACK). Set only for power/gnd zone fills - the
+        # physical reality that lets a signal net via through a plane, and the
+        # unlock for kiln's cross-layer control bus (see the plane-via findings in
+        # NETCLASS_PLAN.md). A real anti-pad is cut by KiCad on zone refill after
+        # the via is written, so writes MUST refill for DRC-clean output.
+        self.via_transparent = via_transparent
         # owner: None for existing/human board copper (NEVER ripped); an integer
         # connection id for autorouter-placed copper (rippable in step 4).
         self.owner = owner
@@ -3188,10 +3284,16 @@ def _edge_cut_segments(board_path: Path) -> list[tuple[float, float, float, floa
 
 
 def _collect_obstacles(board_path: Path, routable: set[str], all_cu: list[str],
-                       edge_clearance: float) -> list["_Obst"]:
+                       edge_clearance: float,
+                       power_patterns: list[str] | None = None) -> list["_Obst"]:
     """Every copper item on the board as an `_Obst` (segments/arcs, vias, pads,
     foreign zone fills) plus Edge.Cuts segments. Built once per board; the
-    per-connection window filters this list by bbox."""
+    per-connection window filters this list by bbox.
+
+    A foreign POWER/GND zone fill is tagged `via_transparent` (per
+    `power_patterns`): it blocks same-layer tracks but yields an anti-pad to a via
+    crossing it, so a signal net can via through a plane (see NETCLASS_PLAN.md
+    plane-via findings)."""
     tracks = _pcb._parse_tracks_cached(board_path)
     footprints = _pcb._parse_footprint_pads_cached(board_path)
     fills = _zone_fill_index_cached(board_path)
@@ -3219,12 +3321,14 @@ def _collect_obstacles(board_path: Path, routable: set[str], all_cu: list[str],
             obs.append(_Obst("pt", pad.get("net", ""), layers, _pad_reach(pad),
                              pos["x"], pos["y"], pos["x"], pos["y"]))
     for net_name, fill_list in fills.items():
+        is_plane = _pcb._net_kind(net_name, None, power_patterns) == "power"
         for zf in fill_list:
             if zf["layer"] not in routable:
                 continue
             obs.append(_Obst("zone", net_name, frozenset([zf["layer"]]), 0.0,
                              zf["pts"][0][0], zf["pts"][0][1], zf["pts"][0][0], zf["pts"][0][1],
-                             raster=zf.get("raster"), pts=zf["pts"]))
+                             raster=zf.get("raster"), pts=zf["pts"],
+                             via_transparent=is_plane))
     for (x1, y1, x2, y2) in _edge_cut_segments(board_path):
         obs.append(_Obst("edge", "", frozenset(all_cu), 0.0, x1, y1, x2, y2, is_edge=True))
     return obs
@@ -3414,6 +3518,9 @@ class _FineWindow:
         iy1 = min(self.rows - 1, int(math.ceil((ob.maxy + big - self.miny) / g)))
         if ix0 > ix1 or iy0 > iy1:
             return via_cells, track_cells
+        # A via_transparent obstacle (a power/gnd plane) yields an anti-pad to a
+        # crossing via, so it blocks TRACKS but never VIAS.
+        block_via = not ob.via_transparent
         ob_layers = [l for l in ob.layers if l in self.blocked_track]
         for l in ob_layers:
             track_cells.setdefault(l, set())
@@ -3434,13 +3541,13 @@ class _FineWindow:
                     assert ob.raster is not None
                     inside = ob.raster.covers(px, py, 0.0)
                     dmin = 0.0 if inside else zgrid.min_dist(px, py)
-                    if dmin < via_reach:
+                    if block_via and dmin < via_reach:
                         via_cells.add((ix, iy))
                     if dmin < track_reach:
                         for l in ob_layers:
                             track_cells[l].add((ix, iy))
                     continue
-                if ob.point_within(px, py, via_reach):
+                if block_via and ob.point_within(px, py, via_reach):
                     via_cells.add((ix, iy))
                 if ob.point_within(px, py, track_reach):
                     for l in ob_layers:
@@ -3968,6 +4075,12 @@ def _self_check(
                 violations.append({"kind": "segment", "layer": s["layer"],
                                    "against_net": ob.net, "against_kind": ob.kind,
                                    "required_mm": round(need, 4)})
+        if ob.via_transparent:
+            # a power/gnd plane yields an anti-pad to a crossing via - the plane
+            # copper is cut back around the via on KiCad refill, so a via is NOT a
+            # clearance violation against it (it still blocks tracks, checked
+            # above). Skip the via checks for this obstacle.
+            continue
         for v in vias:
             # a through via touches every routable layer; check against every
             # foreign obstacle regardless of the obstacle's own layer set.
@@ -4288,22 +4401,25 @@ def _route_one(
     plane_step = ctx["plane_step"]
     attachment_via_cost = ctx["attachment_via_cost"]
 
-    margin = ctx["base_margin"]
+    # Ordered (margin, grid) attempts: attempt 1 is the legacy (base_margin,
+    # adaptive-grid) pair (so any connection that already routes on it is
+    # byte-identical), then the on-FAILURE ladder of finer grids + wider margins.
+    attempts = _route_attempts(from_xy, to_xy, board_bbox, grid, ctx["min_grid_mm"],
+                               max_grid_mm, ctx["base_margin"], len(routable_layers),
+                               max_window_nodes)
     win: _FineWindow | None = None
-    for _attempt in range(4):  # window doubling
+    margin = ctx["base_margin"]
+    any_built = False
+    for (margin, win_grid) in attempts:
         minx = max(min(from_xy[0], to_xy[0]) - margin, board_bbox[0] - grid)
         miny = max(min(from_xy[1], to_xy[1]) - margin, board_bbox[1] - grid)
         maxx = min(max(from_xy[0], to_xy[0]) + margin, board_bbox[2] + grid)
         maxy = min(max(from_xy[1], to_xy[1]) + margin, board_bbox[3] + grid)
-        win_grid = _choose_grid(maxx - minx, maxy - miny, len(routable_layers),
-                                grid, max_grid_mm, max_window_nodes)
         win = _FineWindow(minx, miny, maxx, maxy, win_grid, routable_layers, layer_types, net)
         if win.cols * win.rows * max(1, len(routable_layers)) > max_window_nodes:
-            result_rec["failure"] = {"reason": "window_too_large",
-                                     "detail": f"window {win.cols}x{win.rows} exceeds node budget",
-                                     "window_margin_mm": margin, "grid_mm": win_grid}
-            out["win"] = None
-            return out
+            win = None
+            continue  # over budget at this (margin, grid) - a tighter/coarser one may fit
+        any_built = True
         win.build(active_obstacles, track_half, via_radius, rules["clearance"], rules["edge_clearance"])
         s_cell = win.nearest_free(from_xy[0], from_xy[1], start_layers) or win.cell_of(*from_xy)
         g_cell = win.nearest_free(to_xy[0], to_xy[1], list(goal_layers)) or win.cell_of(*to_xy)
@@ -4318,14 +4434,16 @@ def _route_one(
                             home_layer, corridor, win_cong,
                             plane_layers, goal_planes, plane_step, attachment_via_cost)
         if path is None:
-            if margin >= _MAX_WINDOW_SPAN_MM:
-                break
-            margin = min(margin * 2.0, _MAX_WINDOW_SPAN_MM)
-            continue
+            continue  # unreachable at this (margin, grid) - try the next ladder rung
 
         rec_updates, segments, vias, violations = _finalize_core(
             ctx, net, win, path, from_xy, to_xy, active_obstacles, margin, plane_layers)
         if rec_updates is None:
+            # A path cleared the A* obstacle model but not the exact clearance
+            # pass (a plane-skim). Terminal (not demoted to rip-up, a known
+            # simplification): measured that a finer ladder rung does NOT clear it
+            # - the skim is against real copper the route must pass close to, so
+            # continuing only adds latency. The proper fix is rip-up demotion.
             result_rec["self_check"] = {"passed": False, "violations": violations[:8],
                                         "violation_count": len(violations)}
             result_rec["failure"] = {"reason": "self_check_failed",
@@ -4337,7 +4455,17 @@ def _route_one(
         out.update({"routed": True, "segments": segments, "vias": vias})
         return out
 
-    # unreachable within the (doubled) window.
+    if not any_built:
+        # every attempted window exceeded the node budget - the pathological
+        # large window (nothing was ever searched).
+        result_rec["failure"] = {"reason": "window_too_large",
+                                 "detail": "window exceeds node budget at every attempted grid",
+                                 "window_margin_mm": margin,
+                                 "grid_mm": attempts[0][1] if attempts else None}
+        out["win"] = None
+        return out
+
+    # unreachable within every attempted window/grid (finest grid included).
     blocker = _nearest_blocker(win, active_obstacles, net, to_xy) if win is not None else None
     result_rec["failure"] = {"reason": "unreachable_in_window",
                              "nearest_blocker": blocker, "window_margin_mm": margin}
@@ -4444,6 +4572,7 @@ def route_nets(
     write: bool = False,
     allow_while_open: bool = False,
     max_ripup_iterations: int | None = None,
+    refill_zones: bool = False,
 ) -> dict[str, Any]:
     """Phase 7.3b detailed (fine, windowed) routing.
 
@@ -4528,16 +4657,20 @@ def route_nets(
     # The node budget is INTENTIONALLY the same for both backends: it selects the
     # detailed grid (`_choose_grid`), so an identical budget is what guarantees
     # cpu and numpy pick the same grid and thus route-level bit-identical geometry
-    # (7.8 parity). A larger fine-grid window was measured NOT to help kiln (35/39
-    # unrouted connections are walled by foreign copper at clearance - a finer
-    # grid/larger window cannot create a DRC-legal corridor that does not exist),
-    # so raising it for numpy would only break parity and coarsening determinism
-    # for no completion gain. See _MAX_WINDOW_NODES.
+    # (7.8 parity). NOTE: a larger WINDOW (wider margin) at the same grid was
+    # confirmed NOT to help kiln - most unrouted connections are a pad escape
+    # sealed by clearance-inflated foreign copper LOCAL to the pad, not a lack of
+    # room. The fix is a FINER grid (`min_grid_mm`), which places a node in the
+    # sub-0.2 mm channel a hand route threads; the `_route_attempts` ladder tries
+    # those on failure. See _MAX_WINDOW_NODES / `_route_attempts`.
     max_window_nodes = _MAX_WINDOW_NODES
     grid = float(autor.get("grid_mm", 0.2)) or 0.2
     max_grid_mm = float(autor.get("max_grid_mm", 1.0)) or 1.0
     if max_grid_mm < grid:
         max_grid_mm = grid
+    min_grid_mm = float(autor.get("min_grid_mm", 0.05)) or 0.05
+    if min_grid_mm > grid:      # a "finer" floor can never be coarser than base
+        min_grid_mm = grid
     base_margin = float(autor.get("search_window_margin_mm", 8.0)) or 8.0
     if max_ripup_iterations is None:
         max_ripup_iterations = int(autor.get("max_ripup_iterations", 5))
@@ -4572,7 +4705,8 @@ def route_nets(
             layer_types.setdefault(name, "signal")
     routable_set = set(routable_layers)
 
-    obstacles = _collect_obstacles(board_path, routable_set, all_cu, rules["edge_clearance"])
+    obstacles = _collect_obstacles(board_path, routable_set, all_cu, rules["edge_clearance"],
+                                   power_patterns)
     board_bbox = _board_bbox(board_path)
 
     # -- 7.5.4 plane-aware routing: per-net own-fill components + costs ------ #
@@ -4677,7 +4811,8 @@ def route_nets(
     ctx: dict[str, Any] = {
         "power_patterns": power_patterns, "routable_layers": routable_layers,
         "routable_set": routable_set, "layer_types": layer_types, "grid": grid,
-        "max_grid_mm": max_grid_mm, "max_window_nodes": max_window_nodes,
+        "max_grid_mm": max_grid_mm, "min_grid_mm": min_grid_mm,
+        "max_window_nodes": max_window_nodes,
         "base_margin": base_margin, "board_bbox": board_bbox, "board_min": board_min,
         "coarse_grid": coarse_grid, "coarse_min": coarse_min, "backend": backend,
         "plane_step": plane_step, "attachment_via_cost": attachment_via_cost,
@@ -4872,11 +5007,19 @@ def route_nets(
         _pcb.save_board_local(project_path, data)
         written = True
 
+    # Plane-crossing vias/traces need KiCad to cut the real anti-pad/clearance
+    # void in the pours (the `via_transparent` model assumes it). Opt-in so byte-
+    # exact tests and the no-via case stay untouched; auto-skips without kicad-cli.
+    refill = None
+    if written and refill_zones:
+        refill = refill_zones_with_kicad(board_path)
+
     return {
         "board_path": str(board_path),
         "grid_mm": grid,
         "write": write,
         "written": written,
+        "refill": refill,
         "rules": rules,
         "max_ripup_iterations": max_ripup_iterations,
         "ripup_active": True,
@@ -5116,6 +5259,34 @@ def _find_kicad_cli() -> str | None:
         if candidate.exists():
             return str(candidate)
     return None
+
+
+def refill_zones_with_kicad(board_path: str | Path, timeout: int = 180) -> dict[str, Any]:
+    """Recompute ALL zone fills authoritatively with KiCad and save the board -
+    `kicad-cli pcb drc --refill-zones --save-board` (the CLI refills as a side
+    effect of DRC and writes the board back). This is REQUIRED after a write that
+    places plane-crossing vias or traces near a plane: KiCad cuts the real
+    anti-pad / clearance void around the new copper so the board is DRC-clean (the
+    router's `via_transparent` model assumes this refill happens - see the
+    plane-via findings in NETCLASS_PLAN.md). Auto-SKIPS (never raises) when
+    kicad-cli is absent, so a box without KiCad still routes (the raw board then
+    carries fills that overlap the new vias until a manual refill)."""
+    board_path = Path(board_path)
+    cli = _find_kicad_cli()
+    if cli is None:
+        return {"refilled": False, "reason": "kicad-cli not found"}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            report = Path(td) / "refill_drc.json"
+            proc = subprocess.run(
+                [cli, "pcb", "drc", "--refill-zones", "--save-board",
+                 "--format", "json", "-o", str(report), str(board_path)],
+                capture_output=True, text=True, timeout=timeout,
+            )
+        _pcb._invalidate_board_cache(board_path)
+        return {"refilled": proc.returncode == 0, "returncode": proc.returncode}
+    except Exception as exc:  # pragma: no cover - defensive (broken cli, timeout)
+        return {"refilled": False, "reason": str(exc)}
 
 
 def _drc_violations(cli: str, board_path: Path, report_path: Path) -> list[dict[str, Any]] | None:

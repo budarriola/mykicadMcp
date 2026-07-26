@@ -35,7 +35,7 @@ For whoever (human or AI) picks this up next:
   M0 and M1 are fully done (docs page `10-netclasses-and-buses.md` — note:
   verify tool counts by instantiating `KiCadMcpServer`, not by grepping; a
   grep-count once came back wrong).
-  **83 MCP tools registered; full 195-test pytest suite green** (1 slow
+  **83 MCP tools registered; full 201-test pytest suite green** (1 slow
   real-kiln benchmark skipped unless `KICAD_BENCHMARK_REAL=1`; fixtures,
   golden parser tests, writer round-trip, synthetic board/project
   + multi-drop SPI generators, kicad-cli acceptance, corridor/deviation,
@@ -186,6 +186,57 @@ For whoever (human or AI) picks this up next:
   this file.
 
 ## ⭐ Real-board routing findings & the hand-routed baseline (2026-07-24)
+
+> **⭐⭐ ROOT-CAUSE DATA for `unreachable_in_window` (measured 2026-07-24, by
+> tapping `_fine_search` on the real board — this SUPERSEDES the earlier guess
+> that "a finer grid cannot create a corridor that does not exist").** Two
+> distinct, quantified causes — NOT a single window-size limit:
+>
+> 1. **Sealed pad escape at the 0.2 mm grid (FIXED, partially).** Many short
+>    connections (MOSI 0.19 mm airline, IC2-FB 0.69 mm, several 3.3V ~2 mm) failed
+>    because at 0.2 mm NO grid node lands in the sub-0.2 mm channel between
+>    clearance-inflated neighbours — measured: IC2-FB start had **1** reachable
+>    node, 3.3v_Safty **3**. Hand routing threads these off-grid. **Fix landed:
+>    the `_route_attempts` grid-refinement ladder** (finer grids down to
+>    `min_grid_mm`=0.05 at a tight window, on failure only, attempt-1 preserved so
+>    all passing routes stay byte-identical). Proven: MOSI now routes at 0.05 mm
+>    (full board 4→5). Widening the margin — the OLD retry — never helped these
+>    (the block is LOCAL to the pad, not a lack of room).
+>
+> 2. **⭐ THE BIG LEVER — vias can't cross the inner/bottom PLANES (FIXED
+>    2026-07-24).** Measured for CLK at 0.05 mm: F.Cu is 8825/18904 nodes free, but
+>    **In1.Cu & In2.Cu are ~96% solid copper and B.Cu ~97%** (GND/power plane
+>    pours), and only **104/18904 nodes were via-able** — the obstacle model
+>    treated a plane fill as solid copper blocking the via everywhere, so every
+>    cross-layer signal net (CLK, CS0/1/2, MISO, SCL, SDA, DataToSafty/FromSafty,
+>    Fault) that must go F.Cu→B.Cu was `unreachable`. In reality a signal via
+>    punches an **anti-pad** through a GND/power plane (how the hand board crosses
+>    layers). **Fix landed: the plane-via anti-pad model** — a foreign power/gnd
+>    ZONE fill is tagged `via_transparent` (`_collect_obstacles`), so `_Obst` /
+>    `_FineWindow.obstacle_cells` skip VIA-blocking for it (still block same-layer
+>    tracks) and `_self_check` skips via-vs-plane clearance. Unit-tested in
+>    `tests/test_plane_via.py` (5 tests). **Writes must refill:** the
+>    `refill_zones_with_kicad(board_path)` helper (`kicad-cli pcb drc
+>    --refill-zones --save-board`, auto-skips without cli) is wired to
+>    `route_nets(..., refill_zones=True)` — opt-in so byte-exact/no-via tests stay
+>    untouched, but REQUIRED for a DRC-clean written board so KiCad cuts the real
+>    anti-pad around each plane-crossing via.
+>
+>    **COMBINED RESULT (finer grid + plane-via): full-board completion 4 → 10
+>    routed** (preview, `route_nets` on kiln, 2026-07-24). CLK/MOSI now route at
+>    the coarse 0.2 mm grid (plane-via alone), 3.3v_Safty at 0.1 mm (needs both).
+>    Remaining: 6 `self_check_failed` (plane-via route found but skims real copper
+>    at every grid — needs rip-up demotion, a known TODO, NOT a finer grid: that
+>    was measured to not help and only add latency), + long inter-module nets
+>    (item 3) + a few genuinely-sealed pads (SDA, IC2-FB, U6-BIAS: pad ringed by
+>    hand copper, ≤3 reachable nodes — need rip-up of hand copper, which we never
+>    do).
+>
+> 3. **Long inter-module nets (40–113 mm: DataToSafty, Fault, thermoFault, estop,
+>    saftyRelay, 5V/12V spans) remain `unreachable`** at the coarse grid their huge
+>    windows force — the genuine large-window case, deferred to hierarchical
+>    windowing / multilevel global routing (7.8 GPU/M5 batched fields), NOT the
+>    per-window numpy wavefront (which is slower there, see the 7.8 anchor).
 
 > **ENABLER found 2026-07-24 (user suggestion, PROVEN): KiCad can fill zones and
 > run DRC headlessly — use it as the authority instead of estimating.**
@@ -372,15 +423,18 @@ router work):
   grid, (3) ✅ zone-distance perf, (4) ✅ Phase 7.8 (numpy parity tier +
   multi-core independent-connection routing; parity suite is the gate) — LANDED
   2026-07-24, premise-corrected (numpy backend is NOT the fine-grid lever;
-  multi-core is the delivered win). **NOW (5): the fine-grid PATHFINDING revisit**
-  — the still-open `unreachable_in_window` fix, via a smarter search/window
-  strategy (fine grid only near pads, hierarchical windows, or a plane-aware
-  admissible heuristic), NOT more vectorization. This is the prerequisite for
-  beating 8552.276, and is Opus-permitted. Bounded Sonnet quality fixes still
-  available in parallel where they don't touch the search: the power-net fill
-  gate, KiCad-refill/netlist-regen integration, plane-via (defect #3, the 1 DRC
-  violation), and geometry simplification (defect #2). `benchmark` is the
-  standing gate throughout.
+  multi-core is the delivered win). (5) ✅ **Routing-capability revisit — LANDED
+  2026-07-24: the `_route_attempts` finer-grid ladder (sealed pad escapes) + the
+  plane-via anti-pad model (cross-layer signal nets via through planes). Full-board
+  completion 4 → 10 routed.** (See the ROOT-CAUSE DATA block above for the measured
+  mechanism and residuals.) **NOW (6): the remaining completion gaps, in
+  descending value:** (a) **rip-up demotion for `self_check_failed`** (6 nets — a
+  plane-via route is found but skims real copper; demote to the rip-up loop
+  instead of failing hard — measured that a finer grid does NOT clear these); (b)
+  **hierarchical / multilevel windowing for the long inter-module nets** (40–113
+  mm, coarse-grid `unreachable`); (c) the genuinely-sealed pads need rip-up of
+  hand copper (which we never do) — accept or flag. THEN quality/score work vs
+  8552.276. `benchmark` is the standing gate throughout.
 
 ## How to work this plan (living document — keep it current)
 
