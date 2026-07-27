@@ -623,6 +623,29 @@ router work):
   IMPLEMENTED" despite landing 2026-07-23/2026-07-24 respectively (Haiku docs
   pass, coordinator-merged with one mechanical conflict against the
   concurrent 7.12-mention docs pass — same paragraphs, no logic conflict).
+  (17) ✅ **Phase 7.6 whole-board optimizer CORE — LANDED 2026-07-27** (Opus
+  subagent — explicit standing authorization for this specific work per the
+  2026-07-24 user decision below; worktree-isolated; coordinator did a full
+  independent code read-through plus its own from-scratch test runs, not just
+  a report review, given this is the largest single delegation in the plan so
+  far). See the 7.6 anchor for the full write-up: all six move types
+  implemented (five as specced, one — layer swap — honestly reinterpreted
+  since no per-net home-layer override exists in the router), greedy + SA
+  acceptance, resumable checkpointed sessions with RNG-state round-tripping so
+  chunked and one-shot runs decide identically. 89 tools (was 87). 28 new
+  tests, full suite 247→275 passed, same 7 pre-existing board-drift failures,
+  7 skipped. Human copper and the six hand-made zones are safe by construction
+  (the optimizer never bypasses `unroute_nets`'/`modify_plane`'s own ownership
+  guards, adds no new check of its own). **Deliberately deferred to a
+  follow-up delegation:** Phase 7.7 in full (the AI-decision-pause protocol,
+  `decide_kicad_route`, `awaiting_decision` state) — a test guards that
+  `decide_kicad_route` stays unregistered rather than half-built. Also this
+  session's stale-cross-reference sweep found and fixed several other places
+  in this file that still described rip-up/plane-aware-routing/7.5.5/7.8 as
+  pending when they had already landed (the MCP tool summary table and build
+  order items 12-16) — a reminder that "How to work this plan"'s
+  cross-reference-sync rule needs to be followed more consistently going
+  forward, not just applied to the newest landing.
 
 ## How to work this plan (living document — keep it current)
 
@@ -1489,52 +1512,109 @@ and removed stitching is re-placed by the final stitching pass anyway.
 Knobs `stitching`: `{target_spacing_mm: 5.0, near_high_speed_mm: 1.0,
 near_high_speed_pitch_mm: 2.0, enabled: true}`.
 
-### 7.6 Iterative whole-board optimization (`optimize_kicad_board`)
+### 7.6 CORE — LANDED 2026-07-27 (reference anchor; 7.7's decision layer still open, see below)
 
-The "make the best board" loop. Board score
-`S = Σ net trace cost (Phase 6, incl. layer-purpose penalties) + Σ plane costs
-(7.5.3) + unrouted_penalty x unrouted_count` — one number, every term already
-defined in `pcb_settings.json`, so "best" is exactly what the JSON says it is.
+Implemented in new module `kicad_optimizer_tool.py` (1075 lines; Opus subagent
+— explicit standing authorization per the 2026-07-24 user decision recorded
+below, worktree-isolated, coordinator-reviewed including independent re-runs
+of the full suite and the new test file, merged fast-forward). `score_board`
+computes exactly the specced `S` (`get_trace_cost` board total + `audit_plane_
+islands` total island cost + `unrouted_penalty × unrouted_count` from
+`get_ratsnest`); `_ranked_nets` ranks every cost contributor worst-first
+(routed nets at trace cost, unrouted nets at their penalty — the plan's
+"rank nets/planes by cost contribution" step). Each iteration generates up to
+`_MAX_CANDIDATES_PER_ITERATION` (6, an implementation cost bound, not a
+settings field) candidates across all six move types, scores each on its own
+trial, and accepts the best per `optimizer.accept` (`greedy` strict-improvement
+only, or `sa` with `exp(-ΔS/T)` / `T *= sa_cooling`).
 
-**Loop** (knobs under `optimizer` in 6.1): all iteration happens on an **in-memory
-board model** — the file is untouched until the final confirmed write.
-1. Build model (copper, planes, ratsnest), score `S0`.
-2. Each iteration: rank nets/planes by cost contribution; take the `worst_k` and
-   generate candidate **moves**:
-   (a) rip-up + reroute a worst net (new order / perturbed congestion costs),
-   (b) reroute a bus bundle together along its Phase 5 corridor,
-   (c) swap a routed net's layer assignment (layer-purpose driven),
-   (d) add stitching vias to an island (each directly cheapens `island_base / N`),
-   (e) `propose_kicad_plane` for a power net whose trace cost exceeds
-       `create_plane` + projected plane cost,
-   (f) move/resize an **autorouter-owned** zone outline.
-3. Score each candidate; accept per `accept` policy — `greedy` (only improvements)
-   or `sa` (simulated annealing: worse moves accepted with probability
-   `exp(-ΔS/T)`, `T *= sa_cooling` per iteration — escapes local minima like
-   "every GND trace individually cheap but a plane would beat them all").
-4. Stop on `max_iterations`, `time_budget_s`, or improvement < `convergence_delta`.
-5. Result: per-iteration score curve, final `S`, the full move list, and a
-   dry-run diff of every board change. `write=True` applies the best state only
-   (segments/vias/zones), records everything in `autorouter_owned`, and reminds:
-   refill zones + run DRC in KiCad.
+**Architecture deviation from the original text, approved as the sane reading
+of the actual requirement:** "in-memory board model" is implemented as a
+**private scratch copy of the whole project** (the same pattern
+`benchmark_autoroute` already uses), not a parallel in-memory zones/tracks/
+vias representation — building the latter would fork every existing
+uuid-anchored s-expr writer (`route_nets`, `unroute_nets`, `create_plane`,
+`modify_plane`) into a file path and a memory path, duplicating exactly the
+logic this whole plan has avoided duplicating everywhere else. The real board
+file is opened read-only once, at session creation (to copy it), and is never
+touched again until an explicit `write=True`; every move calls the SAME
+writers real routing/plane calls use, so human-copper safety and the
+six-hand-made-zones restriction come for free from `unroute_nets`'s
+`autorouter_owned`-only deletion and `modify_plane`'s ownership refusal — the
+optimizer adds no new safety check of its own, it simply never bypasses the
+existing ones.
 
-Rip-up/move constraints are inherited from 7.3/7.5: human copper and the six
-hand-made zones are read-only inputs; `seed` makes runs reproducible; the session
-(score curve, best-S, owned uuids) persists in the board-local JSON so a later run
-resumes instead of thrashing.
+**Move-by-move status — five fully implemented as specced, one narrowed with
+the gap documented in-code:**
+- (a) rip-up + reroute, (b) bundle reroute (genuinely corridor-aware — members
+  route in ONE `route_nets` call so the global stage's existing `off_corridor`
+  cost applies), (e) create plane, (f) modify plane (zone-outline perturbation
+  is a centroid scale, not a cost-derived reshape — deriving an optimal
+  outline analytically is out of scope) are full, direct reuse of already-
+  landed tools.
+- (c) layer swap: there is no per-net home-layer override anywhere in the
+  router (home layer is *derived* by `_dominant_layer`), so "swap a routed
+  net's layer" is expressed by temporarily multiplying the net's current
+  dominant-layer-type purpose weight ×6 in the TRIAL's own
+  `pcb_settings.json`, rerouting, then restoring the real weights before
+  scoring (a test asserts the restore) — an honest reinterpretation of
+  "layer-purpose driven," not a shortcut.
+- (d) stitching via: required the ONE genuinely new piece of board surgery in
+  this landing, `_place_stitching_via` (a bare via outside any route — nothing
+  else on the board ever emits one), reusing the router's own via-block
+  serializer/ownership recording. Placed exactly where `audit_plane_islands`
+  already computes `suggested_stitching_via`; does not re-run `_self_check`
+  clearance proof (the suggested point is by construction inside the island's
+  own same-net pour), same "needs a KiCad refill + DRC pass" caveat as every
+  other writer here.
 
-**Sessions, not marathons.** One MCP call must never run the whole optimization —
-it would blow tool timeouts and give the caller no control. `optimize_kicad_board`
-is **resumable**: each call runs a bounded chunk (N iterations or a decision pause,
-whichever first) and returns
-`{session_id, state: "running" | "awaiting_decision" | "converged" | "budget_exhausted",
-score_curve, pending_decision?}`. Session state (RNG state, iteration, in-memory
-model diff, decision log) checkpoints to the board-local JSON, so a session
-survives MCP restarts and is inspectable via `get_kicad_route_session`. The final
-`write=True` still only happens on an explicit confirmed call. `route_kicad_nets`
-rides the **same session mechanism** whenever a job exceeds one call's budget (a
-big board's full ratsnest) — a plain small route completes in one call and never
-mentions sessions, but chunking/resume/cancel is one implementation, not two.
+**Sessions:** `optimize_board` runs a bounded chunk (`max_iterations_per_call`
+or `max_seconds`, whichever binds first) and returns `{session_id, state,
+score_curve, moves, diff}` — **three states, not the specced four**
+(`running`/`converged`/`budget_exhausted`; `awaiting_decision` is 7.7's, not
+built — see below). ALL loop state, including the RNG state itself, round-
+trips through the board-local JSON checkpoint (`optimizer_sessions`), which is
+what makes a chunked run and a single big-budget run decide identically (the
+call boundary is not an input to any decision — proven by a dedicated test).
+`get_kicad_route_session` reports a session read-only without advancing it.
+`write=True` copies the scratch board's final accepted state onto the real
+board (not a replay of individual moves — the scratch board IS the state that
+was scored) and merges its `autorouter_owned` into the real board-local state;
+it refuses while `running` or if the real board's fingerprint (size+mtime)
+changed since the session started.
+
+**Deliberately out of scope, tracked for a follow-up delegation (per the
+plan's own stated strategy — "7.6/7.7 are separate delegations, each landed
+and reviewed before the next"):** Phase 7.7 in full — the `awaiting_decision`
+state, `decide_kicad_route`, and `optimizer.ai_decisions` (present in the
+settings schema, never read). A test explicitly guards that `decide_kicad_
+route` stays unregistered rather than half-built. Also NOT done: the "`route_
+kicad_nets` rides the same session mechanism" aspiration from the original
+text — `route_nets` still completes in one call with its own chunking-free
+worklist; unifying it with the optimizer's session mechanism was not
+attempted and is not required for 7.6 to function.
+
+89 tools (was 87 — `optimize_kicad_board`, `get_kicad_route_session`). 28 new
+tests in `tests/test_optimizer.py` (score curve non-increasing under greedy;
+dry-run byte-identical board across a whole session; write applies final
+state + immediate re-convergence; determinism from seed incl. chunked-vs-
+one-call equivalence; session reporting at every state; human copper and
+hand-made zones untouched on a fixture that has both; all six moves
+independently reachable; the 7.7-absence guard). Full suite (independently
+re-run by the coordinator, not just trusted from the subagent report):
+247→275 passed, same 7 pre-existing board-drift failures, 7 skipped.
+
+**Residuals noted by the implementer, accepted:** scratch temp directories are
+never reaped (deliberate — a session must survive to be resumed later — but
+they accumulate under the OS temp dir across sessions); each candidate's
+`route_nets` call spawns its own worker pool (nested-parallelism is harmless
+today — full-suite runtime was unchanged — but is arguably the wrong level for
+future tuning); `route_board`'s `pipeline.whole_board_optimization` still
+reports `"not_implemented (Phase 7.6, M4)"`, which is literally true (7.6 is
+its own tool, not wired into that orchestrator) but reads as more stale than
+it is now — left alone since an existing test
+(`test_route_board_pipeline_hooks_declared_not_faked`) asserts that exact
+string and changing it is a docs/plan judgment call, not a code one.
 
 ### 7.7 AI-in-the-loop routing decisions (high-level, between designated options)
 
@@ -2253,19 +2333,15 @@ session (which also owns all user-facing verification questions):
 ## MCP tool summary (new group: "net classes & buses")
 
 Registered-and-landed rows are removed from this table per "How to work this
-plan"; `detect_kicad_connectors` (7.14 detection) landed 2026-07-23 and is
-gone. `route_kicad_nets`/`unroute_kicad_nets` are registered but `route_nets`
-is still partial (no rip-up/plane/neck-down — see the 7.3b stage-2 anchor), so
-they stay listed until 7.3b closes.
+plan". `route_kicad_nets`/`route_kicad_board`/`optimize_kicad_board`/
+`get_kicad_route_session` are all landed and gone from this table now (rip-up,
+plane-aware routing, and neck-down all landed too — this note previously
+listed them as pending, which had gone stale; see the 7.3b/7.5.4/7.12 anchors).
+Only 7.7's `decide_kicad_route` remains genuinely not-yet-built.
 
 | Tool | Function | Writes? |
 |------|----------|---------|
-| `route_kicad_board` (7.17 minimal LANDED; also a CLI entry; planes/optimize/stitching pending) | `route_board` | **yes (board + board_local.json)** |
-| `route_kicad_nets` (core landed; rip-up/plane/neck-down pending) | `route_nets` | **yes (board + board_local.json)** |
-| `unroute_kicad_nets` (landed) | `unroute_nets` | **yes (board + board_local.json)** |
-| `optimize_kicad_board` | `optimize_board` | **yes (board + board_local.json)** |
-| `decide_kicad_route` | `decide_route` | **yes (board_local.json session)** |
-| `get_kicad_route_session` | `get_route_session` | no |
+| `decide_kicad_route` (7.7, not yet built) | `decide_route` | **yes (board_local.json session)** |
 | `get_kicad_system_resources` | `probe_system_resources` | no |
 | `adopt_kicad_routing` | `adopt_routing` | **yes (board_local.json)** |
 | `seed_kicad_routing_from_board` | `seed_routing_from_board` | **yes (board + board_local.json)** |
@@ -2289,16 +2365,20 @@ planned-not-implemented. **Docs sync LANDED 2026-07-23 (Haiku):**
 `audit_kicad_plane_islands` (7.5.2/7.5.3) now have full rows on
 `11-autorouter.md`; README + CLAUDE.md synced to **82 tools / 11 groups**
 (CLAUDE.md gained "route the board" + zone/island Common-Tasks entries).
-**Docs sync LANDED 2026-07-27 (Haiku, two passes):** `benchmark_kicad_autoroute`
-(7.16), `open_kicad_route_viewer` (7.9), and `propose_kicad_plane`/
-`create_kicad_plane`/`modify_kicad_plane` (7.5.5) now have full rows on
-`11-autorouter.md`; README synced to **87 tools**. **CLAUDE.md tool-count bump
-to 87 still owed** (coordinator has it staged locally in the parent repo but
-does not auto-commit there — needs the user's own commit). **Remaining docs
-debt:** the `route_kicad_nets`/`route_kicad_board` pages should gain a short
-mention of Phase 7.12 neck-down behavior (landed 2026-07-27 — no new MCP
-tool, so no new row, but the pages' description of what gets emitted at a
-small pad is now stale) and future Phase 7 tools add rows as they land)
+**Docs sync LANDED 2026-07-27 (Haiku, three passes):** `benchmark_kicad_autoroute`
+(7.16), `open_kicad_route_viewer` (7.9), `propose_kicad_plane`/
+`create_kicad_plane`/`modify_kicad_plane` (7.5.5), and a Phase 7.12 neck-down
+mention on the `route_kicad_nets`/`route_kicad_board` sections now all have
+coverage on `11-autorouter.md`; a stale-claims sweep also fixed two
+long-drifted "NOT YET IMPLEMENTED" mentions (rip-up & reroute, plane-aware
+routing) that had landed weeks earlier without a docs update; README synced to
+**87 tools**. **CLAUDE.md tool-count bump still owed** (coordinator has it
+staged locally in the parent repo but does not auto-commit there — needs the
+user's own commit; now needs to go to **89**, not 87, since 7.6 landed after
+that staged edit). **Remaining docs debt:** `optimize_kicad_board`/
+`get_kicad_route_session` (7.6, landed 2026-07-27) have no docs rows yet, and
+README needs its count bumped from 87 to 89; future Phase 7 tools add rows as
+they land)
 - Extend `docs/mcp-tools/10-netclasses-and-buses.md` (or the autorouter page,
   as fits) as each remaining tool in the summary table above lands (same
   per-tool format).
@@ -2457,39 +2537,41 @@ landed 2026-07-21 — see their anchors; remaining:):
     It grows to add planes (M4), optimization/effort/decision auto-pick (M4),
     and accel (M5) without changing its signature. Still owed: a docs row on
     `11-autorouter.md`.
-12. Phase 7.9 viewer — developed against a recorded JSONL event file as soon as
-    7.3b emits events.
+12. Phase 7.9 viewer — **LANDED 2026-07-27** (see its anchor).
 
 **M4 — Planes + whole-board optimization:**
-13. Phase 7.5 plane engine — zone parser/`list_kicad_zones` + 7.5.2 fill +
-    7.5.3 `audit_kicad_plane_islands` + 7.5.4 plane-aware routing all **LANDED
-    2026-07-23** (see the 7.5.1, 7.5.2/7.5.3, and 7.5.4 anchors; kiln: 31
-    islands, 1 orphan on safty_gnd F.Cu; plane moves in the detailed A*, signal
-    parity by construction). **Remaining:** 7.5.5 propose/create/modify
-    (writers last), then the 7.5.6 stitching pass +
-    `remove_kicad_stitching_vias` + its ask-before-routing interaction rule
-    (stitching is last in the run order AND last in this milestone). Plus the
-    7.5.4 residuals: wire the estimated-fill fallback into routing, and relabel
-    the `route_board`/`route_kicad_nets` `pipeline.plane_aware_routing` from
-    `not_implemented` to `partial`.
-14. Phase 7.6 optimizer + 7.7 decision protocol — greedy first, SA once greedy is
-    trusted; sessions/resume before decisions (7.7 rides the session mechanism);
-    7.7 verified with a scripted decider (canned answers) before a live AI sits
-    in the loop. **7.15 effort presets + plateau stopping land with 7.6** (they
-    are its stopping/budget layer). Viewer gains the cancel flag + decision
-    banner. Portfolio replicas land here (a session feature).
+13. Phase 7.5 plane engine — all of it, including the 7.5.5 writers, **LANDED**
+    (see the 7.5.1, 7.5.2/7.5.3, 7.5.4, and 7.5.5 anchors; kiln: 31 islands, 1
+    orphan on safty_gnd F.Cu; plane moves in the detailed A*, signal parity by
+    construction; both 7.5.4 residuals wired in with 7.5.5). **Remaining:** the
+    7.5.6 stitching pass + `remove_kicad_stitching_vias` + its
+    ask-before-routing interaction rule — gated on 7.6's stopping rule per its
+    own ordering contract (see the 7.5.6 section), so genuinely blocked until
+    7.7 (or at least a stopping-rule equivalent) exists; `remove_kicad_
+    stitching_vias` itself has no such dependency and could land standalone.
+14. Phase 7.6 optimizer CORE — **LANDED 2026-07-27** (see its anchor; both
+    `greedy` and `sa` accept policies implemented and tested, sessions/resume
+    working). **Remaining:** 7.7's decision protocol (`decide_kicad_route`,
+    `awaiting_decision` state, `ai_decisions` config — verify with a scripted
+    decider before a live AI sits in the loop, per the original plan). 7.15
+    effort presets + plateau stopping were NOT built as part of 7.6's landing —
+    still open, track as a residual of this item. Viewer's cancel flag +
+    decision banner, and portfolio replicas (`cpu.replicas`), also still open.
 15. Phase 7.10 warm start — adoption with 7.6 (ownership flag + backup rule);
     cross-board seeding after it (feeds 7.3a priors). Acceptance: adopt kiln's
     routing on a scratch copy, optimize, verify backup exists and the diff only
     touches owned copper.
 
 **M5 — Acceleration:**
-16. Phase 7.8 numpy tier (parity suite is the gate), then the GPU tier —
-    committed, gated on parity + the M0 synthetic big-board benchmarks
-    (runtime *and* memory budgets); OOM-fallback acceptance = a forced-tiny-VRAM
-    run completes via demotion, not crash. Hybrid scheduling last, once both
-    executors exist (hybrid vs cpu-only parity proves executor assignment can't
-    change results).
+16. Phase 7.8 numpy tier + multi-core — **LANDED 2026-07-24** (see its anchor;
+    premise-corrected: multi-core across independent connections is the
+    delivered win, numpy is the parity oracle, not the fine-grid lever).
+    **Remaining:** the GPU tier — gated on parity + the M0 synthetic big-board
+    benchmarks (runtime *and* memory budgets); OOM-fallback acceptance = a
+    forced-tiny-VRAM run completes via demotion, not crash. Hybrid scheduling
+    last, once both executors exist (hybrid vs cpu-only parity proves executor
+    assignment can't change results). Whole-board windowing (lifting the 60mm/
+    400k-node cap) also still open — see 7.3b's cross-reference.
 
 **M6 — Routing intelligence (added 2026-07-21 at user request):**
 17. Phase 9 residuals — (a) and (b) LANDED 2026-07-23 (see the Phase 9 anchor):
