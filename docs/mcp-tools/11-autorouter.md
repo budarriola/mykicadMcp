@@ -540,6 +540,203 @@ are read from `pcb_settings.json` or defaults.
 }
 ```
 
+## `propose_kicad_plane`
+
+**Phase 7.5.5 — Copper-Pour Plane Proposal (Read-Only)**
+
+Propose a candidate copper-pour plane outline for a net on a specified or auto-picked copper
+layer. The proposal runs read-only and has no ownership restriction — it's a suggestion for
+human review, even if the net already owns one of the six hand-made kiln zones. Intended as the
+first step: propose a plane, review the cost-delta estimate, then use `create_kicad_plane` to
+commit if it looks good.
+
+**Candidate Outline Computation:**
+1. Collect all pads and vias on the net that touch the target layer.
+2. Compute their bounding box, inflated by each pad/via's own reach (copper radius) plus a
+   fixed margin (configurable in `pcb_settings.json` as `plane.propose_outline_margin_mm`,
+   default 1.0 mm).
+3. Clip to the board's `Edge.Cuts` extents.
+4. Rasterize the outline at the autorouter grid and estimate components (mainland/island/orphan)
+   using the same 7.5.2/7.5.3 pipeline as `audit_kicad_plane_islands` (subtracting
+   higher-priority zones and clearance-inflated foreign copper).
+
+**Cost Delta Estimation:**
+The proposal computes `cost_delta` by projecting the plane's ongoing island cost (via 7.5.3
+costing: islands cost `island_base / attachment_count`, orphans cost a fixed `orphan_island`
+penalty) plus a one-time `create_plane` cost, then subtracting the net's current routed trace
+cost (from `get_kicad_trace_cost`; 0.0 if unrouted). Negative `cost_delta` means the plane
+looks cheaper than the net's current copper. This is a **simplified estimate, not a re-route
+simulation** — it does not model what a signal net's copper would look like if removed and
+rerouted after the plane exists.
+
+**Layer Auto-Pick Behavior:**
+If `layer` is omitted, the tool picks a copper layer whose `layer_purpose` TYPE (signal/power)
+matches the net's own kind (7.2 classification), tie-broken by stack order (preferring front).
+Pass an explicit `layer` if you want to propose on a specific layer regardless of its purpose.
+
+**Read-only; no parameters beyond project_path, net, and optional layer.**
+
+**Args:** `project_path`, `net`, `layer` (optional; omit to auto-pick by net kind / layer
+purpose)
+
+**Example output (excerpt):**
+```json
+{
+  "board_path": "path/to/kiln.kicad_pcb",
+  "net": "/Power/GND_Main",
+  "net_kind": "power",
+  "layer": "In1.Cu",
+  "outline": [
+    {"x": 10.5, "y": 20.25},
+    {"x": 95.75, "y": 20.25},
+    {"x": 95.75, "y": 80.5},
+    {"x": 10.5, "y": 80.5}
+  ],
+  "outline_area_mm2": 5782.44,
+  "component_count": 2,
+  "components": [
+    {
+      "role": "mainland",
+      "attachment_count": 52,
+      "attachments": [
+        {"kind": "pad", "reference": "U1", "pad": "1", "position": {"x": 50.5, "y": 60.25}},
+        {"kind": "via", "uuid": "via-uuid-1", "position": {"x": 55.0, "y": 65.0}}
+      ],
+      "area_mm2": 5700.5,
+      "cost": 0.0
+    },
+    {
+      "role": "island",
+      "attachment_count": 2,
+      "attachments": [...],
+      "area_mm2": 82.0,
+      "cost": 20.0
+    }
+  ],
+  "estimate": {
+    "island_count": 1,
+    "orphan_count": 0,
+    "total_island_cost": 20.0,
+    "create_plane_cost": 15.0,
+    "projected_plane_cost": 35.0
+  },
+  "current_routing_cost": 45.5,
+  "cost_delta": -10.5,
+  "note": "cost_delta = (create_plane one-time cost + projected ongoing island cost) minus the net's CURRENT routed trace cost (0.0 if unrouted); negative means the plane looks cheaper than the net's current copper. Simplified estimate, not a re-route simulation."
+}
+```
+
+## `create_kicad_plane`
+
+**Phase 7.5.5 — Create a New Copper-Pour Zone**
+
+Create a new copper-pour zone for a net on a specified or auto-picked copper layer, using
+`propose_kicad_plane`'s candidate outline as the starting geometry. The zone's fill-setting
+shape (hatch style, `connect_pads` clearance, `min_thickness`, thermal gap, smoothing) is copied
+from an existing board zone using `_zone_template_shape` — the same "inherit a reference zone's
+appearance" pattern `create_kicad_netclass` uses for the Default net-class, applied here to
+zones. This ensures the new zone looks native and consistent with the board's existing zones.
+
+**Dry-Run vs Write Behavior:**
+- **`write=false`** (default) — Returns a full preview: the exact `(zone ...)` s-expr text block
+  that WOULD be appended, the uuid that will be assigned, and the outline, without touching
+  the board file.
+- **`write=true`** — Appends the zone block via uuid-anchored top-level surgery (same targeted
+  text edit as `create_kicad_group`), assigns a UUID, records the new zone's uuid in the
+  board-local `autorouter_owned.zones` list — the ONLY thing that makes it eligible for a later
+  `modify_kicad_plane` call. **IMPORTANT: The zone outline is written to the board, but KiCad
+  does NOT compute its fill immediately.** You MUST refill zones (Fill All Zones) and re-run
+  DRC in KiCad after `write=true` to see the copper.
+
+**Ownership & Eligibility:**
+Zones created by this tool are recorded in board-local `autorouter_owned.zones` and can only be
+modified by `modify_kicad_plane` — never by hand in KiCad (though KiCad will not stop you). The
+six hand-made kiln zones (mainGnd, safty_gnd, antenna, main3.3, main12v, 3.3v_safty) are never
+in `autorouter_owned`, so they can only be *proposed* for change via `propose_kicad_plane` — a
+human must review and apply changes to hand-made zones in KiCad.
+
+**Args:** `project_path`, `net`, `layer` (optional; omit to auto-pick by net kind / layer
+purpose), `name` (optional; defaults to `autorouter_<net>_<layer>`), `priority` (optional,
+default 0), `write` (default false), `allow_while_open` (default false)
+
+**Example output (excerpt):**
+```json
+{
+  "board_path": "path/to/kiln.kicad_pcb",
+  "write": false,
+  "written": false,
+  "net": "/Power/GND_Main",
+  "layer": "In1.Cu",
+  "name": "autorouter_/Power/GND_Main_In1.Cu",
+  "uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "priority": 0,
+  "outline": [
+    {"x": 10.5, "y": 20.25},
+    {"x": 95.75, "y": 20.25},
+    {"x": 95.75, "y": 80.5},
+    {"x": 10.5, "y": 80.5}
+  ],
+  "proposal": {...},
+  "block": "(zone\n\t(net \"GND_Main\")\n\t(net_name \"/Power/GND_Main\")\n\t...\n\t(uuid \"550e8400-e29b-41d4-a716-446655440000\")\n)",
+  "refill_required_note": "The zone outline is written but NOT filled - refill zones (Fill All Zones) and re-run DRC in KiCad after write=true."
+}
+```
+
+## `modify_kicad_plane`
+
+**Phase 7.5.5 — Resize/Reprioritize an Autorouter-Created Zone**
+
+Move, grow, shrink, and/or reprioritize an existing zone by uuid, via uuid-anchored s-expr
+surgery. Only the `(polygon (pts ...))` block and/or `(priority N)` line are spliced inside the
+enclosing `(zone ...)` block — never a full board file re-serialize. Shares the same targeted
+edit discipline as `delete_kicad_group` and `unroute_kicad_nets`.
+
+**Ownership Restriction (Critical):**
+This tool **REFUSES** (raises `ValueError`, never silently proceeds) if the zone uuid is not
+recorded in board-local `autorouter_owned.zones`. This tool may ONLY move/resize a zone that
+`create_kicad_plane` itself created. The six hand-made kiln zones (mainGnd, safty_gnd, antenna,
+main3.3, main12v, 3.3v_safty) are never in `autorouter_owned`, so they can only be *proposed*
+for change via `propose_kicad_plane` for a human to apply by hand in KiCad. This restriction
+ensures human-authored zones are never auto-mutated.
+
+**Parameters:**
+- `new_outline` — A list of `{x, y}` dicts or `(x, y)` tuples with at least 3 points, replacing
+  the zone's `(polygon (pts ...))` block. Omit if you're only changing priority.
+- `priority` — An integer to replace or add the zone's `(priority N)` line. Omit if you're only
+  changing the outline.
+- **At least one of `new_outline`/`priority` must be given.**
+
+**Dry-Run vs Write Behavior:**
+- **`write=false`** (default) — Previews the new zone block text (with modified polygon and/or
+  priority) without touching the board.
+- **`write=true`** — Applies the changes to the board file and invalidates caches. **IMPORTANT:
+  As with `create_kicad_plane`, KiCad must refill zones (Fill All Zones) and re-run DRC
+  afterward** to reflect the modified outline in copper.
+
+**Args:** `project_path`, `uuid` (required; must be in `autorouter_owned.zones`), `new_outline`
+(optional), `priority` (optional), `write` (default false), `allow_while_open` (default false)
+
+**Example output (excerpt — outline change):**
+```json
+{
+  "board_path": "path/to/kiln.kicad_pcb",
+  "write": false,
+  "written": false,
+  "uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "net": "/Power/GND_Main",
+  "layers": ["In1.Cu"],
+  "new_outline": [
+    {"x": 12.0, "y": 22.0},
+    {"x": 94.0, "y": 22.0},
+    {"x": 94.0, "y": 78.5},
+    {"x": 12.0, "y": 78.5}
+  ],
+  "new_priority": null,
+  "block": "(zone\n\t(net \"GND_Main\")\n\t...\n\t(polygon\n\t\t(pts\n\t\t\t(xy 12.0 22.0)(xy 94.0 22.0)(xy 94.0 78.5)(xy 12.0 78.5)\n\t\t)\n\t)\n\t...\n)",
+  "refill_required_note": "Zone outline/priority is changed on disk only if write=true - KiCad must refill zones (Fill All Zones) and re-run DRC before this is reflected in copper."
+}
+```
+
 ## `open_kicad_route_viewer`
 
 **Phase 7.9 — Live Route-Progress Viewer**

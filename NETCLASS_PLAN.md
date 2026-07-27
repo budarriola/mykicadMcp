@@ -165,20 +165,18 @@ For whoever (human or AI) picks this up next:
   The 35 failures are now `unreachable_in_window` (genuine dense-board
   pathfinding), not budget — closing that gap is Opus-class whole-board
   optimization (7.6), not a bounded Sonnet patch. See ⭐ findings.
-- **Next work when resumed:** (1) **Phase 7.5.5 propose/create/modify planes**
-  (`propose_kicad_plane`/`create_kicad_plane`/`modify_kicad_plane` — the plane
-  WRITERS, dry-run/write/lock discipline, uuid-anchored s-expr surgery, only
-  autorouter-owned zones mutable), then **7.5.6 stitching pass** +
-  `remove_kicad_stitching_vias` + its ask-before-routing rule (last in M4).
-  (2) Two small 7.5.4 residuals: wire the 7.5.2 estimated-fill fallback into the
-  plane router, and relabel `route_board`/`route_kicad_nets`
-  `pipeline.plane_aware_routing` from `not_implemented` to `partial`. (3) A docs
-  row for
-  `route_kicad_board` on `11-autorouter.md` (README/CLAUDE bump 79→81). (3)
-  Finish 7.3b's remaining bits: 7.12 neck-down, direction-aware pad escape,
-  whole-board windowing (numpy/accel, M5). Still open:
-  M6 item 17 (c) Flow B stack-up-gate question, and 7.14's optimizer pin-swap
-  move + pause-the-user protocol (both wait on 7.6).
+- **Next work when resumed (updated 2026-07-27 — see item 13 above for what
+  just landed):** (1) **7.5.6 stitching pass** + `remove_kicad_stitching_vias`
+  + its ask-before-routing rule (last in M4) — NOTE its ordering contract
+  ("only after 7.6's stopping rule fires") gates the automatic placement pass
+  on the not-yet-built 7.6 optimizer; `remove_kicad_stitching_vias` itself
+  (listing/deleting existing stitching vias) has no such dependency and could
+  land standalone if scoped that way. (2) Docs rows for the three 7.5.5 plane
+  tools + CLAUDE.md tool-count bump to 87 (see docs-debt note). (3) Finish
+  7.3b's remaining bits: 7.12 neck-down, direction-aware pad escape,
+  whole-board windowing (numpy/accel, M5) — none of these depend on 7.6.
+  Still open: M6 item 17 (c) Flow B stack-up-gate question, and 7.14's
+  optimizer pin-swap move + pause-the-user protocol (both wait on 7.6).
 - **Nothing has been committed** in either repo as of this snapshot — review the
   working tree before assuming git history matches this file.
 - Verify claims against the code (`kicad_pcb_tool.py`, `kicad_mcp_server.py`,
@@ -589,8 +587,18 @@ router work):
   subagent, coordinator-verified, worktree-isolated, merged clean). See the
   7.9 anchor for the full landing detail and spec deviations. 84 tools,
   226-test suite green (208→226, same 7 pre-existing board-drift failures
-  before and after, unaffected). Docs debt: `open_kicad_route_viewer` has no
-  docs row yet (see the docs-debt note below).
+  before and after, unaffected). Docs debt closed same day (Haiku pass).
+  (13) ✅ **Phase 7.5.5 plane writers — LANDED 2026-07-27** (Sonnet subagent,
+  worktree-isolated; coordinator found and fixed one test-fixture bug before
+  merging — see the 7.5.5 anchor). Also lands the two small 7.5.4 residuals
+  (estimated-fill wired into the plane router; `pipeline.plane_aware_routing`
+  relabeled `"partial"`). 84→87 tools, 219-test suite green (208→219, same 7
+  pre-existing board-drift failures, unaffected). Merge required one
+  mechanical conflict resolution in `kicad_mcp_server.py` against the
+  already-merged 7.9 viewer branch (both added tool registrations at the same
+  insertion points — no logic conflict, both sets of tools kept). Docs debt:
+  the three new plane tools have no docs rows yet (see the docs-debt note
+  below); CLAUDE.md tool count also still owed a bump to 87.
 
 ## How to work this plan (living document — keep it current)
 
@@ -1134,14 +1142,13 @@ rebuilds its own per-connection window — there is no full-board window, so the
 nearest-node between global/window grids (≤½-cell off when unaligned — fine for
 a soft field).
 
-**Still open in 7.3b (do NOT treat 7.3b as closed):** **plane-aware routing
-(7.5.4)** — plane-net via-drops through pours currently *fail* rather than emit
-DRC-violating copper (needs Phase 7.5 zone model, M4); **7.12 neck-down** (not
-applied); pad escape lands on nearest free node (not direction-aware);
-termination is on the `to` point (not "any same-net copper"); window doubling
-is **capped at 60 mm span / 400k-node budget**, not whole-board (a whole-kiln
-0.2 mm 4-layer raster ~2.3M×4 nodes is infeasible in pure Python — lift with
-numpy/accel, M5).
+**Still open in 7.3b (do NOT treat 7.3b as closed):** (plane-aware routing was
+the other open item here at the time this was written — landed since as 7.5.4,
+see its anchor) **7.12 neck-down** (not applied); pad escape lands on nearest
+free node (not direction-aware); termination is on the `to` point (not "any
+same-net copper"); window doubling is **capped at 60 mm span / 400k-node
+budget**, not whole-board (a whole-kiln 0.2 mm 4-layer raster ~2.3M×4 nodes is
+infeasible in pure Python — lift with numpy/accel, M5).
 
 **Stage 1 LANDED 2026-07-21** (anchor): `kicad_router_tool.py` exists with
 `build_connectivity` (union-find islands per net) + `get_ratsnest` → tool
@@ -1341,31 +1348,57 @@ at the F.Cu pad, `length_mm=0` (plane-riding copper not emitted), self-check
 clean, kicad-cli DRC NEW=0, unconnected 1→0. 8 tests in
 `tests/test_plane_routing.py`; full suite 173 green; `get_ratsnest`=39 holds.
 
-**Residuals (accepted, documented in-code):** (a) only KiCad-filled zones feed
-the plane model — the 7.5.2 "estimated" fill fallback is NOT wired into routing
-yet; (b) `_fine_astar`'s distance-only heuristic (pre-existing) is not
-admissible for a plane-discounted state, so the router returns a valid /
-deterministic / DRC-safe path but not always the global cost optimum; (c) the
-`route_board`/`route_kicad_nets` `pipeline` report still labels
-`plane_aware_routing: not_implemented` — update that string to "partial" now
-that it is wired.
+**Residual (accepted, documented in-code):** `_fine_astar`'s distance-only
+heuristic (pre-existing) is not admissible for a plane-discounted state, so the
+router returns a valid / deterministic / DRC-safe path but not always the
+global cost optimum. (The other two residuals noted at 7.5.4's original
+landing — the estimated-fill fallback not feeding the plane model, and the
+pipeline report's stale `not_implemented` label — were fixed alongside 7.5.5,
+see its anchor below.)
 
-**7.5.5 Creating and moving planes.** Same dry-run/write/lock discipline as every
-writer; zone outlines are uuid-anchored s-expr surgery like `delete_group`:
-- `propose_kicad_plane(net, layer)` — candidate outline: grid-based coverage region
-  of the net's pads/vias on that layer (rectilinear hull, simplified, clipped to
-  `Edge.Cuts`, minus higher-priority zones), preferring layers whose type matches
-  the net kind (7.2 — power nets onto `power` layers). Returns outline, estimated
-  fill/islands/attachments, and the **cost delta** vs. current routing.
-- `create_kicad_plane(..., write=)` — writes the `(zone ...)` block, copying
-  fill-setting shape (hatch, connect_pads clearance, min_thickness, thermal gap,
-  smoothing) from the board's existing zones so new zones look native.
-- `modify_kicad_plane(uuid, new_outline | priority, write=)` — move/grow/shrink an
-  existing zone by replacing its polygon points; refuses on zones it can't
-  re-locate; warns that refill + DRC in KiCad is required after.
-- Board-local JSON records `autorouter_owned.zones` uuids — the optimizer may only
-  move/delete zones it created, never the six hand-made ones (they can only be
-  *proposed* for change, for the user to confirm).
+### 7.5.5 — LANDED 2026-07-27 (reference anchor; no work remains here)
+
+`propose_plane`/`create_plane`/`modify_plane` implemented in
+`kicad_router_tool.py`, registered as `propose_kicad_plane`/`create_kicad_plane`/
+`modify_kicad_plane` (Sonnet subagent, worktree-isolated, coordinator-reviewed
+and merged with one mechanical conflict resolution — both this branch and the
+already-merged 7.9 viewer branch added tool registrations at the same
+insertion points in `kicad_mcp_server.py`; resolved by keeping both, no logic
+conflict). `propose_plane(net, layer=None)` is read-only (no ownership
+restriction — a suggestion even against a hand-made zone/net): grid-based
+candidate outline from the net's own pad/via bounding box (inflated by
+reach + margin, clipped to `Edge.Cuts`), auto-picks a layer by `layer_purpose`
+type matching the net's kind (7.2) when `layer` is omitted, runs the same
+7.5.2/7.5.3 estimation pipeline `audit_plane_islands` uses for
+mainland/island/orphan costing, and returns a `cost_delta` vs. the net's
+current routed trace cost. `create_plane(..., write=)` writes a native-looking
+`(zone ...)` block (fill-setting shape copied from an existing board zone via
+`_zone_template_shape`, the same "copy an existing definition's shape" idea
+`create_netclass` uses) and records the new uuid in board-local
+`autorouter_owned.zones`. `modify_plane(uuid, new_outline=, priority=, write=)`
+does uuid-anchored polygon/priority s-expr surgery (same discipline as
+`delete_group`/`unroute_nets`) and **refuses** (raises, never silently
+proceeds) on any uuid not in `autorouter_owned.zones` — the six hand-made kiln
+zones (mainGnd, safty_gnd, antenna, main3.3, main12v, 3.3v_safty) can only ever
+be *proposed* for change via the read-only `propose_plane`, never auto-mutated.
+Also lands, in the same commit, the two 7.5.4 residuals noted above:
+`_plane_fill_index_with_estimated` wires the 7.5.2 estimated-fill fallback into
+`route_nets`'s plane model (previously only KiCad-authoritative `filled_polygon`
+zones were routable planes), and `route_board`'s `pipeline` report now says
+`plane_aware_routing: "partial"` instead of `"not_implemented"`.
+
+84→87 tools. 11 tests in `tests/test_plane_writers.py` (synthetic board +
+one read-only kiln smoke test for `propose_plane` against `GND_Main`).
+**Coordinator fix applied post-landing:** the subagent's own
+`test_propose_plane_returns_sane_outline_and_cost_delta` used a synthetic net
+named `PWR3V3`, which does not actually match any default
+`power_net_patterns` regex (`3\.3[Vv]` requires a literal decimal point,
+`PWR3V3` has none) — the test was asserting `net_kind == "power"` against a
+net the code correctly classified as `"signal"`. Renamed the synthetic net to
+`3.3V_RAIL` (which does match) throughout the test file rather than loosening
+the assertion or the production regex — the regex and code were correct, the
+test fixture was wrong. Full suite green after the fix: 219 passed / 7
+pre-existing board-drift failures (unrelated, unchanged) / 7 skipped.
 
 ### 7.5.6 Plane stitching pass (always runs LAST) + stitching-via management
 
@@ -2140,9 +2173,6 @@ they stay listed until 7.3b closes.
 | `route_kicad_board` (7.17 minimal LANDED; also a CLI entry; planes/optimize/stitching pending) | `route_board` | **yes (board + board_local.json)** |
 | `route_kicad_nets` (core landed; rip-up/plane/neck-down pending) | `route_nets` | **yes (board + board_local.json)** |
 | `unroute_kicad_nets` (landed) | `unroute_nets` | **yes (board + board_local.json)** |
-| `propose_kicad_plane` | `propose_plane` | no |
-| `create_kicad_plane` | `create_plane` | **yes (board + board_local.json)** |
-| `modify_kicad_plane` | `modify_plane` | **yes (board + board_local.json)** |
 | `optimize_kicad_board` | `optimize_board` | **yes (board + board_local.json)** |
 | `decide_kicad_route` | `decide_route` | **yes (board_local.json session)** |
 | `get_kicad_route_session` | `get_route_session` | no |
@@ -2169,12 +2199,15 @@ planned-not-implemented. **Docs sync LANDED 2026-07-23 (Haiku):**
 `audit_kicad_plane_islands` (7.5.2/7.5.3) now have full rows on
 `11-autorouter.md`; README + CLAUDE.md synced to **82 tools / 11 groups**
 (CLAUDE.md gained "route the board" + zone/island Common-Tasks entries).
-**Remaining docs debt (as of 2026-07-27, 84 tools):** `benchmark_kicad_autoroute`
-(7.16) and `open_kicad_route_viewer` (7.9) have no docs rows yet and
-README/CLAUDE.md now lag at 82 → bump to 84; the `route_kicad_nets`/
-`route_kicad_board` pages get revised as 7.5.4 plane-aware routing and 7.12
-neck-down land (they change what routes vs. fails), and future Phase 7 tools
-add rows as they land)
+**Docs sync LANDED 2026-07-27 (Haiku, two passes):** `benchmark_kicad_autoroute`
+(7.16), `open_kicad_route_viewer` (7.9), and `propose_kicad_plane`/
+`create_kicad_plane`/`modify_kicad_plane` (7.5.5) now have full rows on
+`11-autorouter.md`; README synced to **87 tools**. **CLAUDE.md tool-count bump
+to 87 still owed** (coordinator has it staged locally in the parent repo but
+does not auto-commit there — needs the user's own commit). **Remaining docs
+debt:** the `route_kicad_nets`/`route_kicad_board` pages get revised as 7.12
+neck-down lands (plane-aware routing's page already reflects its "partial"
+status), and future Phase 7 tools add rows as they land)
 - Extend `docs/mcp-tools/10-netclasses-and-buses.md` (or the autorouter page,
   as fits) as each remaining tool in the summary table above lands (same
   per-tool format).
