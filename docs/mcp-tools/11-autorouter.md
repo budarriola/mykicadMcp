@@ -903,10 +903,19 @@ Human-routed copper and the six hand-made board zones (`mainGnd`, `safty_gnd`, `
 `unroute_kicad_nets`/`modify_kicad_plane`, whose ownership guards (recording in `autorouter_owned`)
 prevent mutation of non-autorouter copper/zones. The optimizer never bypasses these.
 
-**Known Limitation:**
-Phase 7.7 (AI-in-the-loop decision pause for near-tied candidate moves) is NOT implemented — there
-is no `awaiting_decision` state and `optimizer.ai_decisions` is never read. Where 7.7 would pause,
-this optimizer simply takes the best-scored candidate.
+**Phase 7.7 — AI-in-the-loop decisions:**
+When the top two candidate moves for an iteration score within
+`optimizer.ai_decisions.min_score_spread` of each other — i.e. the cost model genuinely cannot
+separate them — the call returns `state: "awaiting_decision"` instead of auto-accepting. The
+report's `pending_decision` carries a closed list of 2–4 already-applied, already-scored options
+(`id`, one-line `summary`, `score_delta`); answer with `decide_kicad_route(session_id, decision_id,
+choice, rationale)` (an option id or the literal `"defer"`), or simply call `optimize_kicad_board`
+again to defer to the best-scored option automatically. A clear winner (score spread at or above
+`min_score_spread`) is still auto-taken exactly as before; `ai_decisions.enabled: false` disables
+pausing entirely and `max_pauses_per_run` caps how many pauses one session can spend. Every
+committed move — auto-accepted or AI-decided — is appended to a `decision_log` (visible via
+`get_kicad_route_session`) for audit and replay. Per-option SVG previews are not built (nothing in
+this codebase renders a board to SVG yet); the numbers and summary are what the decision is made on.
 
 **Args:** `project_path`, `session_id` (optional; omit to start a new session), `max_iterations_per_call`
 (default 3), `max_seconds` (optional; omit for iterations-only bounding), `seed` (optional; overrides
@@ -995,10 +1004,11 @@ total SESSION time budget; defaults to `optimizer.time_budget_s`), `write` (defa
 **Phase 7.6 — READ-ONLY Session Status Reporter**
 
 Inspect the state of an `optimize_kicad_board` session without advancing it by a single iteration.
-Returns the session's state (`running | converged | budget_exhausted`), iteration count vs. budget,
-elapsed time, seed, acceptance policy, simulated-annealing temperature, initial/current/best scores,
-the per-iteration score curve, the full move log (what move type was tried, whether it was accepted,
-and why), and the scratch board path.
+Returns the session's state (`running | converged | budget_exhausted | awaiting_decision`),
+iteration count vs. budget, elapsed time, seed, acceptance policy, simulated-annealing temperature,
+initial/current/best scores, the per-iteration score curve, the full move log (what move type was
+tried, whether it was accepted, and why), the Phase 7.7 `decision_log` (every auto or AI-decided
+move, for audit/replay), and the scratch board path.
 
 **Read-only; omit `session_id` to report the board's most recently touched session.** Returns
 `{"found": false, ...}` rather than raising when there is nothing to report, so a caller can poll
@@ -1085,6 +1095,46 @@ a board that has never been optimized.
   "found": false,
   "session_id": null,
   "known_sessions": []
+}
+```
+
+## `decide_kicad_route`
+
+**Phase 7.7 — Answer a Paused Optimizer Session**
+
+Answers an `optimize_kicad_board` session that returned `state: "awaiting_decision"`. The pending
+decision is a CLOSED list of 2–4 candidate moves the optimizer already applied and scored on
+private board copies (`pending_decision.options`, each with an `id`, a one-line `summary`, and a
+`score_delta`) — pick one by its `id` (e.g. `"opt2"`), or pass the literal `"defer"` to take the
+optimizer's own best-scored default. You cannot introduce a move of your own; `rationale` is free
+text that is recorded in `decision_log` and never executed.
+
+A decision only fires where the cost model genuinely cannot separate the options (score spread
+under `optimizer.ai_decisions.min_score_spread`) — exactly where judgment (EMI, serviceability,
+"that jumper layer is for rework wires," future hand-rework) beats arithmetic; clear winners are
+auto-taken without ever pausing.
+
+**This call runs NO further iterations** — it only resolves the pause and returns the session to
+`running` (or to `converged`, if the move it just committed was the one that stopped buying
+`convergence_delta`). Call `optimize_kicad_board` with the same `session_id` afterward to continue.
+Raises if the session is not `awaiting_decision` or if `decision_id` doesn't match the pending one
+(a stale answer is refused). Never touches the real board — like the rest of the optimizer it works
+on the session's private scratch copy until `optimize_kicad_board` is called with `write=true`.
+
+**Args:** `project_path`, `session_id`, `decision_id` (must equal `pending_decision.decision_id`),
+`choice` (an option id or `"defer"`), `rationale` (optional; recorded, never executed)
+
+**Example output (excerpt):**
+```json
+{
+  "command": "decide_route",
+  "decision_id": "d9c4e1f5-i15",
+  "choice": "opt2",
+  "resolved_choice": "opt2",
+  "rationale": "opt1 reroutes through the connector keep-out area we reserved for rework",
+  "state": "running",
+  "iteration": 15,
+  "pending_decision": null
 }
 ```
 
