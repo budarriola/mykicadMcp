@@ -3447,7 +3447,7 @@ class _FineWindow:
     __slots__ = ("grid", "minx", "miny", "cols", "rows", "layers", "layer_types",
                  "blocked_track", "blocked_via", "net",
                  "_track_cnt", "_via_cnt", "_track_half", "_via_radius",
-                 "_clearance", "_edge_clearance")
+                 "_clearance", "_edge_clearance", "_zone_cache")
 
     def __init__(self, minx: float, miny: float, maxx: float, maxy: float, grid: float,
                  layers: list[str], layer_types: dict[str, str], net: str) -> None:
@@ -3471,6 +3471,12 @@ class _FineWindow:
         self._via_radius = 0.0
         self._clearance = 0.0
         self._edge_clearance = 0.0
+        # Optional {id(ob): _ZoneEdgeGrid} set by `_route_one` before `build`,
+        # precomputed ONCE per connection at a bbox+reach bound wide enough to
+        # cover every ladder rung (see `_build_zone_edge_cache`). None for any
+        # window built outside that ladder (e.g. incremental rip-up), which
+        # keeps building its own per-call zgrid exactly as before.
+        self._zone_cache = None
 
     def node_xy(self, ix: int, iy: int) -> tuple[float, float]:
         return (self.minx + ix * self.grid, self.miny + iy * self.grid)
@@ -3524,20 +3530,30 @@ class _FineWindow:
         ob_layers = [l for l in ob.layers if l in self.blocked_track]
         for l in ob_layers:
             track_cells.setdefault(l, set())
-        zedges: list[tuple[float, float, float, float]] | None = None
+        is_zone = ob.kind == "zone" and bool(ob.pts)
         zgrid: _ZoneEdgeGrid | None = None
-        if ob.kind == "zone" and ob.pts:
-            zedges = _clip_polygon_edges(
-                ob.pts, wminx - big, wminy - big, wmaxx + big, wmaxy + big)
-            # `big` bounds every distance this window will ever compare a zone
-            # edge against below (via_reach, track_reach <= big), so a grid
-            # bucketed at that size lets each cell test only its own bucket -
-            # see `_ZoneEdgeGrid` for the exactness argument.
-            zgrid = _ZoneEdgeGrid(zedges, big)
+        if is_zone:
+            cached = self._zone_cache.get(id(ob)) if self._zone_cache is not None else None
+            if cached is not None:
+                # Reuse the per-connection grid built once at a bbox+reach
+                # bound that upper-bounds every ladder rung (`_build_zone_edge_
+                # cache`): it was built with a reach R >= this call's `big`, and
+                # `_ZoneEdgeGrid.min_dist` is exact for any query threshold <=
+                # the reach it was built with, so this is identical to building
+                # fresh here - just skips the re-clip + re-bucket every rung.
+                zgrid = cached
+            else:
+                zedges = _clip_polygon_edges(
+                    ob.pts, wminx - big, wminy - big, wmaxx + big, wmaxy + big)
+                # `big` bounds every distance this window will ever compare a zone
+                # edge against below (via_reach, track_reach <= big), so a grid
+                # bucketed at that size lets each cell test only its own bucket -
+                # see `_ZoneEdgeGrid` for the exactness argument.
+                zgrid = _ZoneEdgeGrid(zedges, big)
         for iy in range(iy0, iy1 + 1):
             for ix in range(ix0, ix1 + 1):
                 px, py = self.node_xy(ix, iy)
-                if zedges is not None:
+                if is_zone:
                     assert ob.raster is not None
                     inside = ob.raster.covers(px, py, 0.0)
                     dmin = 0.0 if inside else zgrid.min_dist(px, py)
@@ -4425,6 +4441,112 @@ def _finalize_core(
     return rec_updates, segments, vias, []
 
 
+def _max_ladder_window_bound(
+    from_xy: tuple[float, float], to_xy: tuple[float, float],
+    board_bbox: tuple[float, float, float, float], ctx_grid: float,
+    attempts: list[tuple[float, float]],
+) -> tuple[float, float, float, float, float]:
+    """(wminx, wminy, wmaxx, wmaxy, max_grid): the reach-padded window bound at
+    the LARGEST (margin, grid) combination reachable across every ladder rung
+    in `attempts` - a single conservative bound both `_prefilter_window_
+    obstacles` and `_build_zone_edge_cache` build their per-connection,
+    reused-across-rungs structures against.
+
+    Safe upper bound because every rung shares the same connection (net,
+    track_half, via_radius, clearance, edge_clearance) and only its (margin,
+    grid) differ:
+      * the window span `_route_one` builds from `margin` is monotonically
+        non-shrinking as `margin` grows (larger request pushes minx/miny down
+        and maxx/maxy up; the board-bbox clamp only floors/ceils it, never
+        un-does that), so the span at `max(margin for margin,_ in attempts)`
+        is a superset of every rung's actual span;
+      * `obstacle_cells` further pads that span by `grid * _FINE_CELL_MARGIN_
+        FRAC` plus the shared clearance/half terms - using `max(grid for _,
+        grid in attempts)` for that pad only widens the probe further, so a
+        test against this bound is at least as generous as any individual
+        rung's smaller pad and possibly-smaller span."""
+    max_margin = max(m for (m, _g) in attempts)
+    max_grid = max(g for (_m, g) in attempts)
+    minx = max(min(from_xy[0], to_xy[0]) - max_margin, board_bbox[0] - ctx_grid)
+    miny = max(min(from_xy[1], to_xy[1]) - max_margin, board_bbox[1] - ctx_grid)
+    maxx = min(max(from_xy[0], to_xy[0]) + max_margin, board_bbox[2] + ctx_grid)
+    maxy = min(max(from_xy[1], to_xy[1]) + max_margin, board_bbox[3] + ctx_grid)
+    return (minx - max_grid, miny - max_grid, maxx + max_grid, maxy + max_grid, max_grid)
+
+
+def _prefilter_window_obstacles(
+    obstacles: list["_Obst"], net: str, from_xy: tuple[float, float],
+    to_xy: tuple[float, float], board_bbox: tuple[float, float, float, float],
+    ctx_grid: float, attempts: list[tuple[float, float]],
+    track_half: float, via_radius: float, clearance: float, edge_clearance: float,
+) -> list["_Obst"]:
+    """Subset of `obstacles` that COULD be kept by at least one ladder rung's
+    `_FineWindow.build` (i.e. NOT bbox-rejected by `obstacle_cells`'s early-out,
+    see line ~3507), evaluated once against the UNION of every rung's window
+    (`_max_ladder_window_bound`) instead of per-rung.
+
+    A same-net non-edge obstacle is unconditionally free at every rung (the
+    first line of `obstacle_cells`), so it is dropped here regardless of bbox."""
+    if not attempts:
+        return obstacles
+    wminx, wminy, wmaxx, wmaxy, max_grid = _max_ladder_window_bound(
+        from_xy, to_xy, board_bbox, ctx_grid, attempts)
+    base_reach = max(track_half, via_radius) + max(clearance, edge_clearance) + max_grid * _FINE_CELL_MARGIN_FRAC
+    out: list[_Obst] = []
+    for ob in obstacles:
+        if ob.net == net and not ob.is_edge:
+            continue  # same-net copper is free at every rung, unconditionally
+        reach = base_reach + ob.half
+        if (ob.maxx < wminx - reach or ob.minx > wmaxx + reach
+                or ob.maxy < wminy - reach or ob.miny > wmaxy + reach):
+            continue
+        out.append(ob)
+    return out
+
+
+def _build_zone_edge_cache(
+    obstacles: list["_Obst"], from_xy: tuple[float, float], to_xy: tuple[float, float],
+    board_bbox: tuple[float, float, float, float], ctx_grid: float,
+    attempts: list[tuple[float, float]],
+    track_half: float, via_radius: float, clearance: float, edge_clearance: float,
+) -> dict[int, "_ZoneEdgeGrid"]:
+    """{id(zone obstacle): _ZoneEdgeGrid}, built ONCE per connection at the same
+    `_max_ladder_window_bound` used for the obstacle prefilter, so every rung's
+    `_FineWindow.obstacle_cells` can reuse it instead of re-clipping the zone's
+    polygon edges (`_clip_polygon_edges`) and re-bucketing them (`_ZoneEdgeGrid.
+    __init__`) on every rung's build - a board-spanning plane fill's edge list is
+    the same edges regardless of which rung is asking.
+
+    Exact for every rung: `_ZoneEdgeGrid.min_dist`'s correctness argument is
+    generic in the `reach` used both to build (bucket size + edge-insertion
+    padding) and to query (the threshold a caller compares its result against) -
+    it only requires the query threshold be `<= reach`. Building here with
+    `reach = big` computed from `max_grid` (see `_max_ladder_window_bound`) and
+    the connection's constant track_half/via_radius/clearance/edge_clearance
+    gives a `big` that upper-bounds every individual rung's own (smaller-grid)
+    `big`, so a rung's actual query threshold (its own track_reach/via_reach)
+    is always `<= this cache's reach` - the same generosity argument used for
+    the window bbox: the padded bbox this cache clips edges against is a
+    superset of every rung's own (smaller) padded bbox, so no relevant edge is
+    missed by clipping once at the bound instead of per rung."""
+    if not attempts:
+        return {}
+    wminx, wminy, wmaxx, wmaxy, max_grid = _max_ladder_window_bound(
+        from_xy, to_xy, board_bbox, ctx_grid, attempts)
+    margin_term = max_grid * _FINE_CELL_MARGIN_FRAC
+    cache: dict[int, _ZoneEdgeGrid] = {}
+    for ob in obstacles:
+        if ob.kind != "zone" or not ob.pts:
+            continue
+        cl = edge_clearance if ob.is_edge else clearance  # always `clearance` for zones (is_edge False)
+        track_reach = track_half + cl + ob.half + margin_term
+        via_reach = via_radius + cl + ob.half + margin_term
+        big = max(track_reach, via_reach)
+        zedges = _clip_polygon_edges(ob.pts, wminx - big, wminy - big, wmaxx + big, wmaxy + big)
+        cache[id(ob)] = _ZoneEdgeGrid(zedges, big)
+    return cache
+
+
 def _route_one(
     ctx: dict[str, Any], conn: dict[str, Any], active_obstacles: list["_Obst"],
     congestion: dict[tuple[int, int, str], int], use_corridor: bool = True,
@@ -4502,10 +4624,32 @@ def _route_one(
     attempts = _route_attempts(from_xy, to_xy, board_bbox, grid, ctx["min_grid_mm"],
                                max_grid_mm, ctx["base_margin"], len(routable_layers),
                                max_window_nodes)
+    # Pre-filter once to the obstacles ANY ladder rung could possibly keep (see
+    # `_prefilter_window_obstacles`), instead of re-testing the full board-wide
+    # obstacle list (~2800 items) against every rung's bbox reject inside
+    # `obstacle_cells`. Only `win.build` below uses this subset; `_finalize_core`'s
+    # exact self-check and `_nearest_blocker`'s global nearest-obstacle search
+    # keep using the untouched `active_obstacles`.
+    window_obstacles = _prefilter_window_obstacles(
+        active_obstacles, net, from_xy, to_xy, board_bbox, grid, attempts,
+        track_half, via_radius, rules["clearance"], rules["edge_clearance"])
+    # Per-connection zone-edge-grid cache (see `_build_zone_edge_cache`): built
+    # LAZILY, only once attempt 1 (the legacy, byte-identical-parity rung) has
+    # failed and the ladder is actually going to run more than one rung -
+    # building it eagerly for every connection would size it to the WORST-CASE
+    # ladder rung (a 60 mm margin) even for the common case that routes on
+    # attempt 1 alone, which measured as a net LOSS (the eager build's own cost
+    # exceeded what it saved). Once built (from `attempts[1:]`, the sub-ladder
+    # that actually still runs), it is reused by every remaining rung's window.
+    zone_cache: dict[int, "_ZoneEdgeGrid"] | None = None
     win: _FineWindow | None = None
     margin = ctx["base_margin"]
     any_built = False
-    for (margin, win_grid) in attempts:
+    for attempt_idx, (margin, win_grid) in enumerate(attempts):
+        if attempt_idx == 1 and zone_cache is None:
+            zone_cache = _build_zone_edge_cache(
+                window_obstacles, from_xy, to_xy, board_bbox, grid, attempts[1:],
+                track_half, via_radius, rules["clearance"], rules["edge_clearance"])
         minx = max(min(from_xy[0], to_xy[0]) - margin, board_bbox[0] - grid)
         miny = max(min(from_xy[1], to_xy[1]) - margin, board_bbox[1] - grid)
         maxx = min(max(from_xy[0], to_xy[0]) + margin, board_bbox[2] + grid)
@@ -4515,7 +4659,8 @@ def _route_one(
             win = None
             continue  # over budget at this (margin, grid) - a tighter/coarser one may fit
         any_built = True
-        win.build(active_obstacles, track_half, via_radius, rules["clearance"], rules["edge_clearance"])
+        win._zone_cache = zone_cache
+        win.build(window_obstacles, track_half, via_radius, rules["clearance"], rules["edge_clearance"])
         s_cell = win.nearest_free(from_xy[0], from_xy[1], start_layers) or win.cell_of(*from_xy)
         g_cell = win.nearest_free(to_xy[0], to_xy[1], list(goal_layers)) or win.cell_of(*to_xy)
         corridor = _corridor_from_global(win, gconn, coarse_grid, coarse_min) if use_corridor else None
