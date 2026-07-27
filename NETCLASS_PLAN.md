@@ -165,18 +165,17 @@ For whoever (human or AI) picks this up next:
   The 35 failures are now `unreachable_in_window` (genuine dense-board
   pathfinding), not budget — closing that gap is Opus-class whole-board
   optimization (7.6), not a bounded Sonnet patch. See ⭐ findings.
-- **Next work when resumed (updated 2026-07-27 — see item 13 above for what
-  just landed):** (1) **7.5.6 stitching pass** + `remove_kicad_stitching_vias`
-  + its ask-before-routing rule (last in M4) — NOTE its ordering contract
-  ("only after 7.6's stopping rule fires") gates the automatic placement pass
-  on the not-yet-built 7.6 optimizer; `remove_kicad_stitching_vias` itself
+- **Next work when resumed (updated 2026-07-27 — 7.12 landed, see its anchor):**
+  (1) **7.5.6 stitching pass** + `remove_kicad_stitching_vias` + its
+  ask-before-routing rule (last in M4) — NOTE its ordering contract ("only
+  after 7.6's stopping rule fires") gates the automatic placement pass on the
+  not-yet-built 7.6 optimizer; `remove_kicad_stitching_vias` itself
   (listing/deleting existing stitching vias) has no such dependency and could
-  land standalone if scoped that way. (2) Docs rows for the three 7.5.5 plane
-  tools + CLAUDE.md tool-count bump to 87 (see docs-debt note). (3) Finish
-  7.3b's remaining bits: 7.12 neck-down, direction-aware pad escape,
-  whole-board windowing (numpy/accel, M5) — none of these depend on 7.6.
-  Still open: M6 item 17 (c) Flow B stack-up-gate question, and 7.14's
-  optimizer pin-swap move + pause-the-user protocol (both wait on 7.6).
+  land standalone if scoped that way. (2) 7.3b's remaining bits:
+  direction-aware pad escape, whole-board windowing (numpy/accel, M5) — 7.12
+  neck-down is now done; neither of the remaining two depends on 7.6. Still
+  open: M6 item 17 (c) Flow B stack-up-gate question, and 7.14's optimizer
+  pin-swap move + pause-the-user protocol (both wait on 7.6).
 - **Nothing has been committed** in either repo as of this snapshot — review the
   working tree before assuming git history matches this file.
 - Verify claims against the code (`kicad_pcb_tool.py`, `kicad_mcp_server.py`,
@@ -596,9 +595,16 @@ router work):
   pre-existing board-drift failures, unaffected). Merge required one
   mechanical conflict resolution in `kicad_mcp_server.py` against the
   already-merged 7.9 viewer branch (both added tool registrations at the same
-  insertion points — no logic conflict, both sets of tools kept). Docs debt:
-  the three new plane tools have no docs rows yet (see the docs-debt note
-  below); CLAUDE.md tool count also still owed a bump to 87.
+  insertion points — no logic conflict, both sets of tools kept). Docs debt
+  (three plane tools + README/CLAUDE.md count) closed same day (Haiku pass,
+  see the docs-sync note below); CLAUDE.md itself still needs the user's own
+  commit in the parent repo (coordinator does not auto-commit there).
+  (14) ✅ **Phase 7.12 neck-down — LANDED 2026-07-27** (Sonnet subagent,
+  worktree-isolated, merged fast-forward — no conflict with the concurrently-
+  landed 7.5.5). See its anchor for the full write-up. 87 tools (unchanged —
+  no new MCP tool), 237→243-test suite green, same 7 pre-existing board-drift
+  failures. Honest residual: the hierarchical last-resort routing tier is
+  deliberately not wired for neck-down (documented in-code and in the anchor).
 
 ## How to work this plan (living document — keep it current)
 
@@ -1857,21 +1863,59 @@ ends with `kicad-cli pcb drc` on the written scratch board; new violations vs.
 the pre-route baseline fail the run (extends the M0 kicad-cli harness into the
 router path).
 
-### 7.12 Neck-down: wide nets onto small pads
+### 7.12 — LANDED 2026-07-27 (reference anchor; no work remains here)
 
-Power net classes route wide (e.g. 1 mm) but must land on 0.3 mm IC pins/balls.
-Per connection endpoint: if the netclass/target width >
-`neck_down.max_width_vs_pad` × the pad's smaller copper dimension, emit a
-**neck** — the final stretch before the pad routes at `neck_width` =
-min(class width, pad-fit width), never below the 7.11 minimum, for a length
-between `neck_down.min_length_mm` and `max_length_mm` (at least the pad-escape
-distance out of the pin field). The 7.3b pad-escape stub is the natural home —
-stubs are already emitted separately from the gridded path. The self-check
-prices the neck at its true width (DRC-true), and Phase 4c
-`audit_netclass_conformance` must learn to accept necks: a segment narrower
-than its class is conformant when it terminates on a pad within neck length
-and matches the neck rules — otherwise still flagged. Knobs `neck_down`:
-`{enabled: true, max_width_vs_pad: 1.0, min_length_mm: 0.5, max_length_mm: 3.0}`.
+Implemented in `kicad_router_tool.py` (routing side) and `kicad_pcb_tool.py`
+(`audit_netclass_conformance` acceptance side); Sonnet subagent, worktree-
+isolated, coordinator-reviewed and merged (fast-forward, no conflicts against
+the concurrently-landed 7.5.5). `_neck_targets_for_conn` identifies a `from`/
+`to` connection endpoint as a pad whose smaller copper dimension the net-class
+width would overrun by more than `neck_down.max_width_vs_pad`, computing
+`neck_width = min(class_width, max_width_vs_pad × pad's smaller dimension)`
+floored at the board's `min_track_width` DRC rule. `_apply_neck_endpoint`
+re-tags the final stretch of already-emitted copper at that endpoint
+(splitting the boundary segment if the cut falls mid-segment) to the narrower
+width, clamped into `[min_length_mm, max_length_mm]` with a floor at
+`_NECK_ESCAPE_RING_CELLS × grid` (reusing the existing pad-escape reach
+constant rather than inventing a new one). Wired into `_finalize_core`
+(called from the normal `_route_one` ladder, its rip-up re-finalize calls, and
+the speculative parallel pass — all three now pass `conn` through). `_self_check`
+now prices any segment carrying its own `"width"` key at THAT width rather than
+the net's uniform `rules["track_width"]` — DRC-true neck pricing. **Strict
+parity guarantee, tested both directions:** a segment with no `"width"` key
+(every segment from every other landed feature) is byte-identical to pre-7.12
+behavior, and `neck_down.enabled: false` restores it exactly even for
+connections that would otherwise get a neck.
+
+`audit_netclass_conformance` no longer unconditionally flags a net whose
+dominant width differs from its class: each individual offending segment is
+checked (`_neck_conformant_segment`) and the mismatch is suppressed only when
+EVERY offending segment is a genuine neck (terminates within reach of a pad on
+the net, at that pad's exact justified width, within the configured length
+bounds) — a merely-narrow segment failing any of those checks still flags the
+mismatch (this is per-segment, not per-net: one real violation mixed with
+legitimate necks still fails the net). Accepted rows report `neck_segments:
+<count>`.
+
+**Honest residual (documented in-code, deliberate scope-down):** the Phase
+7.3b hierarchical last-resort tier (`_route_hierarchical`, only reached once
+the full `_route_attempts` ladder has failed every rung) runs its own inline
+`_route_to_emit`/`_self_check` and is NOT wired for neck-down — a connection
+that only routes via that rare fallback emits at full class width even onto a
+small pad. Scoped out deliberately to avoid touching that tier's own from-
+scratch self-check/emit path and risking its landed seam-safety guarantee for
+a corner this phase does not require.
+
+Knobs `neck_down`: `{enabled: true, max_width_vs_pad: 1.0, min_length_mm: 0.5,
+max_length_mm: 3.0}` (added to `DEFAULT_PCB_SETTINGS`). 87 tools (unchanged —
+no new MCP tool, routing/audit behavior + schema only). 6 tests in
+`tests/test_neck_down.py`: genuine-neck emission (width/length/termination
+checked), enabled-vs-disabled byte-identical parity for a pad that needs no
+neck, `_self_check` pricing proof (a neighbor obstacle that clips at the wide
+width but clears at the narrow width), and `audit_netclass_conformance`
+accepting a genuine neck while still flagging a wrong-width and a too-long
+fake neck (plus the `enabled: false` strict-mode restoration). Full suite:
+237→243 passed, same 7 pre-existing board-drift failures, 7 skipped.
 
 ### 7.13 Impedance-matched traces & matched sets
 
@@ -2149,9 +2193,6 @@ session (which also owns all user-facing verification questions):
   runtime/memory numbers at 10x and 100x kiln scale, not just working code.
 - **Docs (docs page, README, CLAUDE.md updates)** — **Haiku** subagent once code is
   merged, with the final tool list as input.
-- **7.16 benchmark harness, 7.12 neck-down, 7.14 connector detection** —
-  well-specified, reuse-heavy: **Sonnet** delegations. 7.14's acceptance must
-  include the exclusion-validation error path.
 - **7.13 impedance/matched sets and the 7.14 optimizer move + pause-the-user
   protocol** — algorithm-heavy, ride the router core: **Opus**, after their
   build-order prerequisites.
