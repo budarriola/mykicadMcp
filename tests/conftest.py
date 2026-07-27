@@ -28,8 +28,21 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-# The real kilnCtl KiCad project lives one directory above mykicadMcp/.
-_KILN_PROJECT_DIR = _REPO_ROOT.parent
+# The real kilnCtl KiCad project normally lives one directory above mykicadMcp/.
+# When mykicadMcp is checked out as an isolated agent worktree (e.g.
+# `mykicadMcp/.claude/worktrees/agent-<id>/`), the submodule's own repo root is
+# nested several levels below the real kilnCtl checkout instead of exactly one
+# level below it. Walk upward looking for the kilnCtl project marker
+# (`kiln.kicad_pro`, which only ever lives at the real project root) instead of
+# assuming a fixed nesting depth, so this resolves correctly in both layouts.
+def _find_kiln_project_dir(start: Path) -> Path:
+    for candidate in (start, *start.parents):
+        if (candidate / "kiln.kicad_pro").exists():
+            return candidate
+    return start.parent  # fallback: preserve old (non-worktree) behavior
+
+
+_KILN_PROJECT_DIR = _find_kiln_project_dir(_REPO_ROOT)
 
 
 # Board/project files pinned to the git-committed version; everything else the

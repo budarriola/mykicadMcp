@@ -4721,11 +4721,259 @@ def _route_one(
         out["win"] = None
         return out
 
+    # Every `_route_attempts` rung failed (finest grid included) - LAST RESORT:
+    # chain small fine-grid sub-windows along the global stage's own coarse
+    # path (see `_route_hierarchical`'s docstring for why this can succeed
+    # where a single wide-margin window cannot). Strictly gated behind total
+    # ladder exhaustion, so a connection that already routes today never
+    # reaches this call and is byte-identical to before this tier existed.
+    hier = _route_hierarchical(ctx, net, net_kind, from_xy, to_xy, start_layers,
+                               goal_layers, active_obstacles, gconn, home_layer,
+                               plane_layers, goal_planes)
+    if hier is not None:
+        rec_updates, segments, vias = hier
+        result_rec.update(rec_updates)
+        out.update({"routed": True, "segments": segments, "vias": vias})
+        return out
+
     # unreachable within every attempted window/grid (finest grid included).
     blocker = _nearest_blocker(win, active_obstacles, net, to_xy) if win is not None else None
     result_rec["failure"] = {"reason": "unreachable_in_window",
                              "nearest_blocker": blocker, "window_margin_mm": margin}
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Hierarchical (multi-window) last-resort tier.
+#
+# Empirical root cause (kiln board, confirmed against the committed snapshot):
+# 6 long-haul nets (40-113mm span) exhaust the ENTIRE `_route_attempts` ladder,
+# failing even at its widest rung (margin=`_MAX_WINDOW_SPAN_MM`). Every one
+# fails with the goal-adjacent obstacle 0.0-1.9mm away (tight quarters, not an
+# open board area) - `_choose_grid`'s node-budget math forces those wide-margin
+# rungs onto a grid coarse enough to step OVER the real, sub-2mm channel a
+# route needs to thread between hand-routed copper/pours near the endpoint.
+# It is a local-channel-width problem at large scale, not a lack of detour
+# room (see NETCLASS_PLAN.md).
+#
+# Fix: don't search one huge window at a coarse grid. Chain many SMALL
+# fine-grid windows along the connection's own already-computed coarse path
+# (`gconn["candidates"][0]["coarse_path"]`) - each sub-window's span is small
+# enough (`_HIER_CHUNK_SPAN_MM`) to afford the board's FINEST configured grid
+# at the same node budget, so it can find the tight channel the coarse rungs
+# stepped over.
+# --------------------------------------------------------------------------- #
+
+# Deterministic coarse-path decimation stride (mm): consecutive hierarchical
+# waypoints are spaced roughly this far apart along the global stage's winning
+# coarse path. Chosen so a sub-window's bbox (this span + 2x the margin below)
+# stays comfortably inside `_MAX_WINDOW_NODES` at the FINEST grid even on a
+# 4-layer board (a few thousand nodes, not hundreds of thousands) - the whole
+# point is affording the fine grid the coarse ladder's wide rungs cannot.
+_HIER_CHUNK_SPAN_MM = 8.0
+# Small, fixed bbox pad per sub-window. Kept tight (not doubled/escalated like
+# the main ladder) because a sub-window's endpoints are already only
+# `_HIER_CHUNK_SPAN_MM` apart on a path the coarse stage already proved is
+# geometrically plausible - room isn't the problem this tier exists to solve.
+_HIER_WINDOW_MARGIN_MM = 3.0
+
+
+def _hier_world_waypoints(
+    gconn: dict[str, Any] | None, coarse_grid: float, coarse_min: tuple[float, float],
+    from_xy: tuple[float, float], to_xy: tuple[float, float],
+) -> list[tuple[float, float, str]] | None:
+    """Deterministically decimate the global stage's winning coarse path (a
+    (cx, cy, layer) cell sequence at `coarse_grid` resolution, see
+    `_corridor_from_global`) into a sequence of WORLD (x, y, layer) waypoints
+    spaced ~`_HIER_CHUNK_SPAN_MM` apart along the path, always anchored at the
+    connection's exact `from_xy`/`to_xy`. A pure, deterministic distance-
+    accumulation walk over an already-deterministic input (same coarse_path
+    and span in => same waypoints out, always - no iteration-order or
+    randomness dependence). Returns None when there is no coarse path to chain
+    sub-windows along (nothing for this tier to do)."""
+    if not gconn or not gconn.get("candidates"):
+        return None
+    coarse_path = gconn["candidates"][0].get("coarse_path") or []
+    if not coarse_path:
+        return None
+    cmnx, cmny = coarse_min
+    world_pts: list[tuple[float, float, str]] = []
+    for entry in coarse_path:
+        cx, cy, layer = entry[0], entry[1], entry[2]
+        wx = cmnx + (cx + 0.5) * coarse_grid
+        wy = cmny + (cy + 0.5) * coarse_grid
+        world_pts.append((wx, wy, layer))
+    if not world_pts:
+        return None
+
+    waypoints: list[tuple[float, float, str]] = [(from_xy[0], from_xy[1], world_pts[0][2])]
+    acc = 0.0
+    last_xy = (from_xy[0], from_xy[1])
+    n = len(world_pts)
+    for i, (x, y, layer) in enumerate(world_pts):
+        acc += math.hypot(x - last_xy[0], y - last_xy[1])
+        last_xy = (x, y)
+        if acc >= _HIER_CHUNK_SPAN_MM and i != n - 1:
+            waypoints.append((x, y, layer))
+            acc = 0.0
+    waypoints.append((to_xy[0], to_xy[1], world_pts[-1][2]))
+
+    # Drop degenerate (near-zero-length) legs so every sub-window has a
+    # genuine, non-zero span.
+    deduped: list[tuple[float, float, str]] = [waypoints[0]]
+    for wx, wy, layer in waypoints[1:]:
+        px, py, _pl = deduped[-1]
+        if math.hypot(wx - px, wy - py) > _EMIT_EPS_MM:
+            deduped.append((wx, wy, layer))
+    return deduped if len(deduped) >= 2 else None
+
+
+def _route_hierarchical(
+    ctx: dict[str, Any], net: str, net_kind: str,
+    from_xy: tuple[float, float], to_xy: tuple[float, float],
+    start_layers: list[str], goal_layers: set[str],
+    active_obstacles: list["_Obst"], gconn: dict[str, Any] | None,
+    home_layer: str | None,
+    plane_layers: dict[str, list[dict[str, Any]]] | None,
+    goal_planes: dict[str, list[dict[str, Any]]] | None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]] | None:
+    """Last-resort tier: chain small fine-grid `_FineWindow`s along the global
+    stage's own coarse path, ONLY called after the full `_route_attempts`
+    ladder has already failed every rung (see the call site in `_route_one`).
+
+    Stitching (no coordinate transform needed): `_route_to_emit` already emits
+    segment/via records in ABSOLUTE board mm (`win.node_xy` folds in the
+    window's own origin: `self.minx + ix*self.grid`), so successive sub-
+    windows' emitted geometry concatenates directly.
+
+    Self-check (seam-safe end-to-end): `_self_check`/the cost math below run
+    ONCE against the FULL concatenated segment/via list from every leg, using
+    `active_obstacles` - the same full board-global obstacle list a normal
+    single-window connection is proven against - so a seam between two legs
+    gets exactly the same exact-clearance guarantee any other connection's
+    route gets, with zero changes to the self-check machinery itself. A
+    leg's own same-net copper is free to a later leg (the ordinary same-net
+    exemption in `_Obst`/`obstacle_cells`), so legs never falsely block each
+    other.
+
+    Rip-up: intentionally NOT wired in this landing - a hierarchical result is
+    terminal (routed, or hard-failed back to the ordinary `unreachable_in_
+    window` report), exactly how a `self_check_failed` result is treated
+    today. Left for a future landing (see NETCLASS_PLAN.md).
+
+    Determinism: a pure function of (from_xy, to_xy, the coarse path, the
+    given obstacle/layer state) - the same decimation walk, the same per-leg
+    A* (already deterministic), the same concatenation order every call.
+
+    Returns None (never a partial/half-stitched result) when: there is no
+    coarse path to chain along, any leg is unreachable even at the finest
+    grid, or the end-to-end self-check rejects the stitched geometry."""
+    coarse_grid = ctx["coarse_grid"]
+    coarse_min = ctx["coarse_min"]
+    waypoints = _hier_world_waypoints(gconn, coarse_grid, coarse_min, from_xy, to_xy)
+    if waypoints is None:
+        return None
+
+    routable_layers = ctx["routable_layers"]
+    routable_set = ctx["routable_set"]
+    layer_types = ctx["layer_types"]
+    board_bbox = ctx["board_bbox"]
+    grid = ctx["grid"]
+    rules = ctx["rules"]
+    track_half = ctx["track_half"]
+    via_radius = ctx["via_radius"]
+    weights = ctx["weights"]
+    layer_purpose = ctx["layer_purpose"]
+    directions = ctx["directions"]
+    backend = ctx["backend"]
+    plane_step = ctx["plane_step"]
+    attachment_via_cost = ctx["attachment_via_cost"]
+    max_window_nodes = ctx["max_window_nodes"]
+
+    all_segments: list[dict[str, Any]] = []
+    all_vias: list[dict[str, Any]] = []
+    cur_layers = list(start_layers)
+    n_legs = len(waypoints) - 1
+
+    for leg in range(n_legs):
+        leg_from = (waypoints[leg][0], waypoints[leg][1])
+        leg_to = (waypoints[leg + 1][0], waypoints[leg + 1][1])
+        leg_path_layer = waypoints[leg + 1][2]
+        is_last = leg == n_legs - 1
+
+        if is_last:
+            leg_goal_layers = goal_layers
+            leg_goal_planes = goal_planes
+        else:
+            leg_goal_layers = ({leg_path_layer} if leg_path_layer in routable_set
+                               else set(routable_layers))
+            leg_goal_planes = None
+
+        minx = max(min(leg_from[0], leg_to[0]) - _HIER_WINDOW_MARGIN_MM, board_bbox[0] - grid)
+        miny = max(min(leg_from[1], leg_to[1]) - _HIER_WINDOW_MARGIN_MM, board_bbox[1] - grid)
+        maxx = min(max(leg_from[0], leg_to[0]) + _HIER_WINDOW_MARGIN_MM, board_bbox[2] + grid)
+        maxy = min(max(leg_from[1], leg_to[1]) + _HIER_WINDOW_MARGIN_MM, board_bbox[3] + grid)
+        win = _FineWindow(minx, miny, maxx, maxy, grid, routable_layers, layer_types, net)
+        if win.cols * win.rows * max(1, len(routable_layers)) > max_window_nodes:
+            return None  # a chunk still too big for the node budget - bail, no partial emit
+
+        leg_obstacles = _prefilter_window_obstacles(
+            active_obstacles, net, leg_from, leg_to, board_bbox, grid,
+            [(_HIER_WINDOW_MARGIN_MM, grid)], track_half, via_radius,
+            rules["clearance"], rules["edge_clearance"])
+        win.build(leg_obstacles, track_half, via_radius, rules["clearance"], rules["edge_clearance"])
+
+        # A generous escape ring (not the pad-escape default of 6 = 1.2mm):
+        # an INTERMEDIATE waypoint is a decimated coarse-path point, not a
+        # pad, and can land deep inside a plane pour (tracks near-fully
+        # blocked there, see the class docstring) with no free cell within a
+        # tight ring - a large ring still finds the nearest real channel
+        # cheaply (the sub-window itself is small).
+        ring = max(win.cols, win.rows)
+        s_cell = win.nearest_free(leg_from[0], leg_from[1], cur_layers, max_ring=ring) or win.cell_of(*leg_from)
+        g_cell = win.nearest_free(leg_to[0], leg_to[1], list(leg_goal_layers), max_ring=ring) or win.cell_of(*leg_to)
+        path = _fine_search(backend, win, net_kind, weights, layer_purpose, directions,
+                            s_cell, cur_layers, g_cell, leg_goal_layers,
+                            home_layer, None, None, plane_layers, leg_goal_planes,
+                            plane_step, attachment_via_cost)
+        if path is None and not is_last and leg_goal_layers != set(routable_layers):
+            # Intermediate waypoint only: the coarse stage's layer preference
+            # there isn't binding, only its (x, y) location is - retry with any
+            # routable layer before giving up on this leg.
+            leg_goal_layers = set(routable_layers)
+            g_cell = win.nearest_free(leg_to[0], leg_to[1], list(leg_goal_layers), max_ring=ring) or win.cell_of(*leg_to)
+            path = _fine_search(backend, win, net_kind, weights, layer_purpose, directions,
+                                s_cell, cur_layers, g_cell, leg_goal_layers,
+                                home_layer, None, None, plane_layers, leg_goal_planes,
+                                plane_step, attachment_via_cost)
+        if path is None:
+            return None  # this leg is unreachable even at the finest grid - terminal
+
+        segs, vias = _route_to_emit(win, path, leg_from, leg_to, plane_layers)
+        all_segments.extend(segs)
+        all_vias.extend(vias)
+        cur_layers = [path[-1][2]]
+
+    if not all_segments and not all_vias:
+        return None
+    violations = _self_check(net, all_segments, all_vias, active_obstacles, rules, via_radius)
+    if violations:
+        return None  # stitched result fails the end-to-end exact-clearance pass
+
+    length = sum(math.hypot(s["x2"] - s["x1"], s["y2"] - s["y1"]) for s in all_segments)
+    layers_used = sorted({s["layer"] for s in all_segments},
+                         key=lambda l: routable_layers.index(l) if l in routable_layers else 999)
+    tw = ctx["tw"]
+    est_cost = (length * float(tw.get("length_mm", 1.0)) + len(all_vias) * float(tw.get("via", 5.0)))
+    rec_updates = {
+        "routed": True, "length_mm": round(length, 4), "via_count": len(all_vias),
+        "layers": layers_used, "segment_count": len(all_segments),
+        "window_margin_mm": _HIER_WINDOW_MARGIN_MM, "grid_mm": grid,
+        "est_phase6_cost": round(est_cost, 4),
+        "self_check": {"passed": True, "violation_count": 0},
+        "hierarchical": True, "hierarchical_legs": n_legs,
+    }
+    return rec_updates, all_segments, all_vias
 
 
 # Per-process context for the multiprocessing pool (set once by the initializer,
