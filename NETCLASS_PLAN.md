@@ -1151,10 +1151,66 @@ a soft field).
 **Still open in 7.3b (do NOT treat 7.3b as closed):** (plane-aware routing and
 7.12 neck-down were the other two open items here at the time this was
 written — both landed since, as 7.5.4 and 7.12, see their anchors) pad escape
-lands on nearest free node (not direction-aware); termination is on the `to`
-point (not "any same-net copper"); window doubling is **capped at 60 mm span /
-400k-node budget**, not whole-board (a whole-kiln 0.2 mm 4-layer raster
-~2.3M×4 nodes is infeasible in pure Python — lift with numpy/accel, M5).
+lands on nearest free node (not direction-aware — spec'd as 7.3d below);
+termination is on the `to` point (not "any same-net copper"); window doubling
+is **capped at 60 mm span / 400k-node budget**, not whole-board (a whole-kiln
+0.2 mm 4-layer raster ~2.3M×4 nodes is infeasible in pure Python — lift with
+numpy/accel, M5).
+
+### 7.3d Direction-aware pad escape (newly spec'd 2026-07-27, not yet implemented)
+
+**Why this is scoped differently from 7.5.5/7.9/7.12:** those three were pure
+additions gated behind a feature flag/new tool — a caller who never touched
+the new surface got byte-identical behavior "for free," so they were safe to
+default-enable. This one is NOT like that: `_FineWindow.nearest_free`
+(`kicad_router_tool.py` ~line 4186) is called unconditionally for **every**
+connection's start AND goal cell (`s_cell`/`g_cell` in `_route_one`, and again
+per-leg in `_route_hierarchical`) — it is not behind any flag today, so
+changing its tie-break logic changes routing geometry for the whole board,
+not just new cases. **Default this OFF** (`autorouter.pad_escape_direction_
+aware: false` in `pcb_settings.json`) so every currently-passing test (incl.
+exact `length_mm`/geometry assertions and the `benchmark_kicad_autoroute`
+score, which is compared against a fixed human baseline) stays byte-identical
+until explicitly opted into and evaluated — do NOT flip the default to `true`
+without a deliberate before/after `benchmark_kicad_autoroute` comparison and
+the user's sign-off, since unlike 7.12 this can only be judged by whether it
+measurably improves geometry on the real board, not by parity alone.
+
+**The problem (verified in `nearest_free`, current code):** the ring-search
+picks the grid node in the nearest ring that has any free layer, tie-broken
+by pure Euclidean distance to the exact pad point — it has no notion of which
+direction the path is actually going. On a dense pin field (e.g. an IC's BGA
+or a tight header), the nearest free node can be on the FAR side of the pad
+relative to the connection's other endpoint, forcing the fine A* to route
+back around the pad body/neighboring pins to reach it — this is the
+mechanism behind the residual "termination is on the `to` point" note and the
+pad-escape-related zigzag findings from the 2026-07-24 real-board session
+(see the ⭐ findings section above).
+
+**Design, gated by the new flag:** when `pad_escape_direction_aware` is true,
+`nearest_free` (or a new sibling function `nearest_free_toward`, called only
+from the two call sites above and passed the OTHER endpoint's xy) breaks ties
+within the same ring by preferring the candidate whose vector from `(x, y)`
+has the largest dot product with the direction toward the other endpoint
+(`to_xy` for the start cell, `from_xy` for the goal cell) — i.e. "escape
+toward where you're going," not just "escape to the closest open spot."
+When there is only one free candidate in the minimal ring (the common case
+on an uncongested board), behavior is unchanged regardless of the flag — the
+bias only matters when the minimal ring offers a real choice.
+
+**Testing requirement:** a synthetic dense-pin-field fixture (several tightly
+packed pads on one side of the target pad, an open ring on the other) proving
+that with the flag OFF, `nearest_free` picks the pure-nearest node (possibly
+on the wrong side), and with it ON, it picks the direction-biased node instead
+— plus the mandatory parity test: flag OFF must reproduce today's exact
+`nearest_free` output on every existing fixture that already has tests
+covering it (do not regress the existing `_FineWindow`/pad-escape test
+coverage). A real-board measurement is NOT required to land the flag (it's
+off by default) but IS required before ever flipping the default — track that
+as a follow-up, not part of this landing.
+
+Knob: `autorouter.pad_escape_direction_aware: false` (new, added to
+`DEFAULT_PCB_SETTINGS`).
 
 **Stage 1 LANDED 2026-07-21** (anchor): `kicad_router_tool.py` exists with
 `build_connectivity` (union-find islands per net) + `get_ratsnest` → tool
