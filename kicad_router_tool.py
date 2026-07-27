@@ -4183,13 +4183,29 @@ class _FineWindow:
         for ob in obstacles:
             self.add_obstacle(ob)
 
-    def nearest_free(self, x: float, y: float, layers: list[str], max_ring: int = 6
+    def nearest_free(self, x: float, y: float, layers: list[str], max_ring: int = 6,
+                     toward_xy: tuple[float, float] | None = None
                      ) -> tuple[int, int] | None:
         """Nearest grid node (spiral out) not track-blocked on at least one of
-        `layers` - the pad-escape landing node."""
+        `layers` - the pad-escape landing node.
+
+        `toward_xy` (Phase 7.3d, `autorouter.pad_escape_direction_aware`): the
+        OTHER endpoint of the connection this escape belongs to (`to_xy` when
+        escaping the start pad, `from_xy` when escaping the goal pad). When
+        given AND the winning ring has more than one free-layer candidate, the
+        pure-nearest tie-break below is replaced by a directional one: pick
+        the candidate whose vector from `(x, y)` has the largest dot product
+        with the unit direction toward `toward_xy` - i.e. "escape toward where
+        you're going" instead of "escape to the closest open spot," which on a
+        dense pin field can land on the far side of the pad and force the fine
+        A* to route back around it. Passing None (the default) - or a ring
+        with only one free candidate, the common uncongested-board case -
+        reproduces the pre-7.3d behavior exactly; callers gate `toward_xy` on
+        the settings flag so leaving it off is byte-identical to today."""
         cx, cy = self.cell_of(x, y)
         for ring in range(max_ring + 1):
             best: tuple[float, tuple[int, int]] | None = None
+            biased: list[tuple[int, int]] | None = [] if toward_xy is not None else None
             for iy in range(cy - ring, cy + ring + 1):
                 for ix in range(cx - ring, cx + ring + 1):
                     if max(abs(ix - cx), abs(iy - cy)) != ring:
@@ -4201,7 +4217,20 @@ class _FineWindow:
                         d = (nx - x) ** 2 + (ny - y) ** 2
                         if best is None or d < best[0]:
                             best = (d, (ix, iy))
+                        if biased is not None:
+                            biased.append((ix, iy))
             if best is not None:
+                if biased is not None and len(biased) > 1:
+                    tvx, tvy = toward_xy[0] - x, toward_xy[1] - y
+                    tlen = math.hypot(tvx, tvy)
+                    if tlen > 1e-9:
+                        tvx, tvy = tvx / tlen, tvy / tlen
+
+                        def _toward_score(cell: tuple[int, int]) -> float:
+                            nx, ny = self.node_xy(*cell)
+                            return (nx - x) * tvx + (ny - y) * tvy
+
+                        return max(biased, key=_toward_score)
                 return best[1]
         return None
 
@@ -5338,6 +5367,9 @@ def _route_one(
     grid = ctx["grid"]
     backend = ctx["backend"]
     weights = ctx["weights"]
+    # Phase 7.3d: the toward_xy bias below is only ever computed if this is
+    # True (settings default False) - see `nearest_free`'s docstring.
+    pad_escape_aware = bool(ctx.get("pad_escape_direction_aware", False))
     from_item_layers = (conn.get("from") or {}).get("layers") or conn.get("from_layers") or routable_layers
     to_item_layers = (conn.get("to") or {}).get("layers") or conn.get("to_layers") or routable_layers
     start_layers = [l for l in from_item_layers if l in routable_set] or routable_layers
@@ -5431,8 +5463,10 @@ def _route_one(
         any_built = True
         win._zone_cache = zone_cache
         win.build(window_obstacles, track_half, via_radius, rules["clearance"], rules["edge_clearance"])
-        s_cell = win.nearest_free(from_xy[0], from_xy[1], start_layers) or win.cell_of(*from_xy)
-        g_cell = win.nearest_free(to_xy[0], to_xy[1], list(goal_layers)) or win.cell_of(*to_xy)
+        s_cell = win.nearest_free(from_xy[0], from_xy[1], start_layers,
+                                  toward_xy=to_xy if pad_escape_aware else None) or win.cell_of(*from_xy)
+        g_cell = win.nearest_free(to_xy[0], to_xy[1], list(goal_layers),
+                                  toward_xy=from_xy if pad_escape_aware else None) or win.cell_of(*to_xy)
         corridor = _corridor_from_global(win, gconn, coarse_grid, coarse_min) if use_corridor else None
         win_cong = _project_congestion(win, congestion, board_min[0], board_min[1], grid)
         out.update({"win": win, "s_cell": s_cell, "g_cell": g_cell,
@@ -5659,6 +5693,9 @@ def _route_hierarchical(
     plane_step = ctx["plane_step"]
     attachment_via_cost = ctx["attachment_via_cost"]
     max_window_nodes = ctx["max_window_nodes"]
+    # Phase 7.3d: per-leg "other endpoint" bias (settings default False) -
+    # see `nearest_free`'s docstring and `_route_one`'s identical read.
+    pad_escape_aware = bool(ctx.get("pad_escape_direction_aware", False))
 
     all_segments: list[dict[str, Any]] = []
     all_vias: list[dict[str, Any]] = []
@@ -5700,8 +5737,10 @@ def _route_hierarchical(
         # tight ring - a large ring still finds the nearest real channel
         # cheaply (the sub-window itself is small).
         ring = max(win.cols, win.rows)
-        s_cell = win.nearest_free(leg_from[0], leg_from[1], cur_layers, max_ring=ring) or win.cell_of(*leg_from)
-        g_cell = win.nearest_free(leg_to[0], leg_to[1], list(leg_goal_layers), max_ring=ring) or win.cell_of(*leg_to)
+        s_cell = win.nearest_free(leg_from[0], leg_from[1], cur_layers, max_ring=ring,
+                                  toward_xy=leg_to if pad_escape_aware else None) or win.cell_of(*leg_from)
+        g_cell = win.nearest_free(leg_to[0], leg_to[1], list(leg_goal_layers), max_ring=ring,
+                                  toward_xy=leg_from if pad_escape_aware else None) or win.cell_of(*leg_to)
         path = _fine_search(backend, win, net_kind, weights, layer_purpose, directions,
                             s_cell, cur_layers, g_cell, leg_goal_layers,
                             home_layer, None, None, plane_layers, leg_goal_planes,
@@ -5711,7 +5750,8 @@ def _route_hierarchical(
             # there isn't binding, only its (x, y) location is - retry with any
             # routable layer before giving up on this leg.
             leg_goal_layers = set(routable_layers)
-            g_cell = win.nearest_free(leg_to[0], leg_to[1], list(leg_goal_layers), max_ring=ring) or win.cell_of(*leg_to)
+            g_cell = win.nearest_free(leg_to[0], leg_to[1], list(leg_goal_layers), max_ring=ring,
+                                      toward_xy=leg_from if pad_escape_aware else None) or win.cell_of(*leg_to)
             path = _fine_search(backend, win, net_kind, weights, layer_purpose, directions,
                                 s_cell, cur_layers, g_cell, leg_goal_layers,
                                 home_layer, None, None, plane_layers, leg_goal_planes,
@@ -6497,6 +6537,12 @@ def route_nets(
         # shipped to workers with the rest of `ctx` unchanged.
         "neck_cfg": neck_cfg, "pad_size_by_ref_num": pad_size_by_ref_num,
         "neck_min_width": neck_min_width,
+        # Phase 7.3d direction-aware pad escape: default False - a picklable
+        # bool, read once per connection in `_route_one`/`_route_hierarchical`
+        # rather than re-reading `settings` per call. See `nearest_free`'s
+        # `toward_xy` doc and NETCLASS_PLAN.md's 7.3d section for why this is
+        # gated behind a flag instead of a plain new-default addition.
+        "pad_escape_direction_aware": bool(autor.get("pad_escape_direction_aware", False)),
         # Picklable "recipe" fields used ONLY to let a worker process rebuild
         # `base_obstacles`/`plane_by_net` locally instead of receiving them
         # through pickle (see `_worker_init`) - never read by `_route_one`.

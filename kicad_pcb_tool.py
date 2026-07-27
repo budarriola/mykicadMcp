@@ -4867,6 +4867,12 @@ DEFAULT_PCB_SETTINGS: dict[str, Any] = {
         "layer_directions": "auto",
         "max_ripup_iterations": 5,
         "allowed_layers": [],
+        # Phase 7.3d: OFF by default - `nearest_free` is called unconditionally
+        # for every connection's pad escape, so flipping its tie-break changes
+        # board-wide routing geometry, not just new cases. Only flip after a
+        # deliberate before/after `benchmark_kicad_autoroute` comparison (see
+        # NETCLASS_PLAN.md's 7.3d section) - never as a casual default change.
+        "pad_escape_direction_aware": False,
         "acceleration": "auto",
         "gpu": {"memory_budget_mb": 0, "batch": "auto", "oom_fallback": True},
         "cpu": {"workers": 0, "ram_budget_mb": 0, "replicas": "auto", "replica_sync": "chunk_end"},
