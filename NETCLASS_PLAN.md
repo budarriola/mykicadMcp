@@ -165,19 +165,17 @@ For whoever (human or AI) picks this up next:
   The 35 failures are now `unreachable_in_window` (genuine dense-board
   pathfinding), not budget — closing that gap is Opus-class whole-board
   optimization (7.6), not a bounded Sonnet patch. See ⭐ findings.
-- **Next work when resumed (updated 2026-07-27 — 7.12 and 7.3d landed, see
+- **Next work when resumed (updated 2026-07-27 — 7.6 AND 7.7 both landed, see
   their anchors):** (1) **7.5.6 stitching pass** + `remove_kicad_stitching_vias`
-  + its ask-before-routing rule (last in M4) — NOTE its ordering contract ("only
-  after 7.6's stopping rule fires") gates the automatic placement pass on the
-  not-yet-built 7.6 optimizer; `remove_kicad_stitching_vias` itself
-  (listing/deleting existing stitching vias) has no such dependency and could
-  land standalone if scoped that way. (2) 7.3b's one remaining bit: lifting
-  the 60mm/400k-node window cap toward whole-board (numpy/accel, M5) — both
-  neck-down and direction-aware pad escape are now done; this is the only
-  item left that doesn't depend on 7.6, and it's a heavier M5/accel
-  undertaking, not a bounded Sonnet patch. Still open: M6 item 17 (c) Flow B
-  stack-up-gate question, and 7.14's optimizer
-  pin-swap move + pause-the-user protocol (both wait on 7.6).
+  + its ask-before-routing rule (last in M4) — its ordering contract ("only
+  after 7.6's stopping rule fires") is now satisfiable, so this is UNBLOCKED,
+  not just standalone-scopeable anymore. (2) 7.14's optimizer pin-swap move +
+  pause-the-user protocol — was waiting on 7.6/7.7, both landed, so this is
+  UNBLOCKED too. (3) 7.3b's one remaining bit: lifting the 60mm/400k-node
+  window cap toward whole-board (numpy/accel, M5) — a heavier M5/accel
+  undertaking, not a bounded Sonnet patch. (4) 7.15 effort presets + plateau
+  stopping — spec'd, not built as part of either 7.6 or 7.7, genuinely open.
+  Still open: M6 item 17 (c) Flow B stack-up-gate question.
 - **Nothing has been committed** in either repo as of this snapshot — review the
   working tree before assuming git history matches this file.
 - Verify claims against the code (`kicad_pcb_tool.py`, `kicad_mcp_server.py`,
@@ -646,6 +644,19 @@ router work):
   order items 12-16) — a reminder that "How to work this plan"'s
   cross-reference-sync rule needs to be followed more consistently going
   forward, not just applied to the newest landing.
+  (18) ✅ **Phase 7.7 AI-in-the-loop decision protocol — LANDED 2026-07-27**
+  (Opus subagent, same standing authorization as 7.6, worktree-isolated,
+  independently re-verified by the coordinator). See the 7.7 anchor for the
+  full write-up: `awaiting_decision` state, `decide_kicad_route`, the
+  scripted-decider test harness the original plan called for, and a genuine
+  correctness fix the implementer's own tests caught before landing (a
+  decision-resolving move skipped the convergence check the auto-accept path
+  already ran). 89→90 tools, 275→284 passed, same 7 pre-existing failures.
+  **This closes out the 7.6/7.7 delegation pair the plan called for** — SVG
+  option previews and a dedicated replay executor are honest, documented
+  gaps, not required for the core mechanism to work. Unblocks 7.5.6 stitching
+  and 7.14's pin-swap pause protocol, both previously gated on this landing
+  (see their respective sections/build-order items).
 
 ## How to work this plan (living document — keep it current)
 
@@ -1616,52 +1627,85 @@ it is now — left alone since an existing test
 (`test_route_board_pipeline_hooks_declared_not_faked`) asserts that exact
 string and changing it is a docs/plan judgment call, not a code one.
 
-### 7.7 AI-in-the-loop routing decisions (high-level, between designated options)
+### 7.7 — LANDED 2026-07-27 (reference anchor; no work remains here)
 
-The optimizer escalates **strategic** choices to the AI through the MCP
-call/return cycle; the AI never draws geometry. Contract:
+Implemented directly on top of the 7.6 core in `kicad_optimizer_tool.py` (Opus
+subagent, same standing authorization as 7.6, worktree-isolated, coordinator
+did a full independent code read-through plus its own from-scratch test runs
+rather than trusting the report alone). `SESSION_STATES` gained the fourth
+state, `awaiting_decision`. `_pause_check` is the gate: a pause fires only
+when `ai_decisions.enabled` is true, at least 2 applicable candidates exist,
+the winning candidate's own decision type (`_decision_type_for`, mapping the
+six move types onto the plan's six `decision_types`, with `give_up_net`/
+`sa_large_move` detected from the situation rather than the move type — see
+its code comment) is in the `decision_types` allowlist, `max_pauses_per_run`
+hasn't been spent, and — a correctness addition beyond the original text —
+the leading candidate would actually improve the score under `greedy` (else
+every option is about to be rejected regardless of choice, so a converged
+board would otherwise escalate a meaningless menu every iteration). On a
+pause, `pending_decision` carries 2–4 already-applied, already-scored options
+(id, one-line summary, score delta) whose trial directories are copied into a
+stable location so a pause survives an MCP restart. `decide_route`/MCP tool
+`decide_kicad_route(session_id, decision_id, choice, rationale)` applies the
+chosen option (or `"defer"` for the optimizer's own best-scored default),
+appends to `decision_log`, and returns the session to `running` (or straight
+to `converged`, if the committed move was the one that stopped buying
+`convergence_delta` — see the correctness note below) — it runs no further
+iterations itself. Resuming an `awaiting_decision` session via
+`optimize_kicad_board` without answering first auto-resolves it as `defer`,
+so an abandoned session still converges. Every committed move — auto or
+AI-decided — appends one self-contained entry to `decision_log`.
 
-- **Options are always machine-generated and pre-scored.** A decision is a closed
-  list of 2–4 candidates, each fully specified and already priced by the cost
-  model (7.3a candidates, 7.5.5 plane proposals, …). The AI picks one — by id —
-  or answers `defer` (optimizer takes its best-scored default). Free-form input
-  is limited to a `rationale` string, which is *recorded, never executed*.
-- **Only genuine trade-offs pause the run.** A decision fires only when the score
-  spread between best and runner-up is under `ai_decisions.min_score_spread` —
-  i.e. the cost model can't distinguish the options well, which is exactly where
-  judgment (EMI, serviceability, future rework, "that jumper layer is for rework
-  wires") beats arithmetic. Clear winners are auto-taken; `max_pauses_per_run`
-  caps the budget, after which everything auto-picks.
-- **Decision types** (the `decision_types` allowlist in 6.1):
-  - `bundle_layer` — which layer/corridor a bus bundle takes (7.3a candidates:
-    "SPI bundle: F.Cu direct through dense region vs B.Cu detour, +6.2 cost,
-    -2 vias").
-  - `plane_proposal` — create/resize a plane: candidate outlines with projected
-    cost deltas and island forecasts (7.5.5).
-  - `conflict_yield` — two nets want one channel: which yields and takes its
-    alternative candidate.
-  - `stitching_budget` — how many stitching vias an island gets (options: counts
-    with resulting `island_base / N` costs).
-  - `sa_large_move` — an annealing move above a size threshold (e.g. rip a whole
-    bundle) wants confirmation before proceeding.
-  - `give_up_net` — a net keeps failing: leave unrouted for hand-routing vs.
-    accept an expensive route (both shown with numbers).
-- **Mechanics.** `optimize_kicad_board` returns `state: "awaiting_decision"` with
-  one pending decision (options, scores, per-option SVG snippet, a one-line
-  machine-generated summary each). The AI answers via
-  `decide_kicad_route(session_id, decision_id, choice, rationale)`; the session
-  resumes to the next chunk. Undecided sessions time out to `defer` on the next
-  resume, so an abandoned session still converges.
-- **Auditability.** Every decision (options, scores, choice, rationale, whether
-  auto or AI) appends to `decision_log` in the board-local JSON. A run can be
-  **replayed** from the log (same seed + same answers → same board), which keeps
-  the optimizer debuggable even with a nondeterministic decision-maker in the
-  loop; the final report includes the log so the human review of `write=True`
-  sees *why* the board came out this way.
-- **Where the human stays.** The AI decides *between designated options*; the
-  human still holds the write gate (dry-run preview + `write=True`), the
-  hand-made-zone confirmations (7.5.5), and `pcb_settings.json` itself — the AI
-  cannot reweight the cost model mid-run.
+**Correctness fix caught by the implementer's own tests (not a spec
+deviation, a genuine bug the tests found before landing):** resolving a pause
+originally always returned to `running`, skipping the convergence check the
+auto-accept path already ran — so a run whose *last* move happened to be
+escalated diverged from an identical unescalated run (reporting
+`budget_exhausted` where the other correctly reported `converged`).
+`_resolve_pending` now runs the exact same `improvement < convergence_delta`
+test, so `decide_route` can itself return `converged`.
+
+**Parity, the load-bearing guarantee (three independent proofs in one test):**
+an `ai_decisions.enabled: false` run, a `min_score_spread: 0.0` run (nothing
+can ever be close enough to pause), and a run forced to pause on every
+eligible iteration but always answered `defer` all produce byte-identical
+move sequences and score curves — proving `defer` really is the 7.6 rule,
+not an approximation of it.
+
+**Scoped down, documented honestly:**
+- **Per-option SVG snippets — not built.** Nothing in this codebase renders a
+  board to SVG; adding that would mean new export machinery (and a
+  `kicad-cli` dependency) on the critical path of every pause. The `svg`
+  field is present on each option and always `None`; the numbers + one-line
+  summary are what a decision is actually made on.
+- **A dedicated replay executor — not built,** per the task's own scoping
+  guidance. `decision_log` entries are self-contained (options, per-option
+  scores, choice, resolved choice, rationale, auto flag, accept outcome), so
+  seed + log is sufficient for a human (or a future tool) to reconstruct why
+  a run came out the way it did; building the executor itself is future work.
+- **Two 7.6 tests that existed specifically to assert 7.7's absence were
+  replaced** (one asserted `decide_kicad_route` was unregistered; one grepped
+  the source for `ai_decisions` never being read) — correctly so, since those
+  conditions are no longer true; a new registration test and a settings-block
+  test (asserting the 6.1 key names are read, not invented) took their place.
+- Five existing resume loops widened from `while state == "running"` to
+  `while state in ("running", "awaiting_decision")` — not a relaxation, since
+  resuming a pause auto-defers per spec, so those tests still assert the same
+  outcome, just correctly stepping past a state that can now legitimately
+  occur mid-loop.
+
+89→90 tools (`decide_kicad_route`). 10 new tests in `tests/test_optimizer.py`
+(37 total in that file now), full suite 275→284 passed, same 7 pre-existing
+board-drift failures, 7 skipped (coordinator independently re-ran both the
+optimizer file and the full suite, not just reviewed the report).
+
+**Residual (noted by the implementer, accepted):** `write=True` called on an
+`awaiting_decision` session silently auto-defers, runs a chunk, and then
+writes, rather than refusing outright — consistent with the general
+resume-auto-defers-a-pause semantics, but a caller expecting a hard refusal
+on an unresolved decision gets a write instead. Worth revisiting if it proves
+surprising in practice; not blocking, since the underlying safety guarantees
+(dry-run-by-default, board-fingerprint check) are unaffected.
 
 ### 7.8 Acceleration tiers — numpy and GPU
 
@@ -2334,14 +2378,13 @@ session (which also owns all user-facing verification questions):
 
 Registered-and-landed rows are removed from this table per "How to work this
 plan". `route_kicad_nets`/`route_kicad_board`/`optimize_kicad_board`/
-`get_kicad_route_session` are all landed and gone from this table now (rip-up,
-plane-aware routing, and neck-down all landed too — this note previously
-listed them as pending, which had gone stale; see the 7.3b/7.5.4/7.12 anchors).
-Only 7.7's `decide_kicad_route` remains genuinely not-yet-built.
+`get_kicad_route_session`/`decide_kicad_route` are all landed and gone from
+this table now (rip-up, plane-aware routing, and neck-down all landed too —
+this note previously listed them as pending, which had gone stale; see the
+7.3b/7.5.4/7.12/7.6/7.7 anchors).
 
 | Tool | Function | Writes? |
 |------|----------|---------|
-| `decide_kicad_route` (7.7, not yet built) | `decide_route` | **yes (board_local.json session)** |
 | `get_kicad_system_resources` | `probe_system_resources` | no |
 | `adopt_kicad_routing` | `adopt_routing` | **yes (board_local.json)** |
 | `seed_kicad_routing_from_board` | `seed_routing_from_board` | **yes (board + board_local.json)** |
@@ -2371,14 +2414,16 @@ planned-not-implemented. **Docs sync LANDED 2026-07-23 (Haiku):**
 mention on the `route_kicad_nets`/`route_kicad_board` sections now all have
 coverage on `11-autorouter.md`; a stale-claims sweep also fixed two
 long-drifted "NOT YET IMPLEMENTED" mentions (rip-up & reroute, plane-aware
-routing) that had landed weeks earlier without a docs update; README synced to
-**87 tools**. **CLAUDE.md tool-count bump still owed** (coordinator has it
-staged locally in the parent repo but does not auto-commit there — needs the
-user's own commit; now needs to go to **89**, not 87, since 7.6 landed after
-that staged edit). **Remaining docs debt:** `optimize_kicad_board`/
-`get_kicad_route_session` (7.6, landed 2026-07-27) have no docs rows yet, and
-README needs its count bumped from 87 to 89; future Phase 7 tools add rows as
-they land)
+routing) that had landed weeks earlier without a docs update; `optimize_kicad_
+board`/`get_kicad_route_session` (7.6) and `decide_kicad_route` (7.7) also now
+documented (the latter two passes needed a small in-place fix each time,
+since a docs pass for 7.6 that merges just before 7.7 lands goes stale
+immediately — the "Known Limitation: 7.7 not implemented" note had to be
+replaced right after landing); README synced to **90 tools**. **CLAUDE.md
+tool-count bump still owed** (coordinator has it staged locally in the parent
+repo at 90 but does not auto-commit there — needs the user's own commit).
+**Remaining docs debt:** none currently known for landed tools; future Phase 7
+tools add rows as they land)
 - Extend `docs/mcp-tools/10-netclasses-and-buses.md` (or the autorouter page,
   as fits) as each remaining tool in the summary table above lands (same
   per-tool format).
@@ -2545,18 +2590,19 @@ landed 2026-07-21 — see their anchors; remaining:):
     orphan on safty_gnd F.Cu; plane moves in the detailed A*, signal parity by
     construction; both 7.5.4 residuals wired in with 7.5.5). **Remaining:** the
     7.5.6 stitching pass + `remove_kicad_stitching_vias` + its
-    ask-before-routing interaction rule — gated on 7.6's stopping rule per its
-    own ordering contract (see the 7.5.6 section), so genuinely blocked until
-    7.7 (or at least a stopping-rule equivalent) exists; `remove_kicad_
-    stitching_vias` itself has no such dependency and could land standalone.
-14. Phase 7.6 optimizer CORE — **LANDED 2026-07-27** (see its anchor; both
-    `greedy` and `sa` accept policies implemented and tested, sessions/resume
-    working). **Remaining:** 7.7's decision protocol (`decide_kicad_route`,
-    `awaiting_decision` state, `ai_decisions` config — verify with a scripted
-    decider before a live AI sits in the loop, per the original plan). 7.15
-    effort presets + plateau stopping were NOT built as part of 7.6's landing —
-    still open, track as a residual of this item. Viewer's cancel flag +
-    decision banner, and portfolio replicas (`cpu.replicas`), also still open.
+    ask-before-routing interaction rule — its ordering contract ("only after
+    7.6's stopping rule fires") is now satisfiable: 7.6's `converged`/
+    `budget_exhausted` states exist and 7.7's decision protocol landed too, so
+    this item is UNBLOCKED, not just `remove_kicad_stitching_vias` standalone
+    — reassess as the next candidate for delegation.
+14. Phase 7.6/7.7 optimizer + decision protocol — **BOTH LANDED 2026-07-27**
+    (see their anchors; `greedy` and `sa` accept policies, sessions/resume,
+    `awaiting_decision`/`decide_kicad_route`, and `decision_log` auditability
+    all implemented and tested, incl. the scripted-decider harness the
+    original plan called for). **Remaining:** 7.15 effort presets + plateau
+    stopping were NOT built as part of either landing — still open, track as
+    a residual of this item. Viewer's cancel flag + decision banner, and
+    portfolio replicas (`cpu.replicas`), also still open.
 15. Phase 7.10 warm start — adoption with 7.6 (ownership flag + backup rule);
     cross-board seeding after it (feeds 7.3a priors). Acceptance: adopt kiln's
     routing on a scratch copy, optimize, verify backup exists and the diff only
