@@ -4106,8 +4106,16 @@ def _self_check(
     placed copper (rippable). This is what lets a caller (the worklist's rip-up
     step) tell a plane-skim against a filled zone/pad/hand-track (owner is None,
     correctly terminal) apart from a skim against another already-placed
-    connection's own copper (owner is an id, demotable to rip-up)."""
-    track_half = rules["track_width"] / 2.0
+    connection's own copper (owner is an id, demotable to rip-up).
+
+    Per-segment width (Phase 7.12 neck-down): a segment carrying its own
+    `"width"` key (a neck, narrower than the net's class width) is priced at
+    THAT width, not the net's uniform `rules["track_width"]` - this is what
+    makes the self-check DRC-true for a neck (pricing it at the wide class
+    width would be an over-generous, wrong pass; pricing it at some other
+    width would be simply wrong). A segment with no `"width"` key - every
+    segment from every OTHER landed feature - falls back to
+    `rules["track_width"]`, byte-identical to pre-7.12 behavior."""
     clearance = rules["clearance"]
     edge_cl = rules["edge_clearance"]
     violations: list[dict[str, Any]] = []
@@ -4119,7 +4127,8 @@ def _self_check(
         for s in segments:
             if s["layer"] not in ob_layers:
                 continue
-            need = track_half + cl + ob.half - 1e-6
+            seg_half = s.get("width", rules["track_width"]) / 2.0
+            need = seg_half + cl + ob.half - 1e-6
             if ob.seg_within(s["x1"], s["y1"], s["x2"], s["y2"], need):
                 violations.append({"kind": "segment", "layer": s["layer"],
                                    "against_net": ob.net, "against_kind": ob.kind,
@@ -4452,18 +4461,188 @@ def _obstacles_from_emit(net: str, segments: list[dict[str, Any]], vias: list[di
 # canonical order — so the result is bit-identical for any worker count.
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# Phase 7.12: neck-down (wide net-class copper landing on a small pad)
+# --------------------------------------------------------------------------- #
+
+# Matches `_FineWindow.nearest_free`'s default `max_ring` (6 cells) - the
+# existing "how far a pad escape reaches out of a dense pin field" constant,
+# reused rather than inventing a new one (per NETCLASS_PLAN 7.12's "at least
+# the pad-escape distance out of the pin field" rule). At a connection's own
+# search grid this gives `6 * grid` mm as the practical floor under the
+# configured `neck_down.min_length_mm`.
+_NECK_ESCAPE_RING_CELLS = 6
+
+
+def _neck_targets_for_conn(ctx: dict[str, Any], conn: dict[str, Any] | None) -> dict[str, float]:
+    """{'from': neck_width, 'to': neck_width} for each connection endpoint that
+    is a PAD whose smaller copper dimension the net-class width would overrun.
+    Empty when `neck_down.enabled` is false, `conn` carries no pad-identified
+    endpoint (e.g. terminates on existing copper, not a bare pad), or the
+    class width already fits the pad (the common case - most connections
+    return {} here, which is the parity guarantee: no `"width"` key is ever
+    added to their segments).
+
+    neck_width = min(class_width, max_width_vs_pad * pad's smaller dimension),
+    floored at the board's `min_track_width` DRC rule (never emit copper
+    narrower than that floor regardless of how small the pad is) - the exact
+    Phase 7.12 spec formula."""
+    if not conn:
+        return {}
+    neck_cfg = ctx.get("neck_cfg")
+    if not neck_cfg or not neck_cfg.get("enabled", True):
+        return {}
+    pad_sizes: dict[tuple[str, str], tuple[float, float]] = ctx.get("pad_size_by_ref_num") or {}
+    if not pad_sizes:
+        return {}
+    class_width = float(ctx["rules"]["track_width"])
+    max_ratio = float(neck_cfg.get("max_width_vs_pad", 1.0))
+    floor_w = float(ctx.get("neck_min_width", 0.0) or 0.0)
+    out: dict[str, float] = {}
+    for side in ("from", "to"):
+        end = conn.get(side)
+        if not end or end.get("kind") != "pad":
+            continue
+        size = pad_sizes.get((end.get("ref", ""), end.get("pad", "")))
+        if not size:
+            continue
+        sx, sy = size
+        pad_small = min(sx, sy) if (sx and sy) else (sx or sy)
+        if pad_small <= 0 or class_width <= max_ratio * pad_small + 1e-9:
+            continue  # already fits this pad - no neck, byte-identical segments
+        neck_w = min(class_width, max_ratio * pad_small)
+        neck_w = max(neck_w, floor_w)
+        if neck_w >= class_width - 1e-9:
+            continue
+        out[side] = neck_w
+    return out
+
+
+def _split_segment_at(seg: dict[str, Any], dist_from_start: float
+                      ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Split `seg` at `dist_from_start` mm from (x1,y1) towards (x2,y2), same
+    layer on both pieces. Returns (near_part, far_part); either is None when
+    the split point falls at/beyond an endpoint (the whole segment is
+    "near", or none of it is)."""
+    total = math.hypot(seg["x2"] - seg["x1"], seg["y2"] - seg["y1"])
+    if total <= _EMIT_EPS_MM or dist_from_start >= total - _EMIT_EPS_MM:
+        return dict(seg), None
+    if dist_from_start <= _EMIT_EPS_MM:
+        return None, dict(seg)
+    t = dist_from_start / total
+    mx = seg["x1"] + (seg["x2"] - seg["x1"]) * t
+    my = seg["y1"] + (seg["y2"] - seg["y1"]) * t
+    near = {"x1": seg["x1"], "y1": seg["y1"], "x2": mx, "y2": my, "layer": seg["layer"]}
+    far = {"x1": mx, "y1": my, "x2": seg["x2"], "y2": seg["y2"], "layer": seg["layer"]}
+    return near, far
+
+
+def _apply_neck_endpoint(segments: list[dict[str, Any]], from_start: bool,
+                         target_len: float, neck_width: float) -> list[dict[str, Any]]:
+    """Tag the leading (`from_start=True`, the pad at `segments[0]`'s
+    (x1,y1)) or trailing (`from_start=False`, the pad at `segments[-1]`'s
+    (x2,y2)) stretch of `segments` - in path order, the "final stretch before
+    the pad" the 7.12 spec calls for - with `width=neck_width`, up to
+    `target_len` mm, splitting the boundary segment if the cut falls
+    mid-segment. Segments beyond the neck are returned untouched (no
+    `"width"` key - they keep emitting at the net's uniform class width
+    exactly as before this feature). Segment order and each segment's own
+    (x1,y1)->(x2,y2) direction are always preserved - only NEW dicts are
+    produced (via `dict(seg)`/`_split_segment_at`), the input list/dicts are
+    never mutated.
+
+    Never consumes past the midpoint of the whole path: if both endpoints
+    need a neck on a connection shorter than the sum of both neck lengths,
+    each side is capped to at most half the total length so the two necks
+    can never overlap or invert (a documented residual for pathologically
+    short necked connections - see NETCLASS_PLAN 7.12 notes)."""
+    if not segments:
+        return segments
+    total_len = sum(math.hypot(s["x2"] - s["x1"], s["y2"] - s["y1"]) for s in segments)
+    tlen = min(target_len, total_len / 2.0)
+    if tlen <= _EMIT_EPS_MM:
+        return segments
+    n = len(segments)
+    index_order = range(n) if from_start else range(n - 1, -1, -1)
+    replacements: dict[int, list[dict[str, Any]]] = {}
+    consumed = 0.0
+    for idx in index_order:
+        remaining = tlen - consumed
+        if remaining <= _EMIT_EPS_MM:
+            break
+        seg = segments[idx]
+        seg_len = math.hypot(seg["x2"] - seg["x1"], seg["y2"] - seg["y1"])
+        if seg_len <= remaining + _EMIT_EPS_MM:
+            # whole segment falls within the neck stretch.
+            necked = dict(seg)
+            necked["width"] = neck_width
+            replacements[idx] = [necked]
+            consumed += seg_len
+            continue
+        # boundary segment: split so only the pad-adjacent piece necks down.
+        if from_start:
+            # pad is at (x1,y1); the near piece (0..remaining) is pad-adjacent.
+            near, far = _split_segment_at(seg, remaining)
+            pieces: list[dict[str, Any]] = []
+            if near is not None:
+                near["width"] = neck_width
+                pieces.append(near)
+            if far is not None:
+                pieces.append(far)
+        else:
+            # pad is at (x2,y2); the far piece (cut..end) is pad-adjacent.
+            cut = seg_len - remaining
+            near, far = _split_segment_at(seg, cut)
+            pieces = []
+            if near is not None:
+                pieces.append(near)
+            if far is not None:
+                far["width"] = neck_width
+                pieces.append(far)
+        replacements[idx] = pieces
+        consumed = tlen
+        break
+    if not replacements:
+        return segments
+    out: list[dict[str, Any]] = []
+    for idx, seg in enumerate(segments):
+        out.extend(replacements.get(idx, [seg]))
+    return out
+
+
 def _finalize_core(
     ctx: dict[str, Any], net: str, win: "_FineWindow",
     path: list[tuple[int, int, str]], from_xy: tuple[float, float],
     to_xy: tuple[float, float], active_obstacles: list["_Obst"], margin: float,
     plane_layers: dict[str, list[dict[str, Any]]] | None,
+    conn: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Fine path -> (rec-updates, segments, vias, violations); rec-updates None
-    when the exact self-check rejects the path. Stateless (reads only `ctx`)."""
+    when the exact self-check rejects the path. Stateless (reads only `ctx`).
+
+    `conn` (the ratsnest connection this path serves - optional, defaults to
+    None) is ONLY used for Phase 7.12 neck-down: when it identifies a `from`/
+    `to` endpoint as a pad whose smaller dimension the class width would
+    overrun (`_neck_targets_for_conn`), the final stretch of copper at that
+    endpoint is re-tagged to a narrower `width` BEFORE `_self_check` runs, so
+    the self-check prices the neck at its true (narrow) width, never the
+    class width. `conn=None` (or a connection needing no neck) leaves
+    `segments` untouched - byte-identical to pre-7.12 behavior."""
     rules = ctx["rules"]
     routable_layers = ctx["routable_layers"]
     tw = ctx["tw"]
     segments, vias = _route_to_emit(win, path, from_xy, to_xy, plane_layers)
+    neck_targets = _neck_targets_for_conn(ctx, conn)
+    if neck_targets:
+        neck_cfg = ctx["neck_cfg"]
+        min_len = float(neck_cfg.get("min_length_mm", 0.5))
+        max_len = float(neck_cfg.get("max_length_mm", 3.0))
+        floor_len = _NECK_ESCAPE_RING_CELLS * win.grid
+        target_len = min(max(min_len, floor_len), max_len)
+        if "from" in neck_targets:
+            segments = _apply_neck_endpoint(segments, True, target_len, neck_targets["from"])
+        if "to" in neck_targets:
+            segments = _apply_neck_endpoint(segments, False, target_len, neck_targets["to"])
     violations = _self_check(net, segments, vias, active_obstacles, rules, ctx["via_radius"])
     if violations:
         return None, segments, vias, violations
@@ -4717,7 +4896,7 @@ def _route_one(
             continue  # unreachable at this (margin, grid) - try the next ladder rung
 
         rec_updates, segments, vias, violations = _finalize_core(
-            ctx, net, win, path, from_xy, to_xy, active_obstacles, margin, plane_layers)
+            ctx, net, win, path, from_xy, to_xy, active_obstacles, margin, plane_layers, conn)
         if rec_updates is None:
             # A path cleared the A* obstacle model but not the exact clearance
             # pass (a plane-skim). NOT unconditionally terminal: `out["path"]`
@@ -4892,6 +5071,14 @@ def _route_hierarchical(
     terminal (routed, or hard-failed back to the ordinary `unreachable_in_
     window` report), exactly how a `self_check_failed` result is treated
     today. Left for a future landing (see NETCLASS_PLAN.md).
+
+    Neck-down (7.12): also NOT wired here - this tier runs its own inline
+    `_route_to_emit`/`_self_check` rather than `_finalize_core`, and this
+    rare last-resort path (only reached once the whole `_route_attempts`
+    ladder has failed) is deliberately left out of neck-down's scope rather
+    than risking this tier's own seam-safety self-check guarantee. A
+    connection that only routes via this tier emits at full class width even
+    onto a small pad - see `route_nets`'s docstring HONEST RESIDUAL note.
 
     Determinism: a pure function of (from_xy, to_xy, the coarse path, the
     given obstacle/layer state) - the same decimation walk, the same per-leg
@@ -5494,8 +5681,28 @@ def route_nets(
     what was reported.
 
     Still simplified vs. the full spec (documented honestly): pad escape lands
-    on the nearest free grid node rather than a pad-direction-aware exact stub;
-    neck-down (7.12) is not applied.
+    on the nearest free grid node rather than a pad-direction-aware exact stub.
+
+    PHASE 7.12 (neck-down) IS ACTIVE for every connection routed through the
+    normal `_finalize_core` path (the ordinary ladder in `_route_one`, its
+    rip-up re-finalize calls, and the speculative parallel pass - all three
+    call `_finalize_core` with the connection, see `_neck_targets_for_conn`):
+    when a `from`/`to` endpoint is identified as a pad (`_item_id`'s `kind ==
+    "pad"`) whose smaller copper dimension the net-class width would overrun
+    by more than `neck_down.max_width_vs_pad`, the final stretch of copper at
+    that endpoint (`_apply_neck_endpoint`) is emitted at a narrower
+    `neck_width` instead - self-checked at that true narrow width, never the
+    wide class width. `neck_down.enabled: false` (or an endpoint whose class
+    width already fits its pad - the common case) leaves every segment
+    without a `"width"` key, byte-identical to pre-7.12 emission.
+    HONEST RESIDUAL: the Phase-5.x hierarchical last-resort tier
+    (`_route_hierarchical`, only reached after the full `_route_attempts`
+    ladder has failed every rung) does its own `_route_to_emit`/`_self_check`
+    inline and is NOT wired for neck-down - a connection that only routes via
+    that rare fallback tier lands at full class width even onto a small pad.
+    Scoped out deliberately rather than touching that tier's own from-scratch
+    self-check/emit path and risking its landed seam-safety guarantees for a
+    corner this phase does not require.
 
     PHASE 7.5.4 (plane-aware routing) IS ACTIVE for any net that owns a zone
     (a zone whose `net` matches - see `_plane_components_for`): a move whose
@@ -5609,6 +5816,27 @@ def route_nets(
     _plane_stack_order = {name: i for i, name in enumerate(all_cu)}
     _plane_components_cache: dict[str, dict[str, list[dict[str, Any]]]] = {}
 
+    # -- 7.12 neck-down: per-(ref, pad number) copper size, reusing the same
+    #    footprint parse `_plane_footprints` already loaded above (no extra
+    #    board read). Keyed exactly like `_item_id`'s pad identity (`ref`/
+    #    `pad`), which is what a ratsnest connection's `from`/`to` carries. ---- #
+    neck_cfg = settings.get("neck_down", {}) or {}
+    pad_size_by_ref_num: dict[tuple[str, str], tuple[float, float]] = {}
+    for fp in _plane_footprints.values():
+        ref = fp.get("reference", "")
+        for pad in fp["pads"]:
+            size = pad.get("size") or {}
+            sx = float(size.get("x", 0.0) or 0.0)
+            sy = float(size.get("y", 0.0) or 0.0)
+            pad_size_by_ref_num[(ref, pad.get("number", ""))] = (sx, sy)
+    neck_min_width = 0.0
+    if neck_cfg.get("enabled", True):
+        try:
+            neck_min_width = float(
+                get_drc_constraints(project_path)["constraints"].get("track_width", {}).get("value") or 0.0)
+        except Exception:
+            neck_min_width = 0.0
+
     def _plane_components_for(net: str) -> dict[str, list[dict[str, Any]]] | None:
         """This net's own fill, per routable layer, as `[{"raster", "factor"}]`
         components (7.5.3 model: mainland factor 1.0, island `island_base /
@@ -5707,6 +5935,11 @@ def route_nets(
         "track_half": track_half, "via_radius": via_radius, "rules": rules,
         "global_by_key": global_by_key, "tw": tw, "plane_by_net": plane_by_net,
         "base_obstacles": obstacles,
+        # Phase 7.12 neck-down: config + per-(ref, pad) copper size + the
+        # board's min_track_width DRC floor. Small, picklable primitives -
+        # shipped to workers with the rest of `ctx` unchanged.
+        "neck_cfg": neck_cfg, "pad_size_by_ref_num": pad_size_by_ref_num,
+        "neck_min_width": neck_min_width,
         # Picklable "recipe" fields used ONLY to let a worker process rebuild
         # `base_obstacles`/`plane_by_net` locally instead of receiving them
         # through pickle (see `_worker_init`) - never read by `_route_one`.
@@ -6019,7 +6252,8 @@ def route_nets(
                             keep_obs.extend(pl["obstacles"])
                     rec_updates, segments, vias, violations = _finalize_core(
                         ctx, core["net"], win, free_path, core["from_xy"], core["to_xy"],
-                        keep_obs, core.get("margin", base_margin), core["plane_layers"])
+                        keep_obs, core.get("margin", base_margin), core["plane_layers"],
+                        owner_conns[owner])
                     if rec_updates is not None:
                         ripup_iterations += 1
                         congestion_escalations += _raise_path_congestion(
@@ -6087,7 +6321,8 @@ def route_nets(
                         keep_obs.extend(pl["obstacles"])
                 rec_updates, segments, vias, violations = _finalize_core(
                     ctx, core["net"], win, core["path"], core["from_xy"], core["to_xy"],
-                    keep_obs, core.get("margin", base_margin), core["plane_layers"])
+                    keep_obs, core.get("margin", base_margin), core["plane_layers"],
+                    owner_conns[owner])
                 if rec_updates is not None:
                     ripup_iterations += 1
                     congestion_escalations += _raise_path_congestion(
@@ -6156,7 +6391,10 @@ def route_nets(
         blocks: list[str] = []
         records: list[dict[str, Any]] = []
         for (net, s, uid) in emit_segments:
-            blocks.append(_segment_block(s, net, rules["track_width"], uid))
+            # Phase 7.12: a segment carrying its own "width" (a neck) wins
+            # over the net's uniform class width; absence of the key (every
+            # segment from every other feature) is byte-identical to before.
+            blocks.append(_segment_block(s, net, s.get("width", rules["track_width"]), uid))
             records.append({"uuid": uid, "net": net, "kind": "segment"})
             owned_added["segments"].append(uid)
         for (net, v, uid) in emit_vias:

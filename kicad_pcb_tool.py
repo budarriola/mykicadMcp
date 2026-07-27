@@ -4881,6 +4881,12 @@ DEFAULT_PCB_SETTINGS: dict[str, Any] = {
         "create_plane": 15.0,
         "modify_plane": 5.0,
     },
+    "neck_down": {
+        "enabled": True,
+        "max_width_vs_pad": 1.0,
+        "min_length_mm": 0.5,
+        "max_length_mm": 3.0,
+    },
     "schematic_checks": {
         "cap_voltage": {
             "derating_min_ratio": 2.0,
@@ -6137,6 +6143,80 @@ def create_netclass(
     return result
 
 
+def _board_min_track_width_floor(project_file: Path) -> float:
+    """The board's `min_track_width` DRC rule (`board.design_settings.rules.
+    min_track_width` in `.kicad_pro`), or 0.0 when unset - the "7.11 anchor"
+    floor a Phase 7.12 neck must never go narrower than (a neck that ignored
+    this would itself be a DRC violation, defeating the point of "DRC-true"
+    neck pricing). Parsed directly here (a minimal duplicate of the same
+    `.kicad_pro` field `kicad_router_tool._parse_kicad_pro_constraints` reads)
+    rather than imported from `kicad_router_tool`, which imports THIS module
+    (`as _pcb`) - importing back would be a cycle."""
+    if not project_file.exists():
+        return 0.0
+    try:
+        pro_data = json.loads(project_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return 0.0
+    rules = pro_data.get("board", {}).get("design_settings", {}).get("rules", {})
+    try:
+        return float(rules.get("min_track_width", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _neck_conformant_segment(
+    seg: dict[str, Any], pads: list[dict[str, Any]], class_width: float,
+    neck_cfg: dict[str, Any], min_width_floor: float,
+) -> bool:
+    """True when `seg` (a segment routed narrower than its net's class width)
+    is a legitimate Phase 7.12 neck rather than a real conformance violation:
+    its length falls within `[min_length_mm, max_length_mm]` AND at least one
+    of its endpoints lands within reach of some pad ON THIS NET whose smaller
+    copper dimension justifies exactly this width (`min(class_width,
+    max_width_vs_pad * pad's smaller dimension)`, floored at the board's
+    `min_track_width` DRC rule - the same formula `kicad_router_tool` uses to
+    CHOOSE the neck width when routing). `neck_down.enabled: false` always
+    returns False here, restoring the pre-7.12 strict behavior exactly (every
+    off-class-width segment stays flagged, same as before this feature
+    landed)."""
+    if not neck_cfg.get("enabled", True):
+        return False
+    min_len = float(neck_cfg.get("min_length_mm", 0.5))
+    max_len = float(neck_cfg.get("max_length_mm", 3.0))
+    max_ratio = float(neck_cfg.get("max_width_vs_pad", 1.0))
+    length = float(seg.get("length", 0.0))
+    if length < min_len - 1e-6 or length > max_len + 1e-6:
+        return False
+    start = seg.get("start") or {}
+    end = seg.get("end") or {}
+    endpoints = [(start.get("x"), start.get("y")), (end.get("x"), end.get("y"))]
+    for ex, ey in endpoints:
+        if ex is None or ey is None:
+            continue
+        for pad in pads:
+            size = pad.get("size") or {}
+            sx = float(size.get("x", 0.0) or 0.0)
+            sy = float(size.get("y", 0.0) or 0.0)
+            if sx <= 0 and sy <= 0:
+                continue
+            reach = max(sx, sy) / 2.0
+            pos = pad.get("position") or {}
+            px, py = pos.get("x"), pos.get("y")
+            if px is None or py is None:
+                continue
+            if math.hypot(ex - px, ey - py) > reach + 1e-6:
+                continue
+            pad_small = min(sx, sy) if (sx and sy) else (sx or sy)
+            if pad_small <= 0:
+                continue
+            expected = min(class_width, max_ratio * pad_small)
+            expected = max(expected, min_width_floor)
+            if abs(float(seg.get("width", 0.0)) - expected) <= 1e-6:
+                return True
+    return False
+
+
 def audit_netclass_conformance(project_path: str | Path) -> dict[str, Any]:
     """Reconciliation report (Phase 4c): for each routed net, resolve which
     net class it's assigned to via `<project>.kicad_pro`'s
@@ -6146,6 +6226,23 @@ def audit_netclass_conformance(project_path: str | Path) -> dict[str, Any]:
     `via_diameter`/`via_drill` against the net's *actual* routed dominant
     values (Phase 1's `get_net_track_widths`) and reports a `mismatches` list
     per net, e.g. "net is in class SPI (0.2 mm) but routed at 0.3 mm."
+
+    Phase 7.12 neck-down awareness: a net whose *dominant* width differs from
+    its class (e.g. a short jumper whose copper is ENTIRELY a neck, or a net
+    whose length-weighted dominant width happens to be its neck rather than
+    its class width) is no longer unconditionally flagged. Every segment
+    routed narrower than the class width is checked individually
+    (`_neck_conformant_segment`): if EVERY such segment is a genuine neck
+    (terminates within reach of a pad on this net, at that pad's exact
+    justified neck width, for a length inside the configured neck bounds),
+    the track_width mismatch is suppressed and `neck_segments` on the row
+    reports how many segments were accepted this way. A segment that is
+    merely narrow but does not satisfy the neck geometry - wrong length,
+    wrong width for its pad, or not terminated on any pad at all - still
+    fails this check, so the mismatch stays flagged exactly as before. This
+    is intentionally per-SEGMENT, not per-net: a net with even one real
+    (non-neck) narrow segment mixed in with legitimate necks still reports
+    the mismatch.
 
     Read-only. A pattern referencing a netclass name absent from
     `net_settings.classes` is reported as a row-level `error` instead of a
@@ -6172,6 +6269,19 @@ def audit_netclass_conformance(project_path: str | Path) -> dict[str, Any]:
             continue
 
     width_data = get_net_track_widths(project_path)
+
+    neck_cfg = load_pcb_settings(project_path)["config"].get("neck_down", {}) or {}
+    min_width_floor = _board_min_track_width_floor(project_file)
+    tracks = _parse_tracks_cached(board_path)
+    segments_by_net: dict[str, list[dict[str, Any]]] = {}
+    for seg in tracks["segments"]:
+        if seg["net"]:
+            segments_by_net.setdefault(seg["net"], []).append(seg)
+    pads_by_net: dict[str, list[dict[str, Any]]] = {}
+    for fp in _parse_footprint_pads_cached(board_path).values():
+        for pad in fp["pads"]:
+            if pad.get("net"):
+                pads_by_net.setdefault(pad["net"], []).append(pad)
 
     rows: list[dict[str, Any]] = []
     mismatch_count = 0
@@ -6218,11 +6328,28 @@ def audit_netclass_conformance(project_path: str | Path) -> dict[str, Any]:
         class_via_drill = float(class_def.get("via_drill", 0)) if _is_number(str(class_def.get("via_drill", ""))) else None
 
         mismatches: list[str] = []
+        neck_segment_count = 0
         if actual_width is not None and class_width is not None and abs(actual_width - class_width) > 1e-6:
-            mismatches.append(
-                f"track_width: class {assigned_class_name!r} specifies {class_width} mm but "
-                f"{entry.get('segment_count', 0)} segment(s) are routed at {actual_width} mm"
-            )
+            # Candidate track_width mismatch. Before flagging, give every
+            # segment routed narrower than the class width a chance to prove
+            # itself a legitimate Phase 7.12 neck rather than a real
+            # violation - see `_neck_conformant_segment`. A segment at the
+            # class width itself, or WIDER (never expected but not this
+            # check's concern), is not an "offending" segment.
+            net_segments = segments_by_net.get(net_name, [])
+            net_pads = pads_by_net.get(net_name, [])
+            offending = [s for s in net_segments
+                        if s.get("width", 0.0) > 0 and abs(s["width"] - class_width) > 1e-6]
+            all_necks = bool(offending) and all(
+                _neck_conformant_segment(s, net_pads, class_width, neck_cfg, min_width_floor)
+                for s in offending)
+            if all_necks:
+                neck_segment_count = len(offending)
+            else:
+                mismatches.append(
+                    f"track_width: class {assigned_class_name!r} specifies {class_width} mm but "
+                    f"{entry.get('segment_count', 0)} segment(s) are routed at {actual_width} mm"
+                )
         if actual_via_diameter is not None and class_via_diameter is not None and abs(actual_via_diameter - class_via_diameter) > 1e-6:
             mismatches.append(
                 f"via_diameter: class {assigned_class_name!r} specifies {class_via_diameter} mm but "
@@ -6236,20 +6363,21 @@ def audit_netclass_conformance(project_path: str | Path) -> dict[str, Any]:
 
         if mismatches:
             mismatch_count += 1
-        rows.append(
-            {
-                "net": net_name,
-                "assigned_class": assigned_class_name,
-                "class_track_width": class_width,
-                "actual_dominant_width": actual_width,
-                "class_via_diameter": class_via_diameter,
-                "actual_via_diameter": actual_via_diameter,
-                "class_via_drill": class_via_drill,
-                "actual_via_drill": actual_via_drill,
-                "mismatches": mismatches,
-                "conforms": not mismatches,
-            }
-        )
+        row = {
+            "net": net_name,
+            "assigned_class": assigned_class_name,
+            "class_track_width": class_width,
+            "actual_dominant_width": actual_width,
+            "class_via_diameter": class_via_diameter,
+            "actual_via_diameter": actual_via_diameter,
+            "class_via_drill": class_via_drill,
+            "actual_via_drill": actual_via_drill,
+            "mismatches": mismatches,
+            "conforms": not mismatches,
+        }
+        if neck_segment_count:
+            row["neck_segments"] = neck_segment_count
+        rows.append(row)
 
     return {
         "project_file": str(project_file),
