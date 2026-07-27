@@ -490,16 +490,54 @@ router work):
   `GND_Safty` zone fill, unrelated to this item). Board score unchanged
   (`get_trace_cost` total 10367.891) since neither remaining failure was
   eligible for demotion — this item's value will show up once more
-  self-check-failed nets exist to demote (e.g. after hierarchical windowing
-  below routes more of the long nets and any of ITS results skim).
-  **NOW: the remaining completion gaps, in
-  descending value:** (a) **hierarchical / multilevel windowing for the long
-  inter-module nets** (40–113 mm, coarse-grid `unreachable` — the wide-margin
-  ladder rungs get forced onto a grid too coarse, ~0.5–0.8 mm, to thread the
-  real ≤0.5–2 mm channels next to GND/power planes these nets need); (b) the
-  genuinely-sealed pads need rip-up of hand copper (which we never do) —
-  accept or flag. THEN quality/score work vs 8552.276. `benchmark` is the
-  standing gate throughout.
+  self-check-failed nets exist to demote (e.g. from a future net whose
+  hierarchical-tier result, item 10 below, skims).
+  (10) ✅ **Hierarchical / multilevel windowing tier — LANDED 2026-07-26
+  (Sonnet subagent, coordinator-verified, `ef7a71c`).** `_route_hierarchical`
+  (+ `_hier_world_waypoints`, `kicad_router_tool.py`) chains small fine-grid
+  `_FineWindow`s (span `_HIER_CHUNK_SPAN_MM`=8mm, margin
+  `_HIER_WINDOW_MARGIN_MM`=3mm) along the global stage's own coarse path
+  (decimated every ~8mm), stitches each leg's absolute-mm segments/vias, and
+  runs `_self_check` ONCE end-to-end (seams get the same exact-clearance
+  guarantee as any other route, no self-check changes needed). Gated strictly
+  behind full `_route_attempts` ladder exhaustion — a connection that already
+  routes today never reaches this tier and stays byte-identical. Intentionally
+  NOT wired into rip-up (a hierarchical result is terminal, like
+  `self_check_failed` was before item 9). 6 new tests
+  (`tests/test_hierarchical_route.py`) prove it against a SYNTHETIC wall-with-
+  a-narrow-gap scenario (every `_route_attempts` rung's coarsened grid
+  provably misses the gap, a small fine-grid sub-window finds it) — chosen
+  because the real board's 6 long nets turned out NOT to be an instance of
+  this problem (see below). Also fixed (bonus): `tests/conftest.py`
+  `kiln_project_path` assumed a fixed one-level nesting above `mykicadMcp/`,
+  which silently broke (skipping 55 golden tests) under an agent-worktree
+  checkout; now walks upward for the `kiln.kicad_pro` marker. 151→211
+  passed, 55→1 skipped.
+  **Re-diagnosis of the 6 long nets (BFS flood-fill over the real obstacle
+  grid, not just A* failure): they are NOT a "channel exists but the grid
+  missed it" case.** They sit in genuinely isolated copper islands — e.g.
+  `/SaftyProcessor/saftyRelay`'s source pad has only ~21–154 total reachable
+  `(x, y, layer)` states in the ENTIRE board, at ANY grid resolution,
+  including via-hops through via-transparent GND pours (confirmed for a
+  second net, `5V_Main`, as well). This is a hard topological enclosure — no
+  legal channel exists at all — which no pathfinding-only tier (windowed,
+  hierarchical, or otherwise) can fix; it needs zone rip-up/neck-down of hand
+  copper, same as the "genuinely-sealed pads" item below. **So this landing
+  is a real, tested, general-purpose capability (useful for any FUTURE net
+  whose failure mode actually is grid-resolution-driven) but does not itself
+  unblock the current 6 nets** — board score and routed-count unchanged
+  (8552.276 / no new copper on the real board).
+  **NOW: the remaining completion gap — the genuinely-enclosed nets** (the 6
+  long inter-module nets, converged with the "genuinely-sealed pads" item:
+  both are the same underlying problem, a pad/net topologically walled in by
+  hand-routed/plane copper with no legal channel at any resolution) **need
+  rip-up of HAND copper, which the router never does today** — accept as a
+  routing-completion ceiling and flag for the user, or scope a deliberate
+  hand-copper-rip-up feature (a materially bigger, riskier capability than
+  the autorouter-copper-only rip-up in item 9 — would need explicit user
+  sign-off given it touches copper the user placed by hand). THEN
+  quality/score work vs 8552.276. `benchmark` is the standing gate
+  throughout.
 
 ## How to work this plan (living document — keep it current)
 
