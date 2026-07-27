@@ -5,7 +5,7 @@
 Phase 7.3 windowed A* detailed routing (fine-grained exact copper generation) and its supporting
 infrastructure: ratsnest calculation, layer/constraint querying, and undo (unrouting). This group
 covers the implemented core of the autorouter pipeline as it exists today, with honest documentation
-of what is NOT yet implemented (rip-up/negotiation, plane-aware routing, neck-down). The routing
+of what is NOT yet implemented (rip-up/negotiation, plane-aware routing). The routing
 workflow is: **ratsnest** (find unrouted connections) → **global route** (7.3a, decide layers/corridors)
 → **detail route** (7.3b core, this group) → **self-check** (before write) → **emit**.
 
@@ -183,6 +183,16 @@ connection (in priority-desc/airline-asc order from ratsnest):
 Newly emitted copper becomes an obstacle for later connections in the same run, so multiple routed
 nets in one call stay DRC-clean against each other.
 
+**Phase 7.12 (Neck-down)** — When a wide net-class connection lands on a small pad, the final
+stretch of copper at that endpoint is automatically narrowed to fit the pad. The neck width is
+sized as a fraction of the class width, capped at the pad's smaller copper dimension, and floored
+at the board's DRC minimum track width. Enabled by default via `pcb_settings.json`:
+`neck_down: {enabled: true, max_width_vs_pad: 1.0, min_length_mm: 0.5, max_length_mm: 3.0}`.
+The narrowed segment is self-checked at its true (narrow) width, so no conformance violations are
+raised for a genuine neck. One residual: the Phase-5.x hierarchical last-resort routing tier (fallback
+when detailed A* exhausts all windows) does not apply neck-down; connections that only route via
+hierarchical placement will not emit necks (rare in practice).
+
 **NOT YET IMPLEMENTED (Planned):**
 - Step 4's PathFinder negotiated-congestion **rip-up & reroute** — connections that cannot fit in
   their window without ripping existing autorouter copper currently FAIL with their nearest blocker
@@ -190,7 +200,6 @@ nets in one call stay DRC-clean against each other.
   is active.
 - **Plane-aware routing** — On plane-filled layers (power/ground pours), only pour-free channels
   route today. Full plane-aware routing (via drops through pours, plane-aware A\*) is a later phase.
-- **Neck-down** (7.12) — Not yet applied.
 
 **write=false** (default) returns a full preview — per connection: `routed` flag, `length_mm`, via
 count, layers used, est. Phase-6 cost, self-check result, and failures with reasons — WITHOUT
@@ -736,8 +745,9 @@ When a connection cannot be routed:
 2. **Rip-up & negotiate NOT implemented** — `max_ripup_iterations` is a stub. When a connection
    cannot fit without removing existing autorouter copper, it fails (never rips). Negotiated
    congestion re-costing and PathFinder-style netlist negotiation are planned.
-3. **Neck-down NOT implemented** — Neck-down (trace width reduction for dense fanout, 7.12) is
-   a later phase.
+3. **Hierarchical tier has no neck-down** — The Phase-5.x hierarchical last-resort routing tier
+   (fallback when detailed A* fails all windows) routes without applying Phase 7.12 neck-down;
+   this is rare in practice.
 4. **Simplified pad escape** — Lands on the nearest free grid node, not a pad-direction-aware exact
    stub (a minor detail, but documented honestly).
 5. **Termination on connection's `to` point** — Not "any same-net copper" and not a connection hub;
