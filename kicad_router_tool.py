@@ -4276,6 +4276,101 @@ def _raise_path_congestion(congestion: dict[tuple[int, int, str], int], win: _Fi
     return bumped
 
 
+def _compute_plane_components_for(
+    net: str, plane_fill_index: dict[str, list[dict[str, Any]]],
+    power_patterns: list[str], plane_footprints: dict[str, Any],
+    plane_tracks: dict[str, list[dict[str, Any]]],
+    plane_pads_by_net: dict[str, list[dict[str, Any]]],
+    plane_stack_order: dict[str, int], all_cu: list[str], routable_set: set[str],
+    island_base: float, orphan_island_cost: float,
+    cache: dict[str, dict[str, list[dict[str, Any]]]] | None = None,
+) -> dict[str, list[dict[str, Any]]] | None:
+    """Module-level twin of `route_nets`'s `_plane_components_for` closure - same
+    body, parameterized so a multiprocessing WORKER can recompute a net's plane
+    components locally (from board-derived inputs it rebuilds itself) instead of
+    receiving a pre-built dict of `_FillRaster`-bearing objects through pickle,
+    which is what made the pool initializer's `dump()` the dominant cost of the
+    old parallel path (see 7.8b profiling notes). Pure function of its inputs;
+    identical output to the parent's closure for the same board state."""
+    if net not in plane_fill_index:
+        return None
+    if _pcb._net_kind(net, None, power_patterns) != "power":
+        return None
+    if cache is not None:
+        cached = cache.get(net)
+        if cached is not None:
+            return cached
+    by_layer: dict[str, list[dict[str, Any]]] = {}
+    for e in plane_fill_index[net]:
+        if e["layer"] in routable_set:
+            by_layer.setdefault(e["layer"], []).append(e)
+    result: dict[str, list[dict[str, Any]]] = {}
+    for layer, entries in sorted(by_layer.items()):
+        recs = []
+        for e in entries:
+            comp_like = {"raster": e["raster"], "pts": e["pts"]}
+            attachments = _component_attachments(
+                comp_like, layer, net, plane_pads_by_net, plane_tracks,
+                plane_stack_order, all_cu,
+            )
+            recs.append((e, len(attachments), _polygon_area_mm2(e["pts"])))
+        recs.sort(key=lambda r: (-r[1], -r[2]))
+        comps: list[dict[str, Any]] = []
+        for idx, (e, n, _area) in enumerate(recs):
+            if idx == 0:
+                factor = 1.0
+            elif n == 0:
+                factor = orphan_island_cost
+            else:
+                factor = island_base / n
+            comps.append({"raster": e["raster"], "factor": factor})
+        result[layer] = comps
+    if cache is not None:
+        cache[net] = result
+    return result
+
+
+class _LazyPlaneByNet:
+    """Worker-side stand-in for the parent's `plane_by_net` dict: same `.get(net)`
+    interface `_route_one` uses, but computes (and memoizes) each net's plane
+    components on first access from board-derived recipe pieces the worker
+    rebuilt itself in `_worker_init`, instead of receiving the whole dict (with
+    its `_FillRaster` payloads) through the pool initializer's pickle. Bit-
+    identical values to the parent's dict for the same board state - a pure
+    function of the same inputs, just evaluated lazily and process-locally."""
+
+    __slots__ = ("fill_index", "power_patterns", "footprints", "tracks",
+                 "pads_by_net", "stack_order", "all_cu", "routable_set",
+                 "island_base", "orphan_island_cost", "_cache")
+
+    def __init__(self, fill_index: dict[str, list[dict[str, Any]]],
+                 power_patterns: list[str], footprints: dict[str, Any],
+                 tracks: dict[str, list[dict[str, Any]]],
+                 pads_by_net: dict[str, list[dict[str, Any]]],
+                 stack_order: dict[str, int], all_cu: list[str],
+                 routable_set: set[str], island_base: float,
+                 orphan_island_cost: float) -> None:
+        self.fill_index = fill_index
+        self.power_patterns = power_patterns
+        self.footprints = footprints
+        self.tracks = tracks
+        self.pads_by_net = pads_by_net
+        self.stack_order = stack_order
+        self.all_cu = all_cu
+        self.routable_set = routable_set
+        self.island_base = island_base
+        self.orphan_island_cost = orphan_island_cost
+        self._cache: dict[str, dict[str, list[dict[str, Any]]]] = {}
+
+    def get(self, net: str, default: Any = None) -> Any:
+        result = _compute_plane_components_for(
+            net, self.fill_index, self.power_patterns, self.footprints,
+            self.tracks, self.pads_by_net, self.stack_order, self.all_cu,
+            self.routable_set, self.island_base, self.orphan_island_cost,
+            self._cache)
+        return result if result is not None else default
+
+
 def _obstacles_from_emit(net: str, segments: list[dict[str, Any]], vias: list[dict[str, Any]],
                          track_half: float, via_radius: float, routable_layers: list[str],
                          owner: int) -> list["_Obst"]:
@@ -4478,16 +4573,53 @@ _WORKER_CTX: dict[str, Any] | None = None
 
 
 def _worker_init(ctx: dict[str, Any]) -> None:
+    """Pool initializer: runs ONCE per worker process at startup (not per task).
+
+    `ctx` here is the LIGHT variant `_run_independent_routes` builds - it omits
+    `base_obstacles` and `plane_by_net` (the two keys whose pickled payload used
+    to dominate pool start-up cost: thousands of `_Obst`/`_FillRaster` objects)
+    and instead carries a small `_obstacle_recipe` of picklable primitives (a
+    board path string + the layer/clearance/pattern inputs `_collect_obstacles`
+    needs). Each worker rebuilds its OWN `base_obstacles` and a lazy
+    `plane_by_net` (`_LazyPlaneByNet`) from that recipe, via the SAME pure
+    functions the parent used to build them - bit-identical content, just
+    computed locally instead of shipped through `pickle.dump`, which is what
+    made the old initializer slow (the obstacle list serialized at ~20s per
+    worker on the real kiln board; recomputing it from the cached board parse
+    is a small fraction of that)."""
     global _WORKER_CTX
+    ctx = dict(ctx)
+    recipe = ctx.pop("_obstacle_recipe", None)
+    if "base_obstacles" not in ctx and recipe is not None:
+        board_path_str, routable_set, all_cu, edge_clearance, power_patterns = recipe
+        board_path = Path(board_path_str)
+        ctx["base_obstacles"] = _collect_obstacles(
+            board_path, routable_set, all_cu, edge_clearance, power_patterns)
+        if "plane_by_net" not in ctx:
+            plane_fill_index = _zone_fill_index_cached(board_path)
+            plane_footprints = _pcb._parse_footprint_pads_cached(board_path)
+            plane_tracks = _pcb._parse_tracks_cached(board_path)
+            plane_pads_by_net = _group_pads_by_net(plane_footprints)
+            plane_stack_order = {name: i for i, name in enumerate(all_cu)}
+            ctx["plane_by_net"] = _LazyPlaneByNet(
+                plane_fill_index, power_patterns, plane_footprints, plane_tracks,
+                plane_pads_by_net, plane_stack_order, all_cu, routable_set,
+                ctx.get("plane_island_base", 40.0),
+                ctx.get("plane_orphan_island_cost", 1000.0))
     _WORKER_CTX = ctx
 
 
-def _worker_route_independent(item: tuple[int, dict[str, Any]]) -> tuple[int, dict[str, Any]]:
-    """Route one spatially-independent connection against the BASE obstacles (no
-    placements yet, empty congestion, corridor bias on) - the Phase-A parallel
-    unit. Returns (owner, picklable-out) with the heavy `_FineWindow` stripped
-    (an independent net never needs in-place rip-up: nothing else is in its
-    window). Determinism is unaffected by which worker runs it."""
+def _worker_route_speculative(item: tuple[int, dict[str, Any]]) -> tuple[int, dict[str, Any]]:
+    """Route one connection against the BASE obstacles only (no placements yet,
+    empty congestion, corridor bias on) - the speculative-parallel-pass unit.
+    Returns (owner, picklable-out) with the heavy `_FineWindow` stripped. This
+    is run for EVERY connection now (not just spatially-independent ones): it
+    is a pure function of (ctx, conn, base_obstacles, {}), so its result for a
+    given owner is identical regardless of which worker computes it or how many
+    workers exist. The parent (never this function) decides, in canonical
+    order, whether a result can be committed as-is or must be re-routed
+    serially because it conflicts with an earlier commit from this same pass -
+    that decision, not this computation, is where determinism is enforced."""
     owner, conn = item
     ctx = _WORKER_CTX
     assert ctx is not None
@@ -4514,10 +4646,26 @@ def _resolve_workers(settings: dict[str, Any]) -> int:
 def _run_independent_routes(
     ctx: dict[str, Any], items: list[tuple[int, dict[str, Any]]], workers: int,
 ) -> dict[int, dict[str, Any]]:
-    """Route the independent connections, in parallel across processes when
-    `workers > 1`. Falls back to in-process serial on a single worker/item or any
-    pool error. Result is keyed by owner id and independent of worker count — the
-    caller commits in canonical order, so the board is bit-identical either way."""
+    """Speculatively route every connection in `items` against the BASE board
+    (no other connections' copper), in parallel across processes when
+    `workers > 1`. Falls back to in-process serial on a single worker/item or
+    any pool error. Result is keyed by owner id and independent of worker
+    count - each entry is a pure function of (ctx, conn, base_obstacles, {})
+    (see `_worker_route_speculative`), so it is bit-identical for any worker
+    count or submission order. The CALLER (`route_nets`) is what enforces
+    determinism: it walks results in canonical owner order and commits only
+    when a result's copper self-checks clean against everything already
+    committed this pass, re-queuing any conflict into the serial worklist -
+    so parallel EXECUTION order never leaks into the committed board.
+
+    The pool initializer receives a LIGHT ctx (an `_obstacle_recipe` in place
+    of `base_obstacles`/`plane_by_net`) so each worker rebuilds its own copy of
+    the board-derived obstacle/plane state locally instead of having it shipped
+    through `pickle` - see `_worker_init`. This is what makes a wide worker
+    pool actually pay off: profiling showed pickling `base_obstacles` (every
+    copper item + zone-fill raster on the board) was, by a wide margin, the
+    dominant cost of the old (narrower) parallel phase, dwarfing the actual
+    routing compute it was meant to parallelize."""
     results: dict[int, dict[str, Any]] = {}
     if workers <= 1 or len(items) <= 1:
         for owner, conn in items:
@@ -4526,10 +4674,18 @@ def _run_independent_routes(
                               "segments": out["segments"], "vias": out["vias"], "rec": out["rec"]}
         return results
     try:
+        worker_ctx = dict(ctx)
+        board_path_str = worker_ctx.pop("_board_path", None)
+        if board_path_str is not None:
+            worker_ctx.pop("base_obstacles", None)
+            worker_ctx.pop("plane_by_net", None)
+            worker_ctx["_obstacle_recipe"] = (
+                board_path_str, worker_ctx["routable_set"], worker_ctx["all_cu"],
+                worker_ctx["rules"]["edge_clearance"], worker_ctx["power_patterns"])
         from concurrent.futures import ProcessPoolExecutor
         with ProcessPoolExecutor(max_workers=min(workers, len(items)),
-                                 initializer=_worker_init, initargs=(ctx,)) as ex:
-            for owner, res in ex.map(_worker_route_independent, items):
+                                 initializer=_worker_init, initargs=(worker_ctx,)) as ex:
+            for owner, res in ex.map(_worker_route_speculative, items):
                 results[owner] = res
     except Exception:
         # Any spawn/pickle/executor failure: fall back to the serial reference
@@ -4542,27 +4698,77 @@ def _run_independent_routes(
     return results
 
 
-def _independent_owner_set(conns: list[dict[str, Any]], max_span: float) -> set[int]:
-    """Owner indices (canonical order) whose MAXIMUM possible search window is
-    disjoint from every earlier connection's maximum window. Such a connection's
-    route is provably independent of all others (no earlier copper can ever enter
-    its window at any doubling), so routing it against the base board in parallel
-    yields byte-identical geometry to the serial worklist. `max_span` is the
-    largest margin the doubling can reach (`_MAX_WINDOW_SPAN_MM`)."""
-    boxes: list[tuple[float, float, float, float]] = []
-    for c in conns:
-        (fx, fy), (tx, ty) = _conn_endpoints(c)
-        boxes.append((min(fx, tx) - max_span, min(fy, ty) - max_span,
-                      max(fx, tx) + max_span, max(fy, ty) + max_span))
+def _feasibility_screen(ctx: dict[str, Any], conn: dict[str, Any],
+                        obstacles: list["_Obst"], screen_grid: float = 1.0,
+                        node_cap: int = 600) -> int:
+    """Cheap coarse-grid BFS estimate of a connection's routing difficulty.
 
-    def overlap(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
-        return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
+    Used ONLY to ORDER work submitted to the parallel pool (easy connections
+    first) - it is a heuristic for SCHEDULING, never a gate: a connection this
+    screen scores as hard (returns `node_cap`) still gets the full
+    `_route_attempts` ladder later, exactly like every other connection. The
+    model is deliberately much weaker than the real router: a single merged
+    layer (a cell is impassable only when every routable layer's obstacle
+    footprint covers it - a via can always change layer, so this is the most
+    optimistic view), no clearance geometry beyond a coarse bbox reject, no
+    cost weights - unweighted 8-connected BFS at a coarse (1 mm default) grid
+    over just the connection's base-margin window. This makes screening every
+    connection cost a small fraction of routing even a single one, so it can
+    run serially over the whole worklist before the parallel pass without
+    itself becoming a bottleneck."""
+    from_xy, to_xy = _conn_endpoints(conn)
+    margin = ctx["base_margin"]
+    board_bbox = ctx["board_bbox"]
+    grid = max(screen_grid, ctx["grid"])
+    minx = max(min(from_xy[0], to_xy[0]) - margin, board_bbox[0] - grid)
+    miny = max(min(from_xy[1], to_xy[1]) - margin, board_bbox[1] - grid)
+    maxx = min(max(from_xy[0], to_xy[0]) + margin, board_bbox[2] + grid)
+    maxy = min(max(from_xy[1], to_xy[1]) + margin, board_bbox[3] + grid)
+    cols = max(2, int(math.ceil((maxx - minx) / grid)) + 1)
+    rows = max(2, int(math.ceil((maxy - miny) / grid)) + 1)
+    net = conn.get("net")
+    blocked: set[tuple[int, int]] = set()
+    reach_pad = grid
+    for ob in obstacles:
+        if ob.net == net and not ob.is_edge:
+            continue
+        if (ob.maxx < minx - reach_pad or ob.minx > maxx + reach_pad
+                or ob.maxy < miny - reach_pad or ob.miny > maxy + reach_pad):
+            continue
+        ix0 = max(0, int((ob.minx - reach_pad - minx) / grid))
+        ix1 = min(cols - 1, int((ob.maxx + reach_pad - minx) / grid) + 1)
+        iy0 = max(0, int((ob.miny - reach_pad - miny) / grid))
+        iy1 = min(rows - 1, int((ob.maxy + reach_pad - miny) / grid) + 1)
+        for iy in range(iy0, iy1 + 1):
+            for ix in range(ix0, ix1 + 1):
+                blocked.add((ix, iy))
 
-    indep: set[int] = set()
-    for i in range(len(boxes)):
-        if all(not overlap(boxes[i], boxes[j]) for j in range(i)):
-            indep.add(i)
-    return indep
+    def cell_of(x: float, y: float) -> tuple[int, int]:
+        ix = min(max(int(round((x - minx) / grid)), 0), cols - 1)
+        iy = min(max(int(round((y - miny) / grid)), 0), rows - 1)
+        return ix, iy
+
+    start, goal = cell_of(*from_xy), cell_of(*to_xy)
+    if start == goal:
+        return 0
+    from collections import deque as _dq
+    q: "_dq[tuple[int, int]]" = _dq([start])
+    seen = {start}
+    expansions = 0
+    while q and expansions < node_cap:
+        cx, cy = q.popleft()
+        expansions += 1
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)):
+            nx, ny = cx + dx, cy + dy
+            if not (0 <= nx < cols and 0 <= ny < rows):
+                continue
+            if (nx, ny) in seen or (nx, ny) in blocked:
+                continue
+            if (nx, ny) == goal:
+                return expansions
+            seen.add((nx, ny))
+            q.append((nx, ny))
+    return node_cap
 
 
 def route_nets(
@@ -4820,6 +5026,11 @@ def route_nets(
         "track_half": track_half, "via_radius": via_radius, "rules": rules,
         "global_by_key": global_by_key, "tw": tw, "plane_by_net": plane_by_net,
         "base_obstacles": obstacles,
+        # Picklable "recipe" fields used ONLY to let a worker process rebuild
+        # `base_obstacles`/`plane_by_net` locally instead of receiving them
+        # through pickle (see `_worker_init`) - never read by `_route_one`.
+        "_board_path": str(board_path), "all_cu": all_cu,
+        "plane_island_base": island_base, "plane_orphan_island_cost": orphan_island_cost,
     }
 
     def _route_core(conn: dict[str, Any], owner: int, use_corridor: bool = True) -> dict[str, Any]:
@@ -4860,28 +5071,87 @@ def route_nets(
         }
         failures.pop(owner, None)
 
-    # -- 7.8 Phase A: route the spatially-INDEPENDENT connections in parallel -- #
-    # A connection whose maximum-possible window is disjoint from every earlier
-    # connection's is provably unaffected by any other route (no earlier copper
-    # can enter its window at any doubling), so it can be routed against the base
-    # board concurrently and committed in canonical order — bit-identical to the
-    # serial worklist for ANY worker count. Everything else stays in the serial
-    # rip-up worklist below, which sees these placements.
+    # -- 7.8b speculative parallel pass: route EVERY connection concurrently -- #
+    # against the BASE board (no placements, no congestion), across processes,
+    # then COMMIT in canonical order in the parent. Unlike the old Phase A
+    # (restricted to spatially-independent connections, which are the rare
+    # case on a dense board), this covers the whole worklist - the point being
+    # that most connections' A* search (the 10-19 s cost for a failing one) can
+    # run in parallel across cores, with only genuine cross-connection
+    # conflicts falling back to the serial rip-up worklist below.
+    #
+    # Determinism argument (worker count AND submission order independent):
+    #   - Each `_worker_route_speculative` result is a pure function of
+    #     (ctx, conn, base_obstacles, {}) - see that function's docstring - so
+    #     a given owner's speculative result is identical no matter which
+    #     worker computes it or in what order the pool processes the batch.
+    #   - The PARENT commits strictly in ascending canonical owner order,
+    #     self-checking each routed result against `active_obstacles_for(owner)`
+    #     (base + everything already committed THIS pass) before placing it.
+    #     That self-check and the commit loop are ordinary serial Python -
+    #     same order, same result, regardless of worker count.
+    #   - A speculative "not routed" is TERMINAL, never requeued: obstacles are
+    #     strictly additive (`active_obstacles_for` only ever adds placement
+    #     copper on top of the same base set, and no placement is
+    #     `via_transparent`), so a search that already failed against the
+    #     MINIMAL obstacle set (base only) is provably unreachable against any
+    #     superset too, for the same attempt ladder/corridor bias - and rip-up
+    #     cannot help either, since rip-up only removes AUTOROUTER-PLACED
+    #     copper, which the speculative pass never saw in the first place (its
+    #     view is already "as if every other net were ripped"). So this exactly
+    #     matches what the plain (non-rip-up) first serial attempt at this
+    #     owner would find - recording it now is not a regression.
+    #   - A speculative "routed" that FAILS the commit-time self-check means
+    #     its copper collides with another connection ALSO computed against
+    #     the base-only view (a genuine cross-connection conflict that the
+    #     speculative pass, by construction, could not see) - THIS is requeued
+    #     into the serial worklist, which re-routes it against the true
+    #     current placements and can rip-up if needed, identically to how a
+    #     serial-only run would have handled the second-arriving conflict.
+    #
+    # The cheap feasibility screen (`_feasibility_screen`) only reorders which
+    # owner is SUBMITTED to the pool first (easy-looking ones first) - commit
+    # order below is always ascending canonical order, so this ordering has no
+    # effect on the result, only on how quickly a worker becomes free.
     workers = _resolve_workers(settings)
-    done_in_phase_a: set[int] = set()
-    indep = _independent_owner_set(owner_conns, _MAX_WINDOW_SPAN_MM) if (workers > 1 and n_conns > 1) else set()
-    if indep:
-        items = [(owner, owner_conns[owner]) for owner in sorted(indep)]
-        results = _run_independent_routes(ctx, items, workers)
-        for owner in sorted(results):  # commit in canonical order
-            res = results[owner]
-            if res["routed"]:
-                _place(owner, res["net"], res["segments"], res["vias"], res["rec"])
-            else:
-                failures[owner] = res["rec"]
-            done_in_phase_a.add(owner)
+    speculative: dict[int, dict[str, Any]] = {}
+    if n_conns > 0:
+        # IMPORTANT for determinism: this speculative pass runs for ANY worker
+        # count, including 1 - `_run_independent_routes` internally falls back
+        # to an in-process serial loop when `workers <= 1`, calling the exact
+        # same `_route_one(ctx, conn, base_obstacles, {})` per owner that a
+        # pool worker would. That is what makes `workers` purely an EXECUTION
+        # detail: the ALGORITHM (speculative-against-base, canonical-order
+        # commit with self-check, conflict -> serial requeue) is identical for
+        # every worker count, so its output is too. Gating this block behind
+        # `workers > 1` (an earlier draft did) would make `workers=1` fall
+        # through to the OLD pure-serial algorithm below with NO speculative
+        # pass at all - a genuinely different computation (every connection
+        # searched against the true current placements instead of base-only),
+        # which is NOT guaranteed to reproduce the same geometry. Verified this
+        # the hard way: that gating produced non-identical `connections` JSON
+        # between workers=1 and workers=8 on the real kiln board.
+        submit_order = sorted(range(n_conns),
+                              key=lambda i: (_feasibility_screen(ctx, owner_conns[i], obstacles), i))
+        items = [(owner, owner_conns[owner]) for owner in submit_order]
+        speculative = _run_independent_routes(ctx, items, workers)
 
-    pending: "deque[int]" = deque(i for i in range(n_conns) if i not in done_in_phase_a)
+    for owner in range(n_conns):
+        res = speculative.get(owner)
+        if res is None:
+            continue
+        if not res["routed"]:
+            failures[owner] = res["rec"]
+            continue
+        violations = _self_check(res["net"], res["segments"], res["vias"],
+                                 active_obstacles_for(owner), rules, via_radius)
+        if not violations:
+            _place(owner, res["net"], res["segments"], res["vias"], res["rec"])
+        # else: leaves owner neither placed nor failed -> falls into `pending`
+        # below, which reroutes it against the true current placements.
+
+    done_speculatively = set(placements.keys()) | set(failures.keys())
+    pending: "deque[int]" = deque(i for i in range(n_conns) if i not in done_speculatively)
     while pending:
         owner = pending.popleft()
         core = _route_core(owner_conns[owner], owner, use_corridor=owner not in rerouted)

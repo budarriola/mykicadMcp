@@ -35,7 +35,7 @@ For whoever (human or AI) picks this up next:
   M0 and M1 are fully done (docs page `10-netclasses-and-buses.md` — note:
   verify tool counts by instantiating `KiCadMcpServer`, not by grepping; a
   grep-count once came back wrong).
-  **83 MCP tools registered; full 201-test pytest suite green** (1 slow
+  **83 MCP tools registered; full 205-test pytest suite green** (1 slow
   real-kiln benchmark skipped unless `KICAD_BENCHMARK_REAL=1`; fixtures,
   golden parser tests, writer round-trip, synthetic board/project
   + multi-drop SPI generators, kicad-cli acceptance, corridor/deviation,
@@ -427,7 +427,28 @@ router work):
   2026-07-24: the `_route_attempts` finer-grid ladder (sealed pad escapes) + the
   plane-via anti-pad model (cross-layer signal nets via through planes). Full-board
   completion 4 → 10 routed.** (See the ROOT-CAUSE DATA block above for the measured
-  mechanism and residuals.) **NOW (6): the remaining completion gaps, in
+  mechanism and residuals.) (7) ✅ **Speculative-parallel routing + feasibility screen — LANDED 2026-07-24
+  (Sonnet subagent, coordinator-verified).** The old parallel phase only covered
+  spatially-INDEPENDENT connections (rare on a dense board → effectively serial,
+  which is why routing "took forever" once the fine-grid ladder made failing
+  searches expensive). Now `_run_independent_routes` routes EVERY connection
+  concurrently against the BASE board (`_worker_route_speculative`, workers via a
+  light `_obstacle_recipe` that rebuilds obstacles locally instead of pickling
+  them — pickling `base_obstacles` was profiled as the ~20s/worker dominant cost),
+  the parent commits in canonical owner order self-checking each against
+  already-committed copper, and only genuine cross-connection CONFLICTS fall back
+  to the serial rip-up worklist. `_feasibility_screen` (coarse 1 mm BFS) only
+  ORDERS pool submission (never gates — proven by test). **Verified: 3.71× speedup
+  at 8 workers (878s→236s serial→parallel; default is auto=cores−1≈23, faster
+  still); routed count held at 10; `connections` JSON BIT-IDENTICAL across
+  workers=1 vs 8 on the REAL kiln board (the conflict-requeue path, not just the
+  synthetic independent case); 205-test suite green (+4 in `test_parallel_route.py`,
+  incl. one proving the screen never rejects a routable net).** Determinism
+  invariant: workers COMPUTE pure functions against base-only; the speculative
+  pass runs for ALL worker counts incl. 1 (so `workers` is a pure execution
+  detail, not an algorithm switch — an earlier draft that gated it behind
+  `workers>1` produced non-identical geometry and was caught/fixed).
+  **NOW (6): the remaining completion gaps, in
   descending value:** (a) **rip-up demotion for `self_check_failed`** (6 nets — a
   plane-via route is found but skims real copper; demote to the rip-up loop
   instead of failing hard — measured that a finer grid does NOT clear these); (b)
