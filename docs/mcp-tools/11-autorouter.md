@@ -540,6 +540,108 @@ are read from `pcb_settings.json` or defaults.
 }
 ```
 
+## `open_kicad_route_viewer`
+
+**Phase 7.9 — Live Route-Progress Viewer**
+
+Spawn a detached tkinter subprocess (`kicad_route_viewer.py`) that tails the JSONL event stream
+(`<board>.route_progress.jsonl`, written by `route_kicad_nets`/`route_kicad_board` and gated by
+`autorouter.progress.events`) to display a live board view with progress bars and copper updates
+as routing happens. The viewer is fully decoupled by construction: the router only ever appends to
+the event file, never talks back to the viewer, so the viewer can be opened, closed, or restarted
+without touching or blocking an in-flight route.
+
+**Observational-only failure mode:** If tkinter is unavailable (headless CI/container), this
+returns `{"launched": False, "reason": "tkinter is not available..."}` instead of raising. The MCP
+server keeps running headless even though the viewer cannot launch.
+
+The viewer's **"Stop after this iteration"** button writes a cancel flag into the board-local JSON
+state, which `route_kicad_nets` polls between connections — the safe cancel path a headless MCP
+session would otherwise lack.
+
+Also auto-launched internally by `route_kicad_nets` / `route_kicad_board` when
+`autorouter.progress.open_viewer` is true in `pcb_settings.json`.
+
+**Args:** `project_path` (required), `board` (optional; explicit `.kicad_pcb` path if it differs
+from the project)
+
+**Example output:**
+```json
+{
+  "launched": true,
+  "pid": 12345,
+  "board_path": "path/to/kiln.kicad_pcb",
+  "viewer_script": "path/to/kicad_route_viewer.py"
+}
+```
+
+**Example output (tkinter unavailable):**
+```json
+{
+  "launched": false,
+  "reason": "tkinter is not available in this Python environment; the route viewer is observational-only and cannot run headless."
+}
+```
+
+## `benchmark_kicad_autoroute`
+
+**Phase 7.16 — Benchmark Harness**
+
+Score the autorouter against a human-routed board (your stated north star: "as well or better than
+my hand-routed board", judged by the Phase-6 `get_kicad_trace_cost` board score). Never writes the
+source board — it copies the entire project (board, `.kicad_pro`, `.net`, and `pcb_settings.json`/
+board-local state when present) into a fresh scratch directory before measuring or routing.
+
+Two modes:
+
+- **`mode="complete_only"`** (default, primary acceptance metric) — Measures the human board's
+  score and unrouted-connection count on the untouched scratch copy, then runs `route_board(write=True)`
+  to route only what the human left unrouted. Reports completion %, copper length/vias added,
+  post-route board score, and kicad-cli DRC delta (baseline vs post, new-violation count; auto-skipped
+  if kicad-cli is unavailable).
+
+- **`mode="strip_and_reroute"`** — Deletes ALL non-zone copper from the scratch copy (every
+  top-level segment/via/arc; zones/footprints/edge-cuts are untouched), reroutes the whole board
+  from zero, and compares the rerouted board to the HUMAN ORIGINAL (measured before stripping) on
+  completion %, total length, via count, Phase-6 board score (identical weights both sides),
+  per-layer copper utilization, DRC violation count, and runtime.
+
+Returns a hand-vs-auto comparison dict. **First-class pass/fail fields** to check: `comparison.matched_or_beat_human`
+(bool) and `comparison.verdict` (str).
+
+**Caveat:** Full-kiln runs are slow (detailed A* is pure-Python); prefer a small test project for
+quick checks.
+
+**Args:** `source_board` (required; project path, never written), `mode` (default "complete_only"),
+`effort` (default "balanced"; one of "quick", "balanced", "best"), `scratch_dir` (optional; omit
+for a fresh `tempfile.mkdtemp()`)
+
+**Example output (excerpt — `mode="complete_only"`):**
+```json
+{
+  "command": "benchmark_autoroute",
+  "mode": "complete_only",
+  "source_board": "path/to/kiln.kicad_pcb",
+  "scratch_board": "path/to/scratch/kiln.kicad_pcb",
+  "scratch_owned": true,
+  "human_score": {
+    "total": 2450.75,
+    "board_layers": {...},
+    "unrouted_connections": 5
+  },
+  "post_score": {
+    "total": 2380.5,
+    "board_layers": {...},
+    "unrouted_connections": 0
+  },
+  "comparison": {
+    "matched_or_beat_human": true,
+    "verdict": "PASS: autorouter matched/beat human board on Phase-6 score"
+  },
+  "route_report": {...}
+}
+```
+
 ---
 
 ## Autorouter Architecture & Cost Model
