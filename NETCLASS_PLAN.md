@@ -1148,13 +1148,13 @@ rebuilds its own per-connection window — there is no full-board window, so the
 nearest-node between global/window grids (≤½-cell off when unaligned — fine for
 a soft field).
 
-**Still open in 7.3b (do NOT treat 7.3b as closed):** (plane-aware routing was
-the other open item here at the time this was written — landed since as 7.5.4,
-see its anchor) **7.12 neck-down** (not applied); pad escape lands on nearest
-free node (not direction-aware); termination is on the `to` point (not "any
-same-net copper"); window doubling is **capped at 60 mm span / 400k-node
-budget**, not whole-board (a whole-kiln 0.2 mm 4-layer raster ~2.3M×4 nodes is
-infeasible in pure Python — lift with numpy/accel, M5).
+**Still open in 7.3b (do NOT treat 7.3b as closed):** (plane-aware routing and
+7.12 neck-down were the other two open items here at the time this was
+written — both landed since, as 7.5.4 and 7.12, see their anchors) pad escape
+lands on nearest free node (not direction-aware); termination is on the `to`
+point (not "any same-net copper"); window doubling is **capped at 60 mm span /
+400k-node budget**, not whole-board (a whole-kiln 0.2 mm 4-layer raster
+~2.3M×4 nodes is infeasible in pure Python — lift with numpy/accel, M5).
 
 **Stage 1 LANDED 2026-07-21** (anchor): `kicad_router_tool.py` exists with
 `build_connectivity` (union-find islands per net) + `get_ratsnest` → tool
@@ -2246,9 +2246,10 @@ planned-not-implemented. **Docs sync LANDED 2026-07-23 (Haiku):**
 `11-autorouter.md`; README synced to **87 tools**. **CLAUDE.md tool-count bump
 to 87 still owed** (coordinator has it staged locally in the parent repo but
 does not auto-commit there — needs the user's own commit). **Remaining docs
-debt:** the `route_kicad_nets`/`route_kicad_board` pages get revised as 7.12
-neck-down lands (plane-aware routing's page already reflects its "partial"
-status), and future Phase 7 tools add rows as they land)
+debt:** the `route_kicad_nets`/`route_kicad_board` pages should gain a short
+mention of Phase 7.12 neck-down behavior (landed 2026-07-27 — no new MCP
+tool, so no new row, but the pages' description of what gets emitted at a
+small pad is now stale) and future Phase 7 tools add rows as they land)
 - Extend `docs/mcp-tools/10-netclasses-and-buses.md` (or the autorouter page,
   as fits) as each remaining tool in the summary table above lands (same
   per-tool format).
@@ -2392,12 +2393,12 @@ landed 2026-07-21 — see their anchors; remaining:):
     registered, integer milli-cost quantization done. **Step 4 rip-up & reroute
     LANDED 2026-07-23** (negotiated congestion, owner-tagged obstacles,
     incremental window clears, deterministic, human copper never ripped — see
-    the stage-2 anchor). **Remaining to close 7.3b:** 7.12
-    neck-down on the pad-escape stub, direction-aware pad escape, "any same-net
+    the stage-2 anchor). 7.12 neck-down landed 2026-07-27 (see its anchor).
+    **Remaining to close 7.3b:** direction-aware pad escape, "any same-net
     copper" termination, and lifting the 60 mm / 400k-node window cap toward
     whole-board (needs the memory planner + numpy/multi-core waves — those slip
     to M5's accel work; the cpu tier remains the reference everything else must
-    match). Plane-aware via-drops through pours need M4's 7.5 zone model.
+    match). Plane-aware via-drops through pours landed as 7.5.4 (see its anchor).
 11h. **[HEADLINE] Phase 7.17 minimal `route_board` — LANDED 2026-07-23** (see
     the 7.17 anchor): the one-command router (MCP tool `route_kicad_board` +
     `python kicad_router_tool.py route <project>` CLI), a thin orchestrator over
