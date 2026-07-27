@@ -1,5 +1,6 @@
 /.venv/
 /.vscode/
+/.claude/worktrees/
 /__pycache__/
 /kicad_mcp_server.log
 
