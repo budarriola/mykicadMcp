@@ -5,7 +5,7 @@
 Phase 7.3 windowed A* detailed routing (fine-grained exact copper generation) and its supporting
 infrastructure: ratsnest calculation, layer/constraint querying, and undo (unrouting). This group
 covers the implemented core of the autorouter pipeline as it exists today, with honest documentation
-of what is NOT yet implemented (rip-up/negotiation, plane-aware routing). The routing
+of active features and remaining planned work. The routing
 workflow is: **ratsnest** (find unrouted connections) → **global route** (7.3a, decide layers/corridors)
 → **detail route** (7.3b core, this group) → **self-check** (before write) → **emit**.
 
@@ -183,7 +183,6 @@ connection (in priority-desc/airline-asc order from ratsnest):
 Newly emitted copper becomes an obstacle for later connections in the same run, so multiple routed
 nets in one call stay DRC-clean against each other.
 
-**Phase 7.12 (Neck-down)** — When a wide net-class connection lands on a small pad, the final
 stretch of copper at that endpoint is automatically narrowed to fit the pad. The neck width is
 sized as a fraction of the class width, capped at the pad's smaller copper dimension, and floored
 at the board's DRC minimum track width. Enabled by default via `pcb_settings.json`:
@@ -193,13 +192,18 @@ raised for a genuine neck. One residual: the Phase-5.x hierarchical last-resort 
 when detailed A* exhausts all windows) does not apply neck-down; connections that only route via
 hierarchical placement will not emit necks (rare in practice).
 
-**NOT YET IMPLEMENTED (Planned):**
-- Step 4's PathFinder negotiated-congestion **rip-up & reroute** — connections that cannot fit in
-  their window without ripping existing autorouter copper currently FAIL with their nearest blocker
-  named. The parameter `max_ripup_iterations` is accepted and reported but only window-doubling retry
-  is active.
-- **Plane-aware routing** — On plane-filled layers (power/ground pours), only pour-free channels
-  route today. Full plane-aware routing (via drops through pours, plane-aware A\*) is a later phase.
+**ACTIVE FEATURES (Phases 7.3b+):**
+- **Step 4 negotiated-congestion rip-up & reroute** — When a connection cannot fit in its window
+  without removing existing autorouter copper, the router rips ONLY autorouter-owned copper
+  from the failed path (never human-routed copper by default), reschedules the ripped connections,
+  and re-attempts them. Bounded by `pcb_settings.json`'s `max_ripup_iterations`. Off-by-default
+  ripup of hand-routed copper is gated by separate `allow_hand_copper_ripup` flag.
+- **Plane-aware routing (Phase 7.5.4, Partial)** — For power/ground nets that own a filled zone,
+  the router recognizes moves onto the net's own plane fill as low-cost traversal and can terminate
+  on any point already inside that net's own fill (not just the exact `to` point). On-plane moves
+  cost plane-step × island-factor instead of normal trace cost. Known limitation: the A* heuristic
+  is distance-only (pre-existing), so it is not cost-optimal for plane-discounted routes. Signal
+  nets are unaffected (plane-aware gates are behind `is not None` checks, ensuring parity).
 
 **write=false** (default) returns a full preview — per connection: `routed` flag, `length_mm`, via
 count, layers used, est. Phase-6 cost, self-check result, and failures with reasons — WITHOUT
@@ -207,7 +211,7 @@ touching the board. **Always preview first.**
 
 **Args:** `project_path`, `nets` (optional array; omit to route all unrouted connections), `connections`
 (optional explicit connection list from `get_ratsnest`), `write` (default false), `allow_while_open`
-(default false), `max_ripup_iterations` (accepted but window-doubling retry only)
+(default false), `max_ripup_iterations` (default from pcb_settings.json; bounds rip-up iterations)
 
 **Example output (excerpt — single routed connection):**
 ```json
@@ -216,7 +220,7 @@ touching the board. **Always preview first.**
   "grid_mm": 0.2,
   "write": false,
   "written": false,
-  "ripup_active": false,
+  "ripup_active": true,
   "rules": {
     "track_width": 0.25,
     "via_diameter": 0.8,
@@ -303,9 +307,10 @@ Higher efforts become more meaningful when Phase 7.6 (whole-board optimizer) lan
 documented honestly in the report's `notes`.
 
 **NOT YET IMPLEMENTED (Marked as M4 Hooks):**
-- Plane-aware routing (Phase 7.5)
 - Whole-board optimization (Phase 7.6)
 - Stitching pass (Phase 7.5.6)
+
+Plane-aware routing (Phase 7.5.4) is ACTIVE for power/ground nets; see `route_kicad_nets` for details.
 
 The report's `pipeline` block lists each stage with its status, transparently marking not-yet-wired
 stages so callers know what's actually running.
@@ -343,12 +348,12 @@ copper and records ownership for undo.
     "global_route": "done",
     "detailed_route": "done",
     "rip_up": "active",
-    "plane_aware_routing": "not_implemented (Phase 7.5, M4)",
+    "plane_aware_routing": "partial (Phase 7.5.4 landed for power nets; heuristic not cost-optimal)",
     "whole_board_optimization": "not_implemented (Phase 7.6, M4)",
     "stitching": "not_implemented (Phase 7.5.6, M4)"
   },
   "notes": [
-    "Minimal route_board (Phase 7.17): ratsnest -> global -> detailed only; planes/optimizer/stitching are M4 TODO hooks and do not run yet.",
+    "Minimal route_board (Phase 7.17): ratsnest -> global -> detailed only; optimizer/stitching are M4 TODO hooks and do not run yet.",
     "effort currently maps only to rip-up aggressiveness (quick=0, balanced=config default, best=20)."
   ]
 }
@@ -936,19 +941,23 @@ When a connection cannot be routed:
 
 ### Known Limitations (Honest Documentation)
 
-1. **Plane-aware routing NOT implemented** — Power/ground pours are treated as obstacles, and only
-   pour-free channels (spaces between plane polygons) route. Via drops and plane-split routing are
-   later phases.
-2. **Rip-up & negotiate NOT implemented** — `max_ripup_iterations` is a stub. When a connection
-   cannot fit without removing existing autorouter copper, it fails (never rips). Negotiated
-   congestion re-costing and PathFinder-style netlist negotiation are planned.
-3. **Hierarchical tier has no neck-down** — The Phase-5.x hierarchical last-resort routing tier
-   (fallback when detailed A* fails all windows) routes without applying Phase 7.12 neck-down;
+1. **Plane-aware routing is partial (Phase 7.5.4)** — Power/ground nets that own a filled zone route
+   with on-plane cost discounts and termination relaxation; signal nets are unaffected. The A*
+   heuristic is distance-only (pre-existing), so plane-aware routes are not cost-optimal — a plane
+   route and a normal-cost route both reaching the goal may have different costs. Full plane-split
+   routing and plane drop-via pathfinding are later phases.
+2. **Rip-up uses integer-milli decision logic** — When a connection fails, the router rips only
+   autorouter-owned copper in its path. Human-routed copper (`owner is None`) is never ripped by
+   default; a separate opt-in flag `allow_hand_copper_ripup` can gate ripping of hand-routed tracks/arcs.
+   Anti-thrash logic and deterministic canonical ordering ensure deterministic, repeatable results.
+3. **Hierarchical fallback tier has no neck-down** — The Phase 5.x hierarchical last-resort routing
+   tier (fallback when detailed A* exhausts all windows) routes without applying Phase 7.12 neck-down;
    this is rare in practice.
 4. **Simplified pad escape** — Lands on the nearest free grid node, not a pad-direction-aware exact
    stub (a minor detail, but documented honestly).
 5. **Termination on connection's `to` point** — Not "any same-net copper" and not a connection hub;
-   exact per-connection routing, which is correct for tree-style nets.
+   exact per-connection routing (relaxed only for plane nets landing on their own fill), which is
+   correct for tree-style nets.
 
 ### Tuning & Settings (pcb_settings.json)
 
