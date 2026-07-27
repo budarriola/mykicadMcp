@@ -101,6 +101,7 @@ try:
         get_drc_constraints,
         get_ratsnest,
         list_zones,
+        open_route_viewer,
         route_board,
         route_nets,
         unroute_nets,
@@ -1148,6 +1149,36 @@ class KiCadMcpServer:
                 },
                 "handler": self._tool_unroute_nets,
             },
+            "open_kicad_route_viewer": {
+                "description": (
+                    "Phase 7.9 - open the live route-progress viewer: a tkinter window that redraws the "
+                    "board's copper and progress bars as route_kicad_nets/route_kicad_board run, tailing "
+                    "the JSONL event stream those tools append to (<board>.route_progress.jsonl, gated by "
+                    "pcb_settings.json's autorouter.progress.events). Spawns a DETACHED "
+                    "`python kicad_route_viewer.py <board_path>` subprocess - decoupled by construction: "
+                    "the router never talks to the viewer directly, only ever appends to that file, so the "
+                    "viewer can be closed/reopened mid-run, survives server restarts (it replays the file "
+                    "to catch up), and can never block or crash a route. Its 'Stop after this iteration' "
+                    "button writes a cancel flag into the board-local JSON that route_kicad_nets polls "
+                    "between connections - the safe cancel path a headless MCP session otherwise lacks. "
+                    "Also auto-launched by route_kicad_nets/route_kicad_board when "
+                    "autorouter.progress.open_viewer is true. Observational only: a viewer bug or a missing "
+                    "tkinter (headless CI/container) can never corrupt a route or crash this server - if "
+                    "tkinter is unavailable this reports launched=false with a reason instead of raising."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "board": {
+                            "type": "string",
+                            "description": "Explicit .kicad_pcb path to view, if it differs from project_path's board.",
+                        },
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_open_route_viewer,
+            },
             "benchmark_kicad_autoroute": {
                 "description": (
                     "Phase 7.16 - score route_board against a human-routed board (the user's north star: "
@@ -2010,6 +2041,9 @@ class KiCadMcpServer:
             write=bool(args.get("write", False)),
             allow_while_open=bool(args.get("allow_while_open", False)),
         )
+
+    def _tool_open_route_viewer(self, args: dict[str, Any]) -> dict[str, Any]:
+        return open_route_viewer(args["project_path"], board=args.get("board"))
 
     def _tool_benchmark_autoroute(self, args: dict[str, Any]) -> dict[str, Any]:
         return benchmark_autoroute(

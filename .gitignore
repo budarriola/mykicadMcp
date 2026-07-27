@@ -3,6 +3,8 @@
 /.claude/worktrees/
 /__pycache__/
 /kicad_mcp_server.log
+*.board_local.json
+*.route_progress.jsonl
 
 /tests/__pycache__/
 /tests/__pycache__/synthetic_board.cpython-314.pyc
