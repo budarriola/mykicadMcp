@@ -176,7 +176,7 @@ For whoever (human or AI) picks this up next:
   row for
   `route_kicad_board` on `11-autorouter.md` (README/CLAUDE bump 79→81). (3)
   Finish 7.3b's remaining bits: 7.12 neck-down, direction-aware pad escape,
-  whole-board windowing (numpy/accel, M5). Then step 12 (viewer). Still open:
+  whole-board windowing (numpy/accel, M5). Still open:
   M6 item 17 (c) Flow B stack-up-gate question, and 7.14's optimizer pin-swap
   move + pause-the-user protocol (both wait on 7.6).
 - **Nothing has been committed** in either repo as of this snapshot — review the
@@ -585,6 +585,12 @@ router work):
   re-baseline the golden stats (pending user go-ahead, see above), then
   quality/score work vs 8552.276. `benchmark` is the standing gate
   throughout.
+  (12) ✅ **Phase 7.9 live progress viewer — LANDED 2026-07-27** (Sonnet
+  subagent, coordinator-verified, worktree-isolated, merged clean). See the
+  7.9 anchor for the full landing detail and spec deviations. 84 tools,
+  226-test suite green (208→226, same 7 pre-existing board-drift failures
+  before and after, unaffected). Docs debt: `open_kicad_route_viewer` has no
+  docs row yet (see the docs-debt note below).
 
 ## How to work this plan (living document — keep it current)
 
@@ -1693,72 +1699,48 @@ not as a graceful-degradation fallback. `cupy`/`torch` (GPU) remain optional
 names the backend, batch sizes, worker/replica counts, demotion counts, and
 peak memory used.
 
-### 7.9 Live progress viewer (tkinter — stdlib, vector-drawn)
+### 7.9 — LANDED 2026-07-27 (reference anchor; no work remains here)
 
-Show the board evolving while the router/optimizer works: a redrawing board view
-plus progress bars. `tkinter` ships with CPython on Windows — still zero added
-dependencies.
+Implemented: `kicad_route_viewer.py` (new, 589 lines — pure JSONL replay/diff
+layer (`iter_events`, `ProgressState`/`replay_state`) importable and testable
+without `tkinter`; `_load_kicad_layer_colors()` theme resolution (KiCad
+`pcbnew.json` → `colors/*.json` → embedded `DEFAULT_LAYER_COLORS` fallback);
+`RouteViewerApp` — Canvas board redraw, two progress bars, score sparkline,
+pan/zoom, "Stop after this iteration" cancel button; `main()` CLI entry point,
+degrades to a clear stderr message when `tkinter` is unavailable). Wired into
+`kicad_router_tool.py`: `route_nets` now truncates `<board>.route_progress.jsonl`
+at the start of each call and appends `header`/`connection`/`cancelled`/
+`run_complete` JSONL events (gated by `autorouter.progress.events`); the
+per-connection loop polls a `route_cancel_requested` board-local flag between
+connections (not mid-search) for a clean stop, reporting unattempted
+connections honestly as `cancelled_before_attempt` rather than a routing
+failure; `open_route_viewer()` spawns the detached viewer subprocess (also
+auto-launched when `autorouter.progress.open_viewer` is set). New MCP tool
+`open_kicad_route_viewer` registered in `kicad_mcp_server.py` (83→84 tools).
+`.gitignore` gained `*.board_local.json` (previously missing entirely) and
+`*.route_progress.jsonl`. 18 new tests in `tests/test_route_progress.py`
+(event shape/ordering, reset-not-accumulated, disable-via-settings, cancel
+mid-run + stale-flag reset, color parsing/theme-resolution/fallback, JSONL
+parse/replay, graceful tkinter-unavailable degradation) — 208→226 passed, same
+7 pre-existing board-drift failures before and after (unaffected).
 
-**Architecture: separate viewer process, file-based event stream.** The MCP
-server must never host a GUI thread (Tk wants the main thread; the server may be
-headless or restart mid-session). Instead:
-- The router appends **JSONL progress events** (when `autorouter.progress.events`)
-  to `<board>.route_progress.jsonl` next to the board-local JSON (gitignored by
-  the same `.gitignore` change, and pruned at session start): session/board
-  geometry snapshot first, then per-event `iteration`, `connection done/total`,
-  `score`, `changed` (added/removed segment+via geometry by uuid), pending
-  7.7 decisions.
-- `open_kicad_route_viewer` (also auto-launched when `progress.open_viewer`)
-  spawns a **detached** `python kicad_route_viewer.py <board>` subprocess that
-  tails the file. Decoupled by construction: the viewer can be closed/reopened
-  mid-run, survives server restarts (replays the file to catch up), and never
-  blocks or crashes the router — the router only ever appends to a file.
-- **Cancel support**: a "Stop after this iteration" button writes a flag into the
-  board-local session; the optimizer checks it between chunks — a clean, safe
-  cancel path that a headless MCP session otherwise lacks.
-
-**Rendering: vector, straight onto `tk.Canvas`** — no SVG rasterization, no image
-files. Canvas *is* a retained-mode vector surface: segments as width-scaled
-lines, vias/pads as ovals, zone outlines as polygons, ratsnest as thin dashed
-lines; per-layer colors with layer-visibility checkboxes; zoom/pan via
-`canvas.scale`. Incremental by uuid — each event only deletes/creates the changed
-items, so redraw stays O(change), not O(board). (The "changing image of the
-board", done as live vector drawing rather than image swapping.)
-
-**Layer colors = the user's KiCad colors.** The viewer renders with the same
-palette the PCB editor shows, so the picture reads instantly. Helper
-`_load_kicad_layer_colors()` resolves, in order (driven by
-`autorouter.progress.color_theme`):
-1. **The active KiCad theme** (`"auto"`): newest version dir under
-   `%APPDATA%/kicad/<ver>/` (10.0 on this machine), read `pcbnew.json` →
-   `appearance.color_theme`, then match that theme in `colors/*.json` by
-   `meta.name`/filename. Theme JSON layout (verified locally): `board.copper.f`
-   / `.in1` / `.in2` / `.b` as `"rgb(200, 52, 52)"`-style strings (F.Cu red,
-   In1 green, B.Cu blue on this machine), plus `board.via_through`,
-   `board.background`, `board.edge_cuts`, `board.ratsnest` — parsed to Tk hex
-   (`#c83434`); `rgba(...)` alpha is dropped (Canvas has no per-item alpha).
-2. **Embedded fallback palette**: KiCad's stock default colors baked into the
-   viewer as constants. Not optional-nice-to-have: the active theme on this
-   machine is `_builtin_default`, which is compiled into KiCad and has **no
-   theme file**, so "read the config" alone can't work — auto falls back to the
-   embedded palette whenever the named theme has no file (also covers machines
-   without any KiCad config).
-Copper layer keys map `f/in1..in30/b` → `F.Cu`/`In1.Cu`…`B.Cu`; layers a theme
-doesn't name fall back per-layer to the embedded palette. The resolved palette
-is written into the JSONL header event, so the viewer stays a dumb renderer
-(no KiCad-config knowledge in the GUI process) and a recorded event file replays
-with the colors it was recorded with.
-
-**Chrome**: two `ttk.Progressbar`s (connections routed this iteration; iterations
-this run), best-score readout with a small score-curve sparkline (Canvas
-polyline), backend + session-state line, and a banner when the session is
-`awaiting_decision` showing the pending 7.7 options read-only (answering stays in
-the MCP conversation, where the decision log lives).
-
-Failure honesty: the viewer is *observational only* — if tkinter is unavailable
-(headless CI), `open_kicad_route_viewer` reports that and everything else works;
-viewer bugs can't corrupt a route because the viewer never writes anything except
-the cancel flag.
+**Spec deviations (Sonnet subagent, coordinator-reviewed):**
+- Per-connection progress events use a run-local id (`f"{owner}:seg:{i}"` /
+  `f"{owner}:via:{i}"`), not the final board uuid — `route_nets` only assigns
+  real board uuids once, in a single batch, at the very end of the function.
+- `score` in each connection event is a cumulative-routed-length proxy, not a
+  full `get_trace_cost` board score (too expensive to compute per connection);
+  documented as a placeholder the sparkline can still plot meaningfully.
+- Cancel-flag polling only gates the serial rip-up worklist, not the 7.8b
+  speculative parallel pre-pass — most connections resolve there and never
+  reach the serial loop, so the serial loop is where a mid-run stop is
+  actually reachable.
+- The viewer's redraw-on-poll re-derives full state from the JSONL file each
+  tick rather than true incremental Tk item diffing (the file is small enough
+  that this is cheap) — an intentional simplicity/cost tradeoff, not a bug.
+- `decision_protocol` is a left-in `None` hook in the header event and
+  `ProgressState` (no 7.6/7.7 optimizer/decision protocol exists yet to feed
+  it).
 
 ### 7.10 Warm start — an existing board as the starting point
 
@@ -2127,9 +2109,6 @@ session (which also owns all user-facing verification questions):
 - **Parsers, inventory, settings plumbing (Phase 7.5.1)** —
   pattern-following work with clear specs: **Sonnet** subagents, one phase each, in
   dependency order; verify each lands green before starting a dependent.
-- **Progress viewer (7.9)** — self-contained, spec'd, and decoupled from the
-  router by the event-file contract: **Sonnet**, developed against a recorded
-  JSONL event file rather than a live run.
 - **numpy backend (7.8)** — mechanical vectorization of a proven cpu
   implementation with the parity suite as the acceptance gate: **Sonnet**. The
   **GPU tier** goes to **Opus**: it owns the batching/tiling/VRAM-budget design
@@ -2167,7 +2146,6 @@ they stay listed until 7.3b closes.
 | `optimize_kicad_board` | `optimize_board` | **yes (board + board_local.json)** |
 | `decide_kicad_route` | `decide_route` | **yes (board_local.json session)** |
 | `get_kicad_route_session` | `get_route_session` | no |
-| `open_kicad_route_viewer` | `open_route_viewer` | no (spawns viewer process) |
 | `get_kicad_system_resources` | `probe_system_resources` | no |
 | `adopt_kicad_routing` | `adopt_routing` | **yes (board_local.json)** |
 | `seed_kicad_routing_from_board` | `seed_routing_from_board` | **yes (board + board_local.json)** |
@@ -2191,11 +2169,12 @@ planned-not-implemented. **Docs sync LANDED 2026-07-23 (Haiku):**
 `audit_kicad_plane_islands` (7.5.2/7.5.3) now have full rows on
 `11-autorouter.md`; README + CLAUDE.md synced to **82 tools / 11 groups**
 (CLAUDE.md gained "route the board" + zone/island Common-Tasks entries).
-**Remaining docs debt (as of 2026-07-24, 83 tools):** `benchmark_kicad_autoroute`
-(7.16) has no docs row yet and README/CLAUDE.md now lag at 82 → bump to 83; the
-`route_kicad_nets`/`route_kicad_board` pages get revised as 7.5.4 plane-aware
-routing and 7.12 neck-down land (they change what routes vs. fails), and future
-Phase 7 tools add rows as they land)
+**Remaining docs debt (as of 2026-07-27, 84 tools):** `benchmark_kicad_autoroute`
+(7.16) and `open_kicad_route_viewer` (7.9) have no docs rows yet and
+README/CLAUDE.md now lag at 82 → bump to 84; the `route_kicad_nets`/
+`route_kicad_board` pages get revised as 7.5.4 plane-aware routing and 7.12
+neck-down land (they change what routes vs. fails), and future Phase 7 tools
+add rows as they land)
 - Extend `docs/mcp-tools/10-netclasses-and-buses.md` (or the autorouter page,
   as fits) as each remaining tool in the summary table above lands (same
   per-tool format).
