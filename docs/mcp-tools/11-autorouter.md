@@ -342,12 +342,12 @@ copper and records ownership for undo.
     "global_route": "done",
     "detailed_route": "done",
     "rip_up": "active",
-    "plane_aware_routing": "not_implemented (Phase 7.5, M4)",
+    "plane_aware_routing": "partial (Phase 7.5.4 landed for power nets; heuristic not cost-optimal)",
     "whole_board_optimization": "not_implemented (Phase 7.6, M4)",
     "stitching": "not_implemented (Phase 7.5.6, M4)"
   },
   "notes": [
-    "Minimal route_board (Phase 7.17): ratsnest -> global -> detailed only; planes/optimizer/stitching are M4 TODO hooks and do not run yet.",
+    "Minimal route_board (Phase 7.17): ratsnest -> global -> detailed only; optimizer/stitching are M4 TODO hooks and do not run yet.",
     "effort currently maps only to rip-up aggressiveness (quick=0, balanced=config default, best=20)."
   ]
 }
