@@ -4073,7 +4073,14 @@ def _self_check(
     """Prove every proposed segment/via against ALL foreign copper at netclass
     clearance (edge-to-edge >= clearance). Returns a list of violation records;
     empty means the route is DRC-safe to emit. Same-net obstacles are skipped
-    (a route legitimately touches its own endpoints' copper)."""
+    (a route legitimately touches its own endpoints' copper).
+
+    Each violation carries `owner`: None for existing/human board copper (never
+    rippable) or the integer connection id that owns the colliding AUTOROUTER-
+    placed copper (rippable). This is what lets a caller (the worklist's rip-up
+    step) tell a plane-skim against a filled zone/pad/hand-track (owner is None,
+    correctly terminal) apart from a skim against another already-placed
+    connection's own copper (owner is an id, demotable to rip-up)."""
     track_half = rules["track_width"] / 2.0
     clearance = rules["clearance"]
     edge_cl = rules["edge_clearance"]
@@ -4090,7 +4097,7 @@ def _self_check(
             if ob.seg_within(s["x1"], s["y1"], s["x2"], s["y2"], need):
                 violations.append({"kind": "segment", "layer": s["layer"],
                                    "against_net": ob.net, "against_kind": ob.kind,
-                                   "required_mm": round(need, 4)})
+                                   "required_mm": round(need, 4), "owner": ob.owner})
         if ob.via_transparent:
             # a power/gnd plane yields an anti-pad to a crossing via - the plane
             # copper is cut back around the via on KiCad refill, so a via is NOT a
@@ -4103,7 +4110,8 @@ def _self_check(
             need = via_radius + cl + ob.half - 1e-6
             if ob.point_within(v["x"], v["y"], need):
                 violations.append({"kind": "via", "against_net": ob.net,
-                                   "against_kind": ob.kind, "required_mm": round(need, 4)})
+                                   "against_kind": ob.kind, "required_mm": round(need, 4),
+                                   "owner": ob.owner})
     return violations
 
 
@@ -4680,16 +4688,24 @@ def _route_one(
             ctx, net, win, path, from_xy, to_xy, active_obstacles, margin, plane_layers)
         if rec_updates is None:
             # A path cleared the A* obstacle model but not the exact clearance
-            # pass (a plane-skim). Terminal (not demoted to rip-up, a known
-            # simplification): measured that a finer ladder rung does NOT clear it
-            # - the skim is against real copper the route must pass close to, so
-            # continuing only adds latency. The proper fix is rip-up demotion.
+            # pass (a plane-skim). NOT unconditionally terminal: `out["path"]`
+            # and the FULL `violations` list (each carrying `owner` - see
+            # `_self_check`) are kept so the worklist's rip-up step (Step 4,
+            # ~line 5300) can attempt demotion - ripping precisely the placed
+            # connections that own the colliding copper and re-finalizing this
+            # SAME path against the reduced obstacle set. A skim whose
+            # violations are all against non-rippable copper (owner is None:
+            # a filled zone/plane, a pad, an edge, hand-routed copper) cannot be
+            # helped by rip-up and correctly stays terminal there.
             result_rec["self_check"] = {"passed": False, "violations": violations[:8],
                                         "violation_count": len(violations)}
             result_rec["failure"] = {"reason": "self_check_failed",
                                      "detail": "proposed copper clears the A* obstacle model "
                                                "but not the exact clearance pass (plane-skim); "
-                                               "not demoted to rip-up"}
+                                               "demoted to rip-up when the skim is against "
+                                               "rippable autorouter-placed copper"}
+            out["path"] = path
+            out["violations"] = violations
             return out
         result_rec.update(rec_updates)
         out.update({"routed": True, "segments": segments, "vias": vias})
@@ -4957,23 +4973,31 @@ def route_nets(
     path that skims an obstacle still fails self-check and is never emitted.
 
     STEP 4 (rip-up & reroute, negotiated congestion) IS ACTIVE. When a
-    connection cannot route in its window, the window's obstacle cells are
-    cleared INCREMENTALLY of the autorouter-owned copper on the freed path (never
-    a full rebuild), the blocking autorouter connections are RIPPED (human/board
-    copper is NEVER ripped - a net blocked solely by human copper fails with the
-    blocker named), a `congestion` cost is escalated on the contested cells, and
-    the ripped connections are re-queued to re-route (their corridor choice may
-    change) - bounded by `max_ripup_iterations`. A displaced net does not
-    immediately rip the net that displaced it (anti-thrash), and every decision
-    is integer-milli / canonically ordered, so a given input routes identically
-    run to run. The result reports `ripup_active: true` plus per-run rip-up stats
-    (`ripup_iterations`, `connections_ripped`, `congestion_escalations`).
+    connection cannot route in its window (A* found no path at all), the
+    window's obstacle cells are cleared INCREMENTALLY of the autorouter-owned
+    copper on the freed path (never a full rebuild), the blocking autorouter
+    connections are RIPPED (human/board copper is NEVER ripped - a net blocked
+    solely by human copper fails with the blocker named), a `congestion` cost is
+    escalated on the contested cells, and the ripped connections are re-queued
+    to re-route (their corridor choice may change) - bounded by
+    `max_ripup_iterations`. A self-check failure (proposed copper clears the A*
+    obstacle model but not the exact clearance pass - a plane-skim) is ALSO
+    demoted through the same rip-up step when the skim's violations are against
+    rippable autorouter-placed copper: the offending placements are ripped and
+    the SAME found path (not a fresh search - it was already geometrically fine
+    except for those specific conflicts) is re-finalized/re-self-checked against
+    the reduced obstacle set. A plane-skim against non-rippable copper (a filled
+    zone/plane, a pad, an edge, hand-routed copper - `owner is None` on every
+    violation) cannot be helped by rip-up and correctly stays a hard failure. A
+    displaced net does not immediately rip the net that displaced it
+    (anti-thrash), and every decision is integer-milli / canonically ordered, so
+    a given input routes identically run to run. The result reports
+    `ripup_active: true` plus per-run rip-up stats (`ripup_iterations`,
+    `connections_ripped`, `congestion_escalations`).
 
-    Still simplified vs. the full spec (documented honestly): a self-check
-    failure (proposed copper clears the A* obstacle model but not the exact
-    clearance pass - the plane-skim case) is a hard failure, not demoted back to
-    rip-up; pad escape lands on the nearest free grid node rather than a pad-
-    direction-aware exact stub; neck-down (7.12) is not applied.
+    Still simplified vs. the full spec (documented honestly): pad escape lands
+    on the nearest free grid node rather than a pad-direction-aware exact stub;
+    neck-down (7.12) is not applied.
 
     PHASE 7.5.4 (plane-aware routing) IS ACTIVE for any net that owns a zone
     (a zone whose `net` matches - see `_plane_components_for`): a move whose
@@ -5304,11 +5328,14 @@ def route_nets(
             _place(owner, core["net"], core["segments"], core["vias"], core["rec"])
             continue
 
-        # Step 4: attempt rip-up ONLY for an A*-unreachable failure (self-check /
-        # window-budget failures are hard). Never rip when nothing is placed.
+        # Step 4: attempt rip-up for an A*-unreachable failure OR a self-check
+        # failure whose violations are against RIPPABLE autorouter-placed
+        # copper (window-budget failures, and self-check failures against
+        # non-rippable copper, stay hard). Never rip when nothing is placed.
         failure = core["rec"].get("failure") or {}
+        reason = failure.get("reason")
         did_rip = False
-        if (failure.get("reason") == "unreachable_in_window" and core["win"] is not None
+        if (reason == "unreachable_in_window" and core["win"] is not None
                 and placements and ripup_iterations < max_ripup_iterations):
             win = core["win"]
             # Anti-thrash: a net does not rip the net that just displaced it.
@@ -5360,6 +5387,51 @@ def route_nets(
                         # re-queue the ripped connections (canonical order).
                         pending = deque(sorted(set(pending) | blockers))
                         did_rip = True
+
+        elif (reason == "self_check_failed" and core.get("path") is not None
+                and core["win"] is not None and placements
+                and ripup_iterations < max_ripup_iterations):
+            # A path was FOUND (it cleared the A* obstacle model) but the exact
+            # `_finalize_core` self-check rejected it - a plane-skim. Unlike the
+            # unreachable case, we already have the failing path AND (via
+            # `core["violations"]`, each carrying `owner` - see `_self_check`)
+            # exactly which obstacle each violation is against, so there is no
+            # need to re-search: rip the OWNING placed connection(s) of every
+            # RIPPABLE violation (owner is not None) and re-finalize the SAME
+            # path against the reduced obstacle set. A violation with
+            # `owner is None` (filled zone/plane, pad, edge, hand copper) can
+            # never be freed this way, so its owning net is left out of
+            # `blockers` - if every violation is against such copper, `blockers`
+            # is empty and this connection correctly stays a hard failure below.
+            win = core["win"]
+            protect = {displaced_by[owner]} if owner in displaced_by else set()
+            blockers = {v["owner"] for v in (core.get("violations") or [])
+                       if v.get("owner") is not None} - protect
+            if blockers:
+                keep_obs = list(obstacles)
+                for oid, pl in placements.items():
+                    if oid not in blockers:
+                        keep_obs.extend(pl["obstacles"])
+                rec_updates, segments, vias, violations = _finalize_core(
+                    ctx, core["net"], win, core["path"], core["from_xy"], core["to_xy"],
+                    keep_obs, core.get("margin", base_margin), core["plane_layers"])
+                if rec_updates is not None:
+                    ripup_iterations += 1
+                    congestion_escalations += _raise_path_congestion(
+                        congestion, win, core["path"], board_min[0], board_min[1],
+                        grid, congestion_bump)
+                    for b in sorted(blockers):
+                        placements.pop(b, None)
+                        displaced_by[b] = owner
+                        rerouted.add(b)
+                        connections_ripped += 1
+                    rec = dict(core["rec"])
+                    rec.update(rec_updates)
+                    rec["ripped_to_place"] = sorted(blockers)
+                    _place(owner, core["net"], segments, vias, rec)
+                    # re-queue the ripped connections (canonical order).
+                    pending = deque(sorted(set(pending) | blockers))
+                    did_rip = True
 
         if not did_rip:
             failures[owner] = core["rec"]
