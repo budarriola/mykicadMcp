@@ -117,6 +117,7 @@ except Exception as exc:  # pragma: no cover - import safety
 
 try:
     from kicad_optimizer_tool import (
+        decide_route,
         get_route_session,
         optimize_board,
     )
@@ -1350,7 +1351,8 @@ class KiCadMcpServer:
                     "exp(-dS/T), T *= sa_cooling per iteration). `seed` makes a run fully reproducible. "
                     "RESUMABLE, never a marathon: one call runs at most max_iterations_per_call "
                     "iterations or max_seconds of wall clock and returns {session_id, state, "
-                    "score_curve, moves, diff}, with state in running|converged|budget_exhausted; pass "
+                    "score_curve, moves, diff}, with state in "
+                    "running|converged|budget_exhausted|awaiting_decision; pass "
                     "the session_id back to continue exactly where it stopped (RNG state and all loop "
                     "state checkpoint to the board-local JSON, so a session survives an MCP restart and "
                     "is inspectable via get_kicad_route_session). ALL iteration happens on a private "
@@ -1362,9 +1364,14 @@ class KiCadMcpServer:
                     "Refill zones + re-run DRC in KiCad after write=true. Human-routed copper and the "
                     "hand-made zones are read-only inputs throughout - the moves reuse "
                     "unroute_kicad_nets/modify_kicad_plane, whose own ownership guards they never "
-                    "bypass. Phase 7.7 (AI-in-the-loop decisions) is NOT implemented: there is no "
-                    "'awaiting_decision' state and optimizer.ai_decisions is never read; where 7.7 would "
-                    "pause on a near-tie, this optimizer takes the best-scored move."
+                    "bypass. Phase 7.7 (AI in the loop): when the top two candidate moves are within "
+                    "optimizer.ai_decisions.min_score_spread - i.e. the cost model genuinely cannot "
+                    "separate them - the call returns state 'awaiting_decision' with a pending_decision "
+                    "holding 2-4 pre-scored options (id, one-line summary, score delta); answer it with "
+                    "decide_kicad_route, or simply call this tool again to defer to the best-scored "
+                    "option. Clear winners are auto-taken exactly as before, max_pauses_per_run caps the "
+                    "escalation budget, and ai_decisions.enabled:false disables pausing entirely. Every "
+                    "committed move - auto or AI-decided - is appended to decision_log for audit/replay."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -1419,6 +1426,46 @@ class KiCadMcpServer:
                     "required": ["project_path"],
                 },
                 "handler": self._tool_get_route_session,
+            },
+            "decide_kicad_route": {
+                "description": (
+                    "Phase 7.7 - answer an optimize_kicad_board session that is paused in the "
+                    "'awaiting_decision' state. The pending_decision is a CLOSED list of 2-4 candidate "
+                    "moves the optimizer already applied and scored on private board copies; you pick "
+                    "one by its option id (e.g. 'opt2'), or pass the literal 'defer' to take the "
+                    "optimizer's own best-scored default. You cannot introduce a move of your own - "
+                    "`rationale` is free text that is RECORDED (in decision_log) and never executed. "
+                    "Decisions fire only where the cost model cannot separate the options (score spread "
+                    "under optimizer.ai_decisions.min_score_spread), which is exactly where judgement "
+                    "the arithmetic does not have - EMI, serviceability, 'that jumper layer is for "
+                    "rework wires', future hand-rework - beats the numbers. Applies the chosen candidate "
+                    "and returns the session to 'running'; it runs NO further iterations, so call "
+                    "optimize_kicad_board with the same session_id afterwards to continue. Raises if the "
+                    "session is not awaiting a decision or the decision_id does not match the pending "
+                    "one. Never touches the real board - like the rest of the optimizer it works on the "
+                    "session's private scratch copy until optimize_kicad_board is called with write=true."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "session_id": {"type": "string", "description": "The paused session."},
+                        "decision_id": {
+                            "type": "string",
+                            "description": "Must equal pending_decision.decision_id - a stale answer is refused.",
+                        },
+                        "choice": {
+                            "type": "string",
+                            "description": "An option id from pending_decision.options, or 'defer'.",
+                        },
+                        "rationale": {
+                            "type": "string",
+                            "description": "Why - recorded in decision_log, never executed.",
+                        },
+                    },
+                    "required": ["project_path", "session_id", "decision_id", "choice"],
+                },
+                "handler": self._tool_decide_route,
             },
             "propose_kicad_netclass": {
                 "description": (
@@ -2296,6 +2343,15 @@ class KiCadMcpServer:
 
     def _tool_get_route_session(self, args: dict[str, Any]) -> dict[str, Any]:
         return get_route_session(args["project_path"], session_id=args.get("session_id"))
+
+    def _tool_decide_route(self, args: dict[str, Any]) -> dict[str, Any]:
+        return decide_route(
+            args["project_path"],
+            args["session_id"],
+            args["decision_id"],
+            args["choice"],
+            rationale=args.get("rationale"),
+        )
 
     def _tool_propose_netclass(self, args: dict[str, Any]) -> dict[str, Any]:
         return propose_netclass_from_nets(args["project_path"], list(args["nets"]), args["name"])

@@ -1,4 +1,4 @@
-"""Phase 7.6 - iterative whole-board optimization (`optimize_kicad_board`).
+"""Phase 7.6/7.7 - iterative whole-board optimization (`optimize_kicad_board`).
 
 The "make the best board" loop. One number decides everything:
 
@@ -63,12 +63,37 @@ call boundary is not an input to any decision. (The one exception is the wall
 clock - a run stopped by `max_seconds` obviously diverges from one that wasn't.
 Tests pin this by bounding on iterations only.)
 
-Phase 7.7 (AI-in-the-loop decisions: the `awaiting_decision` state,
-`decide_kicad_route`, and the `optimizer.ai_decisions` settings block) is
-DELIBERATELY NOT IMPLEMENTED here - it is a separate landing. This module has
-three session states, not four, and never reads `optimizer.ai_decisions`. Where
-7.7 would pause on a near-tie between candidate moves, this optimizer simply
-takes the best-scored candidate.
+PHASE 7.7 - AI IN THE LOOP, BETWEEN DESIGNATED OPTIONS ONLY
+-----------------------------------------------------------
+The optimizer escalates a choice to the AI ONLY where its own arithmetic cannot
+separate the options: when the score spread between the best and runner-up
+candidate is under `optimizer.ai_decisions.min_score_spread`. That is the whole
+gate, and it is deliberately narrow - a clear winner is still auto-taken, so a
+run's behaviour is UNCHANGED from the 7.6 core everywhere except on a genuine
+near-tie. `ai_decisions.enabled: false` restores the 7.6 behaviour exactly.
+
+On a near-tie the chunk stops mid-iteration with `state: "awaiting_decision"`
+and a `pending_decision` holding a CLOSED list of 2-4 already-applied,
+already-scored candidates. The AI answers with an option id (or `"defer"`) via
+`decide_route` / MCP `decide_kicad_route`; free-form input is confined to a
+`rationale` string that is recorded and never executed. Nothing is applied while
+the session is paused, and the AI can never introduce a move the optimizer did
+not itself generate and price.
+
+Because a paused option must survive an MCP restart like everything else, the
+options' trial directories are copied out of the throwaway trial root into a
+stable `_pending` directory recorded in the checkpoint; resolving the decision
+promotes the chosen one over the scratch, exactly as auto-acceptance does.
+
+An abandoned pause cannot wedge a session: calling `optimize_board` again on an
+`awaiting_decision` session resolves the pause as `defer` (the optimizer's own
+best-scored option) and carries on, so an undecided session still converges.
+
+Auditability is the point of the whole mechanism, so EVERY committed move -
+auto-accepted or AI-decided - appends one entry to `decision_log` carrying the
+options, their scores, the choice, the rationale and the `auto` flag. That log
+plus `seed` is enough to replay a run (same seed + same answers -> same board);
+a dedicated replay executor is not built here (see the report's TODO).
 """
 
 from __future__ import annotations
@@ -86,10 +111,7 @@ from typing import Any
 import kicad_pcb_tool as _pcb
 import kicad_router_tool as _r
 
-# The three session states this phase implements. 7.7's `awaiting_decision` is
-# intentionally absent (see module docstring) rather than declared-and-unused,
-# so a caller cannot be told a state exists that nothing can ever produce.
-SESSION_STATES = ("running", "converged", "budget_exhausted")
+SESSION_STATES = ("running", "converged", "budget_exhausted", "awaiting_decision")
 
 # Hard cap on how many candidate moves one iteration evaluates. Each candidate
 # costs a full board copy + reroute + rescore, so this is the knob that keeps a
@@ -105,6 +127,59 @@ _MAX_CANDIDATES_PER_ITERATION = 6
 # routes (the "the weights decide, the router never hard-forbids" rule from
 # 7.3c) rather than failing and costing an unrouted-connection penalty.
 _LAYER_SWAP_PENALTY = 6.0
+
+# How many options a pending decision may carry. The plan fixes this at "a
+# closed list of 2-4 candidates": fewer than two is not a decision, and more
+# than four stops being a judgement call and starts being a search the AI is
+# worse at than the cost model.
+_MIN_DECISION_OPTIONS = 2
+_MAX_DECISION_OPTIONS = 4
+
+# Which of the plan's six `decision_types` each move type escalates as. The
+# move types are the optimizer's internal vocabulary; `decision_types` in
+# `pcb_settings.json` is the USER-facing allowlist, so the two have to be
+# mapped rather than conflated - a user who wants "never ask me about planes"
+# removes `plane_proposal` and both plane moves stop pausing.
+#
+# `swap_layer` maps to `bundle_layer` because it is the same class of question
+# the plan describes there ("which layer/corridor this copper takes"), just for
+# a single net rather than a whole bundle; there is no separate net-layer type
+# in the plan's list and inventing one would put a name in the allowlist that
+# the settings schema does not document.
+_MOVE_DECISION_TYPES = {
+    "ripup_reroute": "conflict_yield",
+    "reroute_bundle": "bundle_layer",
+    "swap_layer": "bundle_layer",
+    "add_stitching_via": "stitching_budget",
+    "create_plane": "plane_proposal",
+    "modify_plane": "plane_proposal",
+}
+
+# The remaining two decision types are properties of the SITUATION, not of the
+# move type, so they are detected from the winning candidate's own result and
+# override the static map above.
+#
+# `give_up_net`: the leading candidate still leaves connections unrouted, so the
+# real question is "hand-route this or buy an expensive route", which is exactly
+# the plan's give_up_net.
+# `sa_large_move`: an annealing move that rips this many nets or more is the
+# "rip a whole bundle" case the plan wants confirmed before proceeding.
+_SA_LARGE_MOVE_NETS = 2
+
+
+def _ai_decision_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the `optimizer.ai_decisions` block, falling back to the 6.1
+    schema defaults. Snapshotted into the session at creation so a run's pause
+    policy cannot change under it mid-session - the same treatment `worst_k` and
+    `convergence_delta` already get."""
+    defaults = _pcb.DEFAULT_PCB_SETTINGS["optimizer"]["ai_decisions"]
+    block = (config.get("optimizer", {}) or {}).get("ai_decisions", {}) or {}
+    return {
+        "enabled": bool(block.get("enabled", defaults["enabled"])),
+        "min_score_spread": float(block.get("min_score_spread", defaults["min_score_spread"])),
+        "max_pauses_per_run": int(block.get("max_pauses_per_run", defaults["max_pauses_per_run"])),
+        "decision_types": list(block.get("decision_types", defaults["decision_types"])),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -293,7 +368,31 @@ def _session_report(session: dict[str, Any]) -> dict[str, Any]:
         "scratch_dir": session["scratch_dir"],
         "applied": session.get("applied", False),
         "stop_reason": session.get("stop_reason"),
+        # 7.7. `pending_decision` is None except in the `awaiting_decision`
+        # state; it is reported unconditionally so a caller can test the field
+        # rather than having to know which states carry it.
+        "pending_decision": session.get("pending_decision"),
+        "decision_log": list(session.get("decision_log", [])),
+        "pauses_used": session.get("pauses_used", 0),
+        "ai_decisions": dict(session.get("ai_decisions", {})),
     }
+
+
+def _migrate_session(session: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Bring a checkpoint written by the 7.6 core up to the 7.7 shape.
+
+    Sessions outlive the process AND the code version - a board-local JSON
+    written before this landing is a perfectly legitimate thing to resume, and
+    it must not crash on a missing key. Resolving `ai_decisions` from the
+    CURRENT settings here is the only honest option: the older session never
+    recorded a policy to preserve.
+    """
+    session.setdefault("pending_decision", None)
+    session.setdefault("decision_log", [])
+    session.setdefault("pauses_used", 0)
+    if not session.get("ai_decisions"):
+        session["ai_decisions"] = _ai_decision_config(config)
+    return session
 
 
 # --------------------------------------------------------------------------- #
@@ -746,6 +845,269 @@ def _accept(policy: str, delta: float, temperature: float, rng: random.Random) -
     return False, f"sa_rejected_worse (p={probability:.4f})"
 
 
+# --------------------------------------------------------------------------- #
+# Phase 7.7 - decisions
+#
+# The gate, the option list, and the ONE place a chosen candidate is committed.
+# Auto-acceptance and AI-acceptance go through the same commit, which is what
+# makes the parity claim checkable rather than asserted: an auto-decided
+# iteration executes literally the same code as before, plus a log append.
+# --------------------------------------------------------------------------- #
+
+def _decision_type_for(session: dict[str, Any], best: dict[str, Any]) -> str:
+    """Classify the decision the leading candidate represents (see
+    `_MOVE_DECISION_TYPES` for why the situation-derived types win)."""
+    detail = best.get("detail") or {}
+    if int(detail.get("failed", 0) or 0) > 0:
+        return "give_up_net"
+    if session["accept"] == "sa" and len(detail.get("nets", []) or []) >= _SA_LARGE_MOVE_NETS:
+        return "sa_large_move"
+    return _MOVE_DECISION_TYPES[best["type"]]
+
+
+def _option_records(usable: list[dict[str, Any]], current_total: float) -> list[dict[str, Any]]:
+    """Project the scored candidates into the option list a decision (and every
+    `decision_log` entry) is made of.
+
+    `usable` arrives already sorted best-first, so `opt1` is ALWAYS the
+    optimizer's own default - which is what `defer` resolves to and what the
+    7.6 core would have taken unconditionally.
+    """
+    options = []
+    for index, record in enumerate(usable[:_MAX_DECISION_OPTIONS], start=1):
+        options.append({
+            "id": f"opt{index}",
+            "type": record["type"],
+            "summary": record["summary"],
+            "score": record["score"],
+            "score_total": record["score"]["total"],
+            "score_delta": round(record["score"]["total"] - current_total, 6),
+            "spread_from_best": round(record["score"]["total"] - usable[0]["score"]["total"], 6),
+            "is_default": index == 1,
+            "trial_dir": record["trial_dir"],
+            "detail": record.get("detail"),
+            # Per-option SVG previews are specified in the plan but not built
+            # here: nothing in this codebase renders a board to SVG, so it would
+            # mean new export machinery (and a KiCad CLI dependency) on the
+            # critical path of every paused iteration. The numbers plus the
+            # one-line summary are what the decision is actually made on.
+            "svg": None,
+        })
+    return options
+
+
+def _log_entry(decision_id: str, iteration: int, decision_type: str,
+               options: list[dict[str, Any]], choice: str, resolved: str,
+               rationale: str | None, auto: bool, auto_reason: str | None) -> dict[str, Any]:
+    """One `decision_log` row. Deliberately self-contained (the options and
+    their scores are copied in, not referenced) so the log alone is enough to
+    understand - or replay - why the board came out the way it did."""
+    return {
+        "decision_id": decision_id,
+        "iteration": iteration,
+        "decision_type": decision_type,
+        "options": [{"id": o["id"], "type": o["type"], "summary": o["summary"],
+                     "score_total": o["score_total"], "score_delta": o["score_delta"],
+                     "is_default": o["is_default"]} for o in options],
+        "scores": {o["id"]: o["score_total"] for o in options},
+        "choice": choice,
+        "resolved_choice": resolved,
+        "rationale": rationale,
+        "auto": auto,
+        "auto_reason": auto_reason,
+    }
+
+
+def _pause_check(session: dict[str, Any], options: list[dict[str, Any]],
+                 decision_type: str) -> str | None:
+    """Should this iteration pause for the AI? Returns None to pause, or the
+    reason it is auto-decided instead (which goes straight into the log, so a
+    run's history says WHY each move was never escalated).
+
+    Consumes no RNG and reads no board: whether a pause happens can never
+    perturb the run's decisions, only defer them.
+    """
+    policy = session["ai_decisions"]
+    if not policy["enabled"]:
+        return "ai_decisions_disabled"
+    if len(options) < _MIN_DECISION_OPTIONS:
+        return "single_applicable_candidate"
+    if decision_type not in policy["decision_types"]:
+        return f"decision_type_not_enabled:{decision_type}"
+    if session["pauses_used"] >= policy["max_pauses_per_run"]:
+        return "max_pauses_per_run"
+    # A decision whose outcome cannot change the board is not a decision. Under
+    # `greedy` every option is at least as expensive as the leader, so if the
+    # LEADER does not improve the score, every option is rejected whichever one
+    # is picked - and a converged board (where nothing improves any more) would
+    # otherwise escalate a menu of six moves that are all about to be thrown
+    # away. Under `sa` a worse move can genuinely be accepted, so the choice
+    # still matters there.
+    if session["accept"] != "sa" and options[0]["score_delta"] >= 0:
+        return "no_improving_candidate"
+    spread = options[1]["score_total"] - options[0]["score_total"]
+    if spread >= policy["min_score_spread"]:
+        return f"clear_winner:spread={round(spread, 6)}"
+    return None
+
+
+def _park_pending_options(session: dict[str, Any], options: list[dict[str, Any]]) -> None:
+    """Copy the option trials out of the per-chunk trial root into a stable
+    `_pending` directory beside the scratch, and repoint the options at it.
+
+    The trial root is wiped at the end of every chunk (and by the next
+    iteration), but a pause has to survive until the AI answers - possibly after
+    an MCP restart. Copying is cheap here: a project snapshot is board +
+    .kicad_pro + .net + two small JSONs, and there are at most four of them.
+    """
+    scratch = Path(session["scratch_dir"])
+    pending_root = scratch.parent / f"{scratch.name}_pending"
+    shutil.rmtree(pending_root, ignore_errors=True)
+    pending_root.mkdir(parents=True, exist_ok=True)
+    for option in options:
+        option["trial_dir"] = str(_scratch_snapshot(Path(option["trial_dir"]),
+                                                    pending_root / option["id"]))
+
+
+def _commit_choice(session: dict[str, Any], chosen: dict[str, Any],
+                   options: list[dict[str, Any]], rng: random.Random,
+                   log: dict[str, Any], evaluated_count: int) -> float:
+    """Apply one chosen candidate to the session and record it. The single
+    place a move is ever committed, whether it was auto-taken or AI-chosen.
+
+    `chosen` carries a `trial_dir` that has ALREADY been applied and scored;
+    promoting that directory over the scratch (rather than replaying the move)
+    is what guarantees the accepted state is exactly the state that was scored.
+    Returns the score improvement, which the caller tests for convergence.
+    """
+    session["iteration"] += 1
+    current_total = session["current_score"]["total"]
+    delta = round(chosen["score_total"] - current_total, 6)
+    accepted, reason = _accept(session["accept"], delta, session["temperature"], rng)
+
+    if accepted:
+        _scratch_snapshot(Path(chosen["trial_dir"]), Path(session["scratch_dir"]))
+        session["current_score"] = chosen["score"]
+        if chosen["score"]["total"] < session["best_score"]["total"]:
+            session["best_score"] = chosen["score"]
+
+    session["moves"].append({
+        "iteration": session["iteration"],
+        "type": chosen["type"],
+        "summary": chosen["summary"],
+        "detail": chosen.get("detail"),
+        "accepted": accepted,
+        "reason": reason,
+        "score_before": current_total,
+        "score_after": session["current_score"]["total"],
+        "delta": round(session["current_score"]["total"] - current_total, 6),
+        "candidates_evaluated": evaluated_count,
+        "candidates_applicable": len(options),
+    })
+    session["score_curve"].append(session["current_score"]["total"])
+    session["decision_log"].append({
+        **log,
+        "accepted": accepted,
+        "accept_reason": reason,
+        "score_before": current_total,
+        "score_after": session["current_score"]["total"],
+        "delta": round(session["current_score"]["total"] - current_total, 6),
+    })
+    return current_total - session["current_score"]["total"]
+
+
+def _resolve_pending(session: dict[str, Any], choice: str, rationale: str | None,
+                     auto: bool, auto_reason: str | None) -> dict[str, Any]:
+    """Turn an `awaiting_decision` session back into a `running` one by
+    committing the chosen option. Shared by `decide_route` (an explicit answer)
+    and by `optimize_board`'s timeout-to-defer on resume.
+
+    Deliberately does NOT run further iterations: resolving a pause and doing
+    more work are separate calls, so the caller always sees the consequence of
+    its own decision before the next one is generated.
+    """
+    pending = session["pending_decision"]
+    options = {o["id"]: o for o in pending["options"]}
+    resolved = pending["default_choice"] if choice == "defer" else choice
+    if resolved not in options:
+        raise ValueError(
+            f"choice {choice!r} is not one of this decision's options "
+            f"({', '.join(sorted(options))}) or the literal 'defer'")
+
+    chosen = options[resolved]
+    rng = _rng_from_json(session["rng_state"])
+    improvement = _commit_choice(
+        session, chosen, pending["options"], rng,
+        _log_entry(pending["decision_id"], pending["iteration"], pending["decision_type"],
+                   pending["options"], choice, resolved, rationale, auto, auto_reason),
+        pending["candidates_evaluated"])
+
+    if session["accept"] == "sa":
+        session["temperature"] *= session["sa_cooling"]
+    session["rng_state"] = _rng_state_to_json(rng)
+    session["pending_decision"] = None
+    # The SAME convergence test the auto path applies to the move it just
+    # committed. Skipping it here would be a parity break, not a simplification:
+    # a run whose final move happened to be escalated would report
+    # `budget_exhausted` on the next resume where the identical unescalated run
+    # reported `converged`.
+    if improvement < session["convergence_delta"]:
+        session["state"] = "converged"
+        session["stop_reason"] = "convergence_delta"
+    else:
+        session["state"] = "running"
+        session["stop_reason"] = None
+    shutil.rmtree(Path(pending["pending_dir"]), ignore_errors=True)
+    return {"resolved_choice": resolved, "improvement": round(improvement, 6),
+            "entry": session["decision_log"][-1]}
+
+
+def decide_route(project_path: str | Path, session_id: str, decision_id: str,
+                 choice: str, rationale: str | None = None) -> dict[str, Any]:
+    """Phase 7.7 - answer a paused optimizer session (MCP `decide_kicad_route`).
+
+    `choice` is one of the pending decision's option ids, or the literal
+    `"defer"` meaning "take the optimizer's own best-scored default". The
+    chosen candidate is applied, the decision (options, scores, choice,
+    rationale) is appended to `decision_log`, and the session returns to
+    `running` - or to `converged`, if the move it just committed was the one
+    that stopped buying `convergence_delta`.
+
+    This call runs NO further iterations - resume with `optimize_board(...,
+    session_id=...)` afterwards. `rationale` is recorded and never executed.
+    """
+    config = _pcb.load_pcb_settings(project_path)["config"]
+    data, sessions = _load_sessions(project_path)
+    if session_id not in sessions:
+        raise KeyError(f"No optimizer session {session_id!r} on this board")
+    session = _migrate_session(sessions[session_id], config)
+
+    if session["state"] != "awaiting_decision" or not session.get("pending_decision"):
+        raise ValueError(
+            f"session {session_id} is {session['state']!r}, not 'awaiting_decision' - "
+            "there is no decision to answer")
+    pending = session["pending_decision"]
+    if decision_id != pending["decision_id"]:
+        raise ValueError(
+            f"decision_id {decision_id!r} does not match this session's pending decision "
+            f"{pending['decision_id']!r}")
+
+    outcome = _resolve_pending(session, str(choice), rationale, auto=False, auto_reason=None)
+    data["last_optimizer_session"] = session["session_id"]
+    _pcb.save_board_local(project_path, data)
+    return {
+        "command": "decide_route",
+        "decision_id": decision_id,
+        "choice": choice,
+        "resolved_choice": outcome["resolved_choice"],
+        "rationale": rationale,
+        "decision": outcome["entry"],
+        **_session_report(session),
+        "notes": ["Decision recorded and applied; call optimize_kicad_board with this "
+                  "session_id to continue optimizing."],
+    }
+
+
 def _new_session(project_path: str | Path, config: dict[str, Any],
                  seed: int | None, accept: str | None,
                  max_iterations: int | None, time_budget_s: float | None) -> dict[str, Any]:
@@ -784,6 +1146,10 @@ def _new_session(project_path: str | Path, config: dict[str, Any],
         "moves": [],
         "applied": False,
         "stop_reason": None,
+        "ai_decisions": _ai_decision_config(config),
+        "pending_decision": None,
+        "decision_log": [],
+        "pauses_used": 0,
     }
 
 
@@ -813,6 +1179,12 @@ def optimize_board(
                             improved it at all).
       `budget_exhausted`  - the SESSION's `max_iterations` / `time_budget_s`
                             ran out first.
+      `awaiting_decision` - (7.7) the top two candidates are within
+                            `optimizer.ai_decisions.min_score_spread`, so the
+                            cost model cannot separate them; `pending_decision`
+                            carries the option list. Answer with
+                            `decide_kicad_route`, or just call this tool again
+                            to defer to the best-scored option.
 
     Each iteration ranks every cost contributor worst-first (routed nets at
     their trace cost, unrouted nets at `unrouted_penalty` x their missing
@@ -830,13 +1202,9 @@ def optimize_board(
     a replay of individual moves) onto the real board and merges the scratch's
     `autorouter_owned` bookkeeping into the real board-local state, so
     `unroute_nets` still undoes every piece of it. It refuses if the session is
-    still `running` (there is no "final state" yet) or if the real board file
-    changed since the session started. As with every writer here, KiCad must
-    refill zones and re-run DRC afterward.
-
-    Phase 7.7 (AI-in-the-loop decisions) is not implemented: there is no
-    `awaiting_decision` state and `optimizer.ai_decisions` is never read. Where
-    7.7 would pause on a near-tie, this optimizer takes the best-scored move.
+    still `running` or `awaiting_decision` (there is no "final state" yet) or if
+    the real board file changed since the session started. As with every writer
+    here, KiCad must refill zones and re-run DRC afterward.
     """
     config = _pcb.load_pcb_settings(project_path)["config"]
     data, sessions = _load_sessions(project_path)
@@ -847,9 +1215,21 @@ def optimize_board(
     else:
         if session_id not in sessions:
             raise KeyError(f"No optimizer session {session_id!r} on this board")
-        session = sessions[session_id]
+        session = _migrate_session(sessions[session_id], config)
 
     notes: list[str] = []
+    # Timeout-to-defer: an abandoned pause must never wedge a session, so a
+    # plain resume answers the outstanding decision with the optimizer's own
+    # best-scored option and carries on. `decide_route` is the way to answer it
+    # with anything ELSE - not the way to answer it at all.
+    if session["state"] == "awaiting_decision" and not session["applied"]:
+        pending = session["pending_decision"]
+        outcome = _resolve_pending(session, "defer", None, auto=True,
+                                   auto_reason="resume_without_decision")
+        notes.append(f"Decision {pending['decision_id']} was resumed without an answer; "
+                     f"deferred to {outcome['resolved_choice']} ({pending['default_choice']} "
+                     "was the optimizer's default).")
+
     if session["state"] == "running" and not session["applied"]:
         _run_chunk(session, max_iterations_per_call, max_seconds, notes)
 
@@ -872,10 +1252,7 @@ def optimize_board(
         **_session_report(session),
         "score_delta": round(session["current_score"]["total"] - session["initial_score"]["total"], 4),
         "diff": _session_diff(session),
-        "notes": notes + [
-            "Phase 7.7 (AI-in-the-loop decisions) is not implemented: this session "
-            "state machine has three states and never reads optimizer.ai_decisions.",
-        ],
+        "notes": notes,
     }
     if write_skipped_reason:
         report["write_skipped_reason"] = write_skipped_reason
@@ -926,15 +1303,12 @@ def _run_chunk(session: dict[str, Any], max_iterations_per_call: int,
         evaluated = [_evaluate_candidate(scratch, trial_root, c, session["iteration"] + 1, i)
                      for i, c in enumerate(candidates)]
         usable = [e for e in evaluated if e["applicable"]]
-        # Best-scored candidate wins outright. 7.7 would pause here when the
-        # top two are within `min_score_spread`; out of scope for this landing.
         usable.sort(key=lambda e: (e["score"]["total"], e["type"], e["summary"]))
-
-        session["iteration"] += 1
-        done_this_call += 1
         current_total = session["current_score"]["total"]
 
         if not usable:
+            session["iteration"] += 1
+            done_this_call += 1
             session["moves"].append({
                 "iteration": session["iteration"], "type": None, "accepted": False,
                 "reason": "no_applicable_candidate", "score_before": current_total,
@@ -946,41 +1320,53 @@ def _run_chunk(session: dict[str, Any], max_iterations_per_call: int,
             _finish_iteration(session, rng, iteration_started)
             break
 
-        best = usable[0]
-        delta = round(best["score"]["total"] - current_total, 6)
-        accepted, reason = _accept(session["accept"], delta, session["temperature"], rng)
+        # 7.7: the ONE branch point this phase adds. Everything below the pause
+        # check is byte-for-byte the 7.6 behaviour, reached whenever
+        # `_pause_check` declines to escalate.
+        options = _option_records(usable, current_total)
+        decision_id = f"{session['session_id'][:8]}-i{session['iteration'] + 1}"
+        decision_type = _decision_type_for(session, usable[0])
+        auto_reason = _pause_check(session, options, decision_type)
 
-        if accepted:
-            # Promote the winning trial to BE the scratch state. Copying the
-            # trial over the scratch (rather than replaying the move on the
-            # scratch) is what guarantees the accepted state is exactly the
-            # state that was scored.
-            _scratch_snapshot(Path(best["trial_dir"]), scratch)
-            session["current_score"] = best["score"]
-            if best["score"]["total"] < session["best_score"]["total"]:
-                session["best_score"] = best["score"]
+        if auto_reason is None:
+            _park_pending_options(session, options)
+            session["pending_decision"] = {
+                "decision_id": decision_id,
+                "iteration": session["iteration"] + 1,
+                "decision_type": decision_type,
+                "default_choice": options[0]["id"],
+                "score_spread": options[1]["score_total"] - options[0]["score_total"],
+                "min_score_spread": session["ai_decisions"]["min_score_spread"],
+                "current_score": current_total,
+                "candidates_evaluated": len(evaluated),
+                "pending_dir": str(Path(scratch.parent) / f"{scratch.name}_pending"),
+                "options": options,
+            }
+            session["pauses_used"] += 1
+            session["state"] = "awaiting_decision"
+            session["stop_reason"] = "awaiting_decision"
+            # Only the timing half of `_finish_iteration`: the iteration has NOT
+            # completed, so cooling the temperature or advancing the counter here
+            # would make a paused run diverge from an unpaused one.
+            session["elapsed_s"] += time.monotonic() - iteration_started
+            session["rng_state"] = _rng_state_to_json(rng)
+            notes.append(f"Paused for decision {decision_id} ({decision_type}); "
+                         "answer with decide_kicad_route, or call optimize_kicad_board "
+                         "again to defer to the best-scored option.")
+            break
 
-        session["moves"].append({
-            "iteration": session["iteration"],
-            "type": best["type"],
-            "summary": best["summary"],
-            "detail": best.get("detail"),
-            "accepted": accepted,
-            "reason": reason,
-            "score_before": current_total,
-            "score_after": session["current_score"]["total"],
-            "delta": round(session["current_score"]["total"] - current_total, 6),
-            "candidates_evaluated": len(evaluated),
-            "candidates_applicable": len(usable),
-        })
-        session["score_curve"].append(session["current_score"]["total"])
+        done_this_call += 1
+        improvement = _commit_choice(
+            session, options[0], options, rng,
+            _log_entry(decision_id, session["iteration"] + 1, decision_type, options,
+                       options[0]["id"], options[0]["id"], None, True, auto_reason),
+            len(evaluated))
         shutil.rmtree(trial_root, ignore_errors=True)
         trial_root.mkdir(exist_ok=True)
 
         # Converged when the best available move cannot buy `convergence_delta`
         # worth of score. Under `greedy` a rejected move means nothing improved,
         # which is the same condition - so both policies stop here honestly.
-        improvement = current_total - session["current_score"]["total"]
         if improvement < session["convergence_delta"]:
             session["state"] = "converged"
             session["stop_reason"] = "convergence_delta"
@@ -1046,7 +1432,7 @@ def _apply_session(session: dict[str, Any], project_path: str | Path,
     save of everything (session checkpoint + ownership) at the end. Saving from
     both places would let the caller's older snapshot clobber this one.
     """
-    if session["state"] == "running":
+    if session["state"] in ("running", "awaiting_decision"):
         return False, "session is still running - resume until converged/budget_exhausted before writing"
     if session.get("applied"):
         return False, "session was already applied"

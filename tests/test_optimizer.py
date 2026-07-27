@@ -43,6 +43,62 @@ def _routed_project(directory: Path, destinations: int = 1) -> Path:
     return directory
 
 
+def _set_ai_decisions(project: Path, **overrides) -> None:
+    """Write an `optimizer.ai_decisions` policy into the project's settings.
+
+    The 7.7 tests need to control the pause GATE, not the board: pushing
+    `min_score_spread` far above any real spread makes every multi-candidate
+    iteration a "near tie" on demand, and 0.0 makes none of them one. That is
+    the only way to exercise the pause path deterministically on a fixture whose
+    natural score spreads depend on the router's output.
+    """
+    path = Path(project) / "pcb_settings.json"
+    config = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    config.setdefault("optimizer", {}).setdefault("ai_decisions", {}).update(overrides)
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+
+def _always_pause(project: Path, **overrides) -> None:
+    _set_ai_decisions(project, enabled=True, min_score_spread=1e9, **overrides)
+
+
+def _run_to_first_pause(project: Path, limit: int = 10, **kwargs) -> dict:
+    """Start a session and advance it until it pauses.
+
+    Which ITERATION first pauses is a property of the board, not of the gate: an
+    iteration that produces only one applicable candidate has nothing to choose
+    between and commits without asking, however wide the configured spread is.
+    So a test that wants a paused session asks for one rather than assuming it
+    arrives on iteration 1.
+    """
+    report = o.optimize_board(project, max_iterations_per_call=1, **kwargs)
+    calls = 0
+    while report["state"] == "running" and calls < limit:
+        report = o.optimize_board(project, session_id=report["session_id"],
+                                  max_iterations_per_call=1)
+        calls += 1
+    assert report["state"] == "awaiting_decision", (
+        f"fixture never produced a near-tie to decide (ended {report['state']})")
+    return report
+
+
+def _run_to_completion(project: Path, report: dict, decider=None, limit: int = 40) -> dict:
+    """Drive a session to a terminal state, answering any pause with `decider`
+    (the "scripted decider" harness - a canned function, never a real AI). With
+    `decider=None` the pauses are left unanswered, which exercises the
+    timeout-to-defer path instead."""
+    calls = 0
+    while report["state"] in ("running", "awaiting_decision") and calls < limit:
+        if report["state"] == "awaiting_decision" and decider is not None:
+            pending = report["pending_decision"]
+            o.decide_route(project, report["session_id"], pending["decision_id"],
+                           decider(pending), rationale="scripted decider")
+        report = o.optimize_board(project, session_id=report["session_id"],
+                                  max_iterations_per_call=2)
+        calls += 1
+    return report
+
+
 def _segment_uuids(project: Path) -> set[str]:
     board_path, _, _ = k._resolve_project_path(project)
     tracks = k._parse_tracks_cached(board_path)
@@ -101,7 +157,7 @@ def test_dry_run_across_a_whole_session_leaves_the_board_byte_identical(tmp_path
     before_bytes = board_path.read_bytes()
 
     report = o.optimize_board(project, max_iterations_per_call=2, seed=11, max_iterations=4)
-    while report["state"] == "running":
+    while report["state"] in ("running", "awaiting_decision"):
         report = o.optimize_board(project, session_id=report["session_id"],
                                   max_iterations_per_call=2)
     assert board_path.read_bytes() == before_bytes
@@ -116,7 +172,7 @@ def test_write_applies_final_state_and_rerun_converges_immediately(tmp_path: Pat
     unrouted_before = r.get_ratsnest(project)["summary"]["total_connections"]
 
     report = o.optimize_board(project, max_iterations_per_call=6, seed=5, max_iterations=6)
-    while report["state"] == "running":
+    while report["state"] in ("running", "awaiting_decision"):
         report = o.optimize_board(project, session_id=report["session_id"], max_iterations_per_call=6)
     assert report["state"] in ("converged", "budget_exhausted")
 
@@ -157,7 +213,7 @@ def test_write_refuses_when_the_real_board_changed_under_the_session(tmp_path: P
     board_path, _, _ = k._resolve_project_path(project)
 
     report = o.optimize_board(project, max_iterations_per_call=8, seed=5, max_iterations=8)
-    while report["state"] == "running":
+    while report["state"] in ("running", "awaiting_decision"):
         report = o.optimize_board(project, session_id=report["session_id"], max_iterations_per_call=8)
 
     # simulate the user editing the board in KiCad mid-session.
@@ -207,13 +263,21 @@ def test_chunked_run_reaches_the_same_state_as_one_big_call(tmp_path: Path) -> N
     scratch board itself) is checkpointed, so the call boundary is not an input
     to any decision. Bounded on ITERATIONS only - a wall-clock bound would
     legitimately diverge."""
-    one_shot = o.optimize_board(_unrouted_project(tmp_path / "one"),
-                                max_iterations_per_call=4, seed=17, max_iterations=4)
+    # Both arms are driven to a terminal state. A 7.7 pause also ends a call, so
+    # "one big call" can no longer be assumed to be literally one call - which
+    # is precisely the property under test: the call boundary, however it
+    # arises, must not be an input to any decision.
+    one_shot_project = _unrouted_project(tmp_path / "one")
+    one_shot = o.optimize_board(one_shot_project, max_iterations_per_call=4,
+                                seed=17, max_iterations=4)
+    while one_shot["state"] in ("running", "awaiting_decision"):
+        one_shot = o.optimize_board(one_shot_project, session_id=one_shot["session_id"],
+                                    max_iterations_per_call=4)
 
     chunked_project = _unrouted_project(tmp_path / "chunked")
     chunked = o.optimize_board(chunked_project, max_iterations_per_call=1, seed=17, max_iterations=4)
     calls = 1
-    while chunked["state"] == "running":
+    while chunked["state"] in ("running", "awaiting_decision"):
         chunked = o.optimize_board(chunked_project, session_id=chunked["session_id"],
                                    max_iterations_per_call=1)
         calls += 1
@@ -263,7 +327,7 @@ def test_get_route_session_reports_state_without_advancing_it(tmp_path: Path) ->
     assert again["score_curve"] == mid["score_curve"]
 
     final = o.optimize_board(project, session_id=running["session_id"], max_iterations_per_call=10)
-    while final["state"] == "running":
+    while final["state"] in ("running", "awaiting_decision"):
         final = o.optimize_board(project, session_id=final["session_id"], max_iterations_per_call=10)
     assert final["state"] in ("converged", "budget_exhausted")
     assert o.get_route_session(project)["state"] == final["state"]
@@ -490,31 +554,301 @@ def test_mcp_tools_are_registered_and_route_to_the_core_functions(tmp_path: Path
     assert session["iteration"] == report["iteration"]
 
 
-def test_decide_kicad_route_is_not_registered(tmp_path: Path) -> None:
-    """Phase 7.7's tool must not appear until 7.7 is actually built."""
+def test_decide_kicad_route_is_registered_and_routes_to_the_core_function() -> None:
+    """Phase 7.7's tool. (This test replaced 7.6's
+    `test_decide_kicad_route_is_not_registered`, whose whole purpose was to fail
+    the moment 7.7 shipped.)"""
     from kicad_mcp_server import KiCadMcpServer
 
-    assert "decide_kicad_route" not in KiCadMcpServer().tools
+    tool = KiCadMcpServer().tools["decide_kicad_route"]
+    assert tool["inputSchema"]["required"] == [
+        "project_path", "session_id", "decision_id", "choice"]
+    assert callable(tool["handler"])
 
 
-# --- 7.7 is honestly out of scope, and must stay that way -------------------
+# --- 7.7: decisions ---------------------------------------------------------
 
 
-def test_phase_77_decision_machinery_is_absent_not_faked(tmp_path: Path) -> None:
-    """7.6 landed WITHOUT 7.7. A regression that silently introduces a fourth
-    state (or starts reading `optimizer.ai_decisions`) should fail here rather
-    than ship a half-built decision loop."""
-    assert o.SESSION_STATES == ("running", "converged", "budget_exhausted")
-    assert not hasattr(o, "decide_route")
+def test_a_near_tie_pauses_the_session_with_a_well_formed_pending_decision(tmp_path: Path) -> None:
+    """The pause gate: when the cost model cannot separate the top candidates,
+    the chunk stops mid-iteration and hands out a CLOSED, pre-scored option
+    list. Nothing is applied while it is paused."""
+    project = _unrouted_project(tmp_path, destinations=2)
+    _always_pause(project)
+
+    report = _run_to_first_pause(project, seed=7, max_iterations=6)
+
+    assert report["state"] in o.SESSION_STATES
+    assert report["stop_reason"] == "awaiting_decision"
+    assert report["pauses_used"] == 1
+    # nothing was committed BY THE PAUSED ITERATION: the move log and the score
+    # curve still describe only the iterations that completed before it.
+    assert len(report["moves"]) == report["iteration"]
+    assert len(report["score_curve"]) == report["iteration"] + 1
+    assert report["current_score"]["total"] == report["score_curve"][-1]
+
+    pending = report["pending_decision"]
+    assert pending["decision_id"]
+    assert pending["iteration"] == report["iteration"] + 1
+    assert pending["decision_type"] in k.DEFAULT_PCB_SETTINGS["optimizer"]["ai_decisions"]["decision_types"]
+    assert 2 <= len(pending["options"]) <= 4
+    assert pending["default_choice"] == pending["options"][0]["id"]
+    for index, option in enumerate(pending["options"]):
+        assert option["id"] == f"opt{index + 1}"
+        assert option["summary"] and option["type"] in o._MOVE_APPLIERS
+        assert option["score_delta"] == pytest.approx(
+            option["score_total"] - report["current_score"]["total"])
+        assert option["is_default"] is (index == 0)
+        assert Path(option["trial_dir"]).exists(), "a paused option must outlive the chunk"
+    # best-first, and the top two really are within the configured spread.
+    totals = [o_["score_total"] for o_ in pending["options"]]
+    assert totals == sorted(totals)
+    assert totals[1] - totals[0] < pending["min_score_spread"]
+
+
+def test_a_clear_winner_never_pauses_and_matches_the_ai_disabled_run_exactly(tmp_path: Path) -> None:
+    """PARITY - the most important test here. A session that never hits a
+    near-tie must behave exactly like the 7.6 core did.
+
+    Two independent statements of the same thing:
+      1. with `min_score_spread` at 0 (no spread can ever be under it) and with
+         `ai_decisions.enabled: false`, no call ever reports a pause; and
+      2. a run that DOES pause on every iteration but answers every decision
+         with `defer` lands on an identical move sequence and score curve -
+         because `defer` IS the 7.6 rule ("take the best-scored candidate").
+    """
+    disabled = _unrouted_project(tmp_path / "disabled", destinations=2)
+    _set_ai_decisions(disabled, enabled=False)
+    baseline = o.optimize_board(disabled, max_iterations_per_call=2, seed=7, max_iterations=6)
+    baseline = _run_to_completion(disabled, baseline)
+    assert baseline["state"] in ("converged", "budget_exhausted")
+    assert baseline["pauses_used"] == 0
+    assert baseline["pending_decision"] is None
+    assert all(entry["auto"] for entry in baseline["decision_log"])
+    assert all(entry["auto_reason"] == "ai_decisions_disabled"
+               for entry in baseline["decision_log"] if len(entry["options"]) > 1)
+
+    clear = _unrouted_project(tmp_path / "clear", destinations=2)
+    _set_ai_decisions(clear, enabled=True, min_score_spread=0.0)
+    strict = _run_to_completion(clear, o.optimize_board(
+        clear, max_iterations_per_call=2, seed=7, max_iterations=6))
+    assert strict["pauses_used"] == 0
+
+    deferred = _unrouted_project(tmp_path / "deferred", destinations=2)
+    _always_pause(deferred)
+    always = _run_to_completion(deferred, o.optimize_board(
+        deferred, max_iterations_per_call=2, seed=7, max_iterations=6),
+        decider=lambda pending: "defer")
+    assert always["pauses_used"] > 0, "this arm must actually have paused"
+
+    def signature(report):
+        return ([(m["type"], m["summary"], m["accepted"], m["score_after"])
+                 for m in report["moves"]], report["score_curve"], report["state"])
+
+    assert signature(strict) == signature(baseline)
+    assert signature(always) == signature(baseline)
+
+
+def test_scripted_decider_drives_a_paused_session_to_a_terminal_state(tmp_path: Path) -> None:
+    """The harness the plan asks for before a live AI sits in the loop: a canned
+    decider answering every pause, proving the pause/decide/resume cycle closes
+    and the session still reaches a terminal state."""
+    project = _unrouted_project(tmp_path, destinations=2)
+    _always_pause(project)
+
+    answers: list[tuple[str, str]] = []
+
+    def decider(pending: dict) -> str:
+        # deliberately NOT always the default - a decider that only ever defers
+        # would not prove the AI's choice is the one that gets applied.
+        choice = pending["options"][-1]["id"] if len(answers) % 2 else "defer"
+        answers.append((pending["decision_id"], choice))
+        return choice
+
+    report = o.optimize_board(project, max_iterations_per_call=2, seed=19, max_iterations=6)
+    report = _run_to_completion(project, report, decider=decider)
+
+    assert answers, "the harness must actually have been asked something"
+    assert report["state"] in ("converged", "budget_exhausted")
+    assert report["pending_decision"] is None
+    assert report["iteration"] >= 1
+
+    ai_entries = [e for e in report["decision_log"] if not e["auto"]]
+    assert len(ai_entries) == len(answers)
+    for (decision_id, choice), entry in zip(answers, ai_entries):
+        assert entry["decision_id"] == decision_id
+        assert entry["choice"] == choice
+        assert entry["rationale"] == "scripted decider"
+        # `defer` is recorded as asked, and resolved to the default option.
+        assert entry["resolved_choice"] in {opt["id"] for opt in entry["options"]}
+        if choice == "defer":
+            assert entry["resolved_choice"] == "opt1"
+        else:
+            assert entry["resolved_choice"] == choice
+    # the chosen option is the move that actually landed in the move log.
+    for entry in ai_entries:
+        chosen = next(o_ for o_ in entry["options"] if o_["id"] == entry["resolved_choice"])
+        move = next(m for m in report["moves"] if m["iteration"] == entry["iteration"])
+        assert move["summary"] == chosen["summary"] and move["type"] == chosen["type"]
+
+
+def test_an_undecided_session_times_out_to_defer_on_the_next_resume(tmp_path: Path) -> None:
+    """An abandoned pause must not wedge the session: resuming without answering
+    takes the optimizer's own best-scored option and carries on."""
+    project = _unrouted_project(tmp_path, destinations=2)
+    _always_pause(project)
+
+    paused = _run_to_first_pause(project, seed=7, max_iterations=6)
+    pending = paused["pending_decision"]
+
+    resumed = o.optimize_board(project, session_id=paused["session_id"], max_iterations_per_call=1)
+    assert resumed["state"] != "awaiting_decision" or \
+        resumed["pending_decision"]["decision_id"] != pending["decision_id"]
+    assert resumed["iteration"] >= pending["iteration"]
+
+    entry = next(e for e in resumed["decision_log"] if e["decision_id"] == pending["decision_id"])
+    assert entry["auto"] is True
+    assert entry["choice"] == "defer"
+    assert entry["auto_reason"] == "resume_without_decision"
+    assert entry["resolved_choice"] == pending["default_choice"]
+    assert any("resumed without an answer" in note for note in resumed["notes"])
+
+    # and an abandoned session still converges rather than looping on pauses.
+    final = _run_to_completion(project, resumed)
+    assert final["state"] in ("converged", "budget_exhausted")
+
+
+def test_max_pauses_per_run_caps_the_escalation_budget(tmp_path: Path) -> None:
+    """After the cap, further near-ties auto-decide instead of pausing again -
+    the run finishes even if the AI stops answering."""
+    project = _unrouted_project(tmp_path, destinations=2)
+    _always_pause(project, max_pauses_per_run=1)
+
+    report = o.optimize_board(project, max_iterations_per_call=2, seed=7, max_iterations=6)
+    assert report["state"] == "awaiting_decision"
+    report = _run_to_completion(project, report, decider=lambda pending: "defer")
+
+    assert report["state"] in ("converged", "budget_exhausted")
+    assert report["pauses_used"] == 1
+    capped = [e for e in report["decision_log"] if e["auto_reason"] == "max_pauses_per_run"]
+    assert capped, "iterations after the cap must record WHY they were not escalated"
+    assert all(e["auto"] and e["choice"] == e["options"][0]["id"] for e in capped)
+
+
+def test_decision_log_records_auto_and_ai_decisions_and_is_inspectable(tmp_path: Path) -> None:
+    """Auditability: every committed move appends one fully self-contained log
+    entry, and the log is readable through the read-only session report."""
+    project = _unrouted_project(tmp_path, destinations=2)
+    _always_pause(project, max_pauses_per_run=1)
+
+    report = o.optimize_board(project, max_iterations_per_call=2, seed=23, max_iterations=6)
+    report = _run_to_completion(project, report,
+                                decider=lambda pending: pending["options"][-1]["id"])
+
+    log = report["decision_log"]
+    assert log, "a run that moved must have logged its decisions"
+    # one entry per committed move (the "no applicable candidate" iteration
+    # commits nothing, so it is a move without a decision).
+    assert len(log) == len([m for m in report["moves"] if m["type"] is not None])
+    assert any(e["auto"] for e in log) and any(not e["auto"] for e in log)
+    for entry in log:
+        assert entry["decision_id"] and entry["iteration"] >= 1
+        assert entry["decision_type"] in \
+            k.DEFAULT_PCB_SETTINGS["optimizer"]["ai_decisions"]["decision_types"]
+        assert entry["options"] and entry["scores"]
+        assert set(entry["scores"]) == {opt["id"] for opt in entry["options"]}
+        assert entry["choice"] and entry["resolved_choice"]
+        assert isinstance(entry["auto"], bool)
+        assert "rationale" in entry and "accepted" in entry
+        assert entry["score_after"] - entry["score_before"] == pytest.approx(entry["delta"])
+
+    reported = o.get_route_session(project, session_id=report["session_id"])
+    assert reported["decision_log"] == log
+    assert reported["pauses_used"] == report["pauses_used"]
+
+    # and it survives the process: the log is checkpointed, not in-memory state.
+    on_disk = json.loads((Path(project) / "spibus.board_local.json").read_text(encoding="utf-8"))
+    assert on_disk["optimizer_sessions"][report["session_id"]]["decision_log"] == log
+
+
+def test_decide_route_refuses_a_stale_decision_or_an_unpaused_session(tmp_path: Path) -> None:
+    project = _unrouted_project(tmp_path, destinations=2)
+    _always_pause(project)
+    paused = _run_to_first_pause(project, seed=7, max_iterations=6)
+    pending = paused["pending_decision"]
+
+    with pytest.raises(ValueError):
+        o.decide_route(project, paused["session_id"], "not-this-decision", "defer")
+    with pytest.raises(ValueError):
+        o.decide_route(project, paused["session_id"], pending["decision_id"], "opt99")
+    with pytest.raises(KeyError):
+        o.decide_route(project, "no-such-session", pending["decision_id"], "defer")
+
+    # a refused answer must leave the pause exactly as it was.
+    assert o.get_route_session(project)["pending_decision"]["decision_id"] == pending["decision_id"]
+
+    o.decide_route(project, paused["session_id"], pending["decision_id"], "defer")
+    with pytest.raises(ValueError):
+        o.decide_route(project, paused["session_id"], pending["decision_id"], "defer")
+
+
+def test_decide_route_does_not_itself_advance_the_session(tmp_path: Path) -> None:
+    """Separation of concerns: answering resolves the pause and applies the
+    chosen move, and stops. Generating the NEXT decision is the caller's next
+    `optimize_kicad_board` call."""
+    project = _unrouted_project(tmp_path, destinations=2)
+    _always_pause(project)
+    paused = _run_to_first_pause(project, seed=7, max_iterations=6)
+    pending = paused["pending_decision"]
+
+    answered = o.decide_route(project, paused["session_id"], pending["decision_id"],
+                              "defer", rationale="keep the jumper layer free")
+
+    assert answered["command"] == "decide_route"
+    # `converged` is legitimate here (the committed move may itself be the one
+    # that stops buying convergence_delta) - what must NOT happen is a second
+    # iteration or a second pending decision.
+    assert answered["state"] in ("running", "converged")
+    assert answered["pending_decision"] is None
+    assert answered["iteration"] == pending["iteration"], \
+        "exactly the paused iteration, and no more"
+    assert len(answered["moves"]) == pending["iteration"]
+    assert answered["decision"]["rationale"] == "keep the jumper layer free"
+    assert o.get_route_session(project)["iteration"] == pending["iteration"]
+
+
+def test_the_real_board_is_untouched_across_a_whole_decided_run(tmp_path: Path) -> None:
+    """The 7.6 dry-run guarantee is not weakened by the decision loop: pausing,
+    parking options and resolving them all happen on scratch copies."""
+    project = _unrouted_project(tmp_path, destinations=2)
+    _always_pause(project)
+    board_path, _, _ = k._resolve_project_path(project)
+    before_bytes = board_path.read_bytes()
+
+    report = o.optimize_board(project, max_iterations_per_call=2, seed=7, max_iterations=6)
+    report = _run_to_completion(project, report, decider=lambda pending: "defer")
+
+    assert board_path.read_bytes() == before_bytes
+    assert report["written"] is False
+
+
+def test_ai_decisions_settings_block_is_read_not_invented(tmp_path: Path) -> None:
+    """The 6.1 schema owns these key names; the optimizer must consume them
+    rather than define its own."""
+    defaults = k.DEFAULT_PCB_SETTINGS["optimizer"]["ai_decisions"]
+    assert set(o._ai_decision_config({})) == set(defaults)
+    assert o._ai_decision_config({}) == {
+        "enabled": defaults["enabled"],
+        "min_score_spread": float(defaults["min_score_spread"]),
+        "max_pauses_per_run": int(defaults["max_pauses_per_run"]),
+        "decision_types": list(defaults["decision_types"]),
+    }
+    # every move type escalates as one of the six documented decision types.
+    assert set(o._MOVE_DECISION_TYPES) == set(o._MOVE_APPLIERS)
+    assert set(o._MOVE_DECISION_TYPES.values()) <= set(defaults["decision_types"])
 
     project = _unrouted_project(tmp_path)
-    report = o.optimize_board(project, max_iterations_per_call=1, seed=2)
-    assert report["state"] in o.SESSION_STATES
-    assert "pending_decision" not in report
-    assert any("7.7" in note for note in report["notes"])
-
-    # the settings block still EXISTS (it is part of the 6.1 schema) - this
-    # phase simply never consults it.
-    assert "ai_decisions" in k.DEFAULT_PCB_SETTINGS["optimizer"]
-    source = Path(o.__file__).read_text(encoding="utf-8")
-    assert 'ai_decisions"]' not in source and "get(\"ai_decisions\"" not in source
+    _set_ai_decisions(project, min_score_spread=1.25, max_pauses_per_run=3)
+    report = o.optimize_board(project, max_iterations_per_call=1, seed=2, max_iterations=1)
+    assert report["ai_decisions"]["min_score_spread"] == 1.25
+    assert report["ai_decisions"]["max_pauses_per_run"] == 3
