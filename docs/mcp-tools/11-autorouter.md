@@ -853,6 +853,241 @@ for a fresh `tempfile.mkdtemp()`)
 }
 ```
 
+## `optimize_kicad_board`
+
+**Phase 7.6 — Iterative Whole-Board Optimization**
+
+Optimize the routed board by minimizing a single composite score:
+
+    S = SUM net trace costs (from `get_kicad_trace_cost` board total, including 7.2 layer-purpose
+                             penalties and Phase 5 deviation terms)
+      + SUM plane island costs (from `audit_kicad_plane_islands` summary)
+      + optimizer.unrouted_penalty × unrouted-connection count (from `get_kicad_ratsnest`)
+
+Every cost contributor is defined in `pcb_settings.json`, so "best" means exactly what that JSON
+declares. The optimizer is a thin orchestrator over existing tools (`route_kicad_nets`,
+`unroute_kicad_nets`, `propose_kicad_plane`, `create_kicad_plane`, `modify_kicad_plane`,
+`get_kicad_ratsnest`, `get_kicad_trace_cost`, `audit_kicad_plane_islands`) and duplicates no
+routing, scoring, or write logic.
+
+**Sessions & Resumability:**
+One MCP call runs a BOUNDED chunk (`max_iterations_per_call` iterations or `max_seconds` of wall
+clock, whichever binds first) and returns `{session_id, state, score_curve, moves, ...}` with
+`state` in `running | converged | budget_exhausted`. Pass `session_id` back to resume exactly
+where it stopped (RNG state and all loop state checkpoint to the board-local JSON, so a session
+survives an MCP restart and is inspectable via `get_kicad_route_session`).
+
+**Six Move Types:**
+Each iteration ranks nets by cost contribution (routed nets at their trace cost; unrouted nets at
+penalty), takes `optimizer.worst_k` worst contributors, and generates up to six candidate moves:
+1. **Rip-up+reroute** — Delete and re-emit a net's copper in a perturbed order.
+2. **Bundle reroute** — Re-emit a whole bus bundle on its Phase 5 corridor (if available).
+3. **Layer swap** — Move a net to a different layer (layer-purpose driven).
+4. **Add stitching via** — Place a via to connect a plane island to the mainland.
+5. **Create plane** — Add a new copper-pour zone for a power net if its cost is lower than routed copper.
+6. **Modify plane** — Resize/reprioritize an existing autorouter-created zone.
+
+Every candidate is scored on its own private copy of the board; acceptance follows
+`optimizer.accept` policy: `greedy` (strict improvements only) or `sa` (simulated annealing, worse
+moves accepted with probability exp(−ΔS/T), T *= `sa_cooling` each iteration). A `seed` makes
+runs fully reproducible.
+
+**Write Behavior:**
+- **`write=false`** (default) — NEVER touches the real board on any call. ALL iteration happens on
+  a private scratch copy of the project (`<project>.board_local.json` checkpoint survives MCP restart).
+- **`write=true`** — Applies the session's FINAL accepted state (copper, vias, and zones together, as one consistent snapshot) onto the real board and records all ownership in `autorouter_owned`. **REFUSES** if the session is still `running` (no final state yet) or if the real board changed since the session started. `unroute_kicad_nets` still undoes all of it. Refill zones (Fill All Zones) and re-run DRC in KiCad after `write=true`.
+
+**Safety:**
+Human-routed copper and the six hand-made board zones (`mainGnd`, `safty_gnd`, `antenna`,
+`main3.3`, `main12v`, `3.3v_safty`) are read-only inputs throughout — the moves reuse
+`unroute_kicad_nets`/`modify_kicad_plane`, whose ownership guards (recording in `autorouter_owned`)
+prevent mutation of non-autorouter copper/zones. The optimizer never bypasses these.
+
+**Known Limitation:**
+Phase 7.7 (AI-in-the-loop decision pause for near-tied candidate moves) is NOT implemented — there
+is no `awaiting_decision` state and `optimizer.ai_decisions` is never read. Where 7.7 would pause,
+this optimizer simply takes the best-scored candidate.
+
+**Args:** `project_path`, `session_id` (optional; omit to start a new session), `max_iterations_per_call`
+(default 3), `max_seconds` (optional; omit for iterations-only bounding), `seed` (optional; overrides
+`optimizer.seed`), `accept` (optional; "greedy" or "sa"; overrides `optimizer.accept`), `max_iterations`
+(optional; total SESSION budget; defaults to `optimizer.max_iterations`), `time_budget_s` (optional;
+total SESSION time budget; defaults to `optimizer.time_budget_s`), `write` (default false), `allow_while_open`
+(default false)
+
+**Example output (excerpt):**
+```json
+{
+  "command": "optimize_board",
+  "board_path": "path/to/kiln.kicad_pcb",
+  "write": false,
+  "written": false,
+  "session_id": "d9c4e1f5-7a8b-4c3d-9e2f-1a6b5c8d3e9f",
+  "state": "running",
+  "iteration": 12,
+  "max_iterations": 50,
+  "elapsed_s": 3.847,
+  "time_budget_s": 60.0,
+  "seed": 42,
+  "accept": "sa",
+  "temperature": 0.082543,
+  "initial_score": {
+    "total": 2580.5,
+    "trace_cost": 2450.75,
+    "plane_island_cost": 129.75,
+    "unrouted_penalty": 0.0
+  },
+  "current_score": {
+    "total": 2510.3,
+    "trace_cost": 2410.5,
+    "plane_island_cost": 99.8,
+    "unrouted_penalty": 0.0
+  },
+  "best_score": {
+    "total": 2510.3,
+    "trace_cost": 2410.5,
+    "plane_island_cost": 99.8,
+    "unrouted_penalty": 0.0
+  },
+  "score_curve": [2580.5, 2575.2, 2570.1, 2560.8, 2550.3, 2545.1, 2540.2, 2530.5, 2525.3, 2520.1, 2515.8, 2510.3],
+  "moves": [
+    {
+      "iteration": 1,
+      "type": "rip_up_reroute",
+      "accepted": true,
+      "net": "/MainControler/CLK",
+      "score_before": 2580.5,
+      "score_after": 2575.2,
+      "score_delta": -5.3,
+      "reason": "improvement"
+    },
+    {
+      "iteration": 2,
+      "type": "layer_swap",
+      "accepted": false,
+      "net": "/Power/VBUS",
+      "score_before": 2575.2,
+      "score_after": 2578.1,
+      "score_delta": 2.9,
+      "reason": "rejected by greedy/sa policy"
+    }
+  ],
+  "moves_accepted": 8,
+  "moves_rejected": 4,
+  "scratch_dir": "C:\\Temp\\kiln_scratch_d9c4e1f5",
+  "score_delta": -70.2,
+  "diff": {
+    "segments_added": 12,
+    "segments_removed": 18,
+    "vias_added": 3,
+    "vias_removed": 5,
+    "zones_added": 1,
+    "zones_modified": 2
+  },
+  "notes": [
+    "Phase 7.7 (AI-in-the-loop decisions) is not implemented: this session state machine has three states and never reads optimizer.ai_decisions."
+  ]
+}
+```
+
+## `get_kicad_route_session`
+
+**Phase 7.6 — READ-ONLY Session Status Reporter**
+
+Inspect the state of an `optimize_kicad_board` session without advancing it by a single iteration.
+Returns the session's state (`running | converged | budget_exhausted`), iteration count vs. budget,
+elapsed time, seed, acceptance policy, simulated-annealing temperature, initial/current/best scores,
+the per-iteration score curve, the full move log (what move type was tried, whether it was accepted,
+and why), and the scratch board path.
+
+**Read-only; omit `session_id` to report the board's most recently touched session.** Returns
+`{"found": false, ...}` rather than raising when there is nothing to report, so a caller can poll
+a board that has never been optimized.
+
+**Args:** `project_path`, `session_id` (optional; omit for the most recently touched session)
+
+**Example output (excerpt):**
+```json
+{
+  "command": "get_route_session",
+  "found": true,
+  "session_id": "d9c4e1f5-7a8b-4c3d-9e2f-1a6b5c8d3e9f",
+  "state": "converged",
+  "iteration": 27,
+  "max_iterations": 50,
+  "elapsed_s": 8.523,
+  "time_budget_s": 60.0,
+  "seed": 42,
+  "accept": "sa",
+  "temperature": 0.001234,
+  "initial_score": {
+    "total": 2580.5,
+    "trace_cost": 2450.75,
+    "plane_island_cost": 129.75,
+    "unrouted_penalty": 0.0
+  },
+  "current_score": {
+    "total": 2502.1,
+    "trace_cost": 2410.2,
+    "plane_island_cost": 91.9,
+    "unrouted_penalty": 0.0
+  },
+  "best_score": {
+    "total": 2502.1,
+    "trace_cost": 2410.2,
+    "plane_island_cost": 91.9,
+    "unrouted_penalty": 0.0
+  },
+  "score_curve": [2580.5, 2575.2, 2570.1, 2560.8, 2550.3, 2545.1, 2540.2, 2530.5, 2525.3, 2520.1, 2515.8, 2510.3, 2505.7, 2503.2, 2502.1, 2502.1, 2502.1, 2502.1, 2502.1, 2502.1, 2502.1, 2502.1, 2502.1, 2502.1, 2502.1, 2502.1, 2502.1],
+  "moves": [
+    {
+      "iteration": 1,
+      "type": "rip_up_reroute",
+      "accepted": true,
+      "net": "/MainControler/CLK",
+      "score_before": 2580.5,
+      "score_after": 2575.2,
+      "score_delta": -5.3,
+      "reason": "improvement"
+    },
+    {
+      "iteration": 2,
+      "type": "layer_swap",
+      "accepted": false,
+      "net": "/Power/VBUS",
+      "score_before": 2575.2,
+      "score_after": 2578.1,
+      "score_delta": 2.9,
+      "reason": "rejected by sa policy (prob 0.04)"
+    },
+    {
+      "iteration": 14,
+      "type": "create_plane",
+      "accepted": true,
+      "net": "/Power/GND_Main",
+      "score_before": 2510.3,
+      "score_after": 2505.7,
+      "score_delta": -4.6,
+      "reason": "improvement"
+    }
+  ],
+  "moves_accepted": 18,
+  "moves_rejected": 9,
+  "scratch_dir": "C:\\Temp\\kiln_scratch_d9c4e1f5",
+  "known_sessions": ["d9c4e1f5-7a8b-4c3d-9e2f-1a6b5c8d3e9f", "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d"]
+}
+```
+
+**Example output (no session yet):**
+```json
+{
+  "command": "get_route_session",
+  "found": false,
+  "session_id": null,
+  "known_sessions": []
+}
+```
+
 ---
 
 ## Autorouter Architecture & Cost Model
