@@ -836,6 +836,72 @@ def _estimate_layer_components(
     return comps
 
 
+def _plane_fill_index_with_estimated(
+    board_path: Path, grid_mm: float, clearance_mm: float,
+) -> dict[str, list[dict[str, Any]]]:
+    """Extends `_zone_fill_index_cached` (KiCad `filled_polygon` blocks only)
+    with the Phase 7.5.2 "estimated" fallback for zone/layer pairs that have
+    not been filled in KiCad yet, so plane-aware routing (7.5.4) can use an
+    unfilled-but-still-poured net as a routable plane too - previously a
+    documented residual ("only KiCad-filled zones feed the plane model").
+    Reuses the exact rasterize/subtract-foreign-copper/flood-fill estimation
+    `audit_plane_islands` already performs (`_estimate_layer_components`), so
+    the two stay consistent with each other.
+
+    Same return shape as `_zone_fill_index_cached`
+    (`{net: [{layer, pts, uuid, name, raster}]}`), plus every entry (kicad AND
+    estimated) now also carries `area_mm2` and `fill_source` - `area_mm2` so
+    callers never need to fall back to `_polygon_area_mm2(pts)` when `pts` is
+    `None` (an estimated component has no polygon, only a raster)."""
+    zones = _parse_zones_cached(board_path)
+    kicad_fills = _zone_fill_index_cached(board_path)
+    footprints = _pcb._parse_footprint_pads_cached(board_path)
+    tracks = _pcb._parse_tracks_cached(board_path)
+    layers_info = _pcb._parse_board_layers_cached(board_path)
+    all_cu = [lyr["name"] for lyr in layers_info] or ["F.Cu", "B.Cu"]
+    stack_order = {name: i for i, name in enumerate(all_cu)}
+
+    kicad_by_zone_layer: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    fills: dict[str, list[dict[str, Any]]] = {}
+    for net_name, entries in kicad_fills.items():
+        for e in entries:
+            kicad_by_zone_layer.setdefault((e["uuid"], e["layer"]), []).append(e)
+            out = dict(e)
+            out["area_mm2"] = _polygon_area_mm2(e["pts"])
+            out["fill_source"] = "kicad"
+            fills.setdefault(net_name, []).append(out)
+
+    for zone in zones:
+        net = zone.get("net", "")
+        if not net:
+            continue
+        for layer in [l for l in zone.get("layers", []) if l.endswith(".Cu")]:
+            if kicad_by_zone_layer.get((zone["uuid"], layer)):
+                continue  # already covered by the kicad-authoritative branch above
+            higher_polys = [
+                z2["polygon"] for z2 in zones
+                if z2 is not zone
+                and layer in z2.get("layers", [])
+                and z2.get("priority", 0) > zone.get("priority", 0)
+                and len(z2.get("polygon", []) or []) >= 3
+            ]
+            foreign_items = _foreign_copper_items(
+                layer, net, footprints, tracks, stack_order, all_cu, clearance_mm,
+            )
+            comps = _estimate_layer_components(zone, layer, higher_polys, foreign_items, grid_mm)
+            for comp in comps:
+                fills.setdefault(net, []).append({
+                    "layer": layer,
+                    "pts": comp["pts"],
+                    "uuid": zone.get("uuid", ""),
+                    "name": zone.get("name", ""),
+                    "raster": comp["raster"],
+                    "area_mm2": comp["area_mm2"],
+                    "fill_source": "estimated",
+                })
+    return fills
+
+
 def _component_attachments(
     comp: dict[str, Any],
     layer: str,
@@ -1088,6 +1154,490 @@ def audit_plane_islands(project_path: str | Path) -> dict[str, Any]:
     board_path, _, _ = _pcb._resolve_project_path(project_path)
     settings = _pcb.load_pcb_settings(project_path)["config"]
     return _zone_island_model(board_path, settings)
+
+
+# =========================================================================== #
+# Phase 7.5.5 - Creating and moving planes (the plane WRITERS)
+#
+# Same dry-run/write/lock discipline as every other writer (create_netclass,
+# create_group, route_nets): zone outlines are uuid-anchored s-expr surgery,
+# same as delete_group/_delete_blocks_by_uuid. `propose_plane` is read-only
+# (never writes, no ownership restriction - it's a suggestion for a human to
+# review, even against a hand-made zone/net); `create_plane`/`modify_plane`
+# write, and `modify_plane` refuses on any zone uuid not recorded in
+# board-local `autorouter_owned.zones` - i.e. it may only move/resize a zone
+# THIS tool created, never one of the six hand-made kiln zones (mainGnd,
+# safty_gnd, antenna, main3.3, main12v, 3.3v_safty), which can only ever be
+# *proposed* for change.
+# =========================================================================== #
+
+def _zone_template_shape(zones: list[dict[str, Any]]) -> dict[str, Any]:
+    """Pick a representative net-owning (non-keepout) board zone's
+    fill-setting SHAPE - hatch, connect_pads clearance, min_thickness, fill
+    block (thermal_gap, thermal_bridge_width, smoothing, radius,
+    island_removal_mode) - to copy onto a newly created zone so it looks
+    native, the same "copy an existing definition's shape" idea
+    `create_netclass` uses for the Default netclass. Falls back to sane
+    KiCad-typical defaults only if the board has no net-owning zone at all."""
+    template = next((z for z in zones if z.get("net") and not z.get("keepout")), None)
+    if template is None:
+        return {
+            "hatch": {"style": "edge", "pitch": 0.5},
+            "connect_pads": {"mode": None, "clearance": 0.2},
+            "min_thickness": 0.2,
+            "fill": {
+                "enabled": True, "thermal_gap": 0.5, "thermal_bridge_width": 0.5,
+                "smoothing": "fillet", "radius": 0.1, "island_removal_mode": 0,
+            },
+        }
+    return {
+        "hatch": template.get("hatch") or {"style": "edge", "pitch": 0.5},
+        "connect_pads": template.get("connect_pads") or {"mode": None, "clearance": 0.2},
+        "min_thickness": (
+            template["min_thickness"] if template.get("min_thickness") is not None else 0.2
+        ),
+        "fill": dict(template.get("fill") or {"enabled": True, "island_removal_mode": 0}),
+    }
+
+
+def _zone_block(
+    net: str, layer: str, name: str, uid: str,
+    outline: list[tuple[float, float]], shape: dict[str, Any], priority: int = 0,
+) -> str:
+    """Serialize one board-level `(zone ...)` text block in the exact shape
+    KiCad itself writes (1-tab top-level indent, 2-tab children - matching
+    `_segment_block`/`_via_block`/`create_group`'s `(group ...)` block), from
+    a candidate outline plus a fill-setting SHAPE copied from an existing
+    zone (`_zone_template_shape`)."""
+    hatch = shape.get("hatch") or {"style": "edge", "pitch": 0.5}
+    cp = shape.get("connect_pads") or {}
+    clearance = cp.get("clearance")
+    if clearance is None:
+        clearance = 0.2
+    min_thickness = shape.get("min_thickness")
+    if min_thickness is None:
+        min_thickness = 0.2
+    fill = shape.get("fill") or {}
+
+    lines = ['\t(zone', f'\t\t(net "{net}")', f'\t\t(layers "{layer}")',
+              f'\t\t(uuid "{uid}")', f'\t\t(name "{name}")']
+    if priority:
+        lines.append(f'\t\t(priority {int(priority)})')
+    lines.append(f'\t\t(hatch {hatch.get("style", "edge")} {_fmt(hatch.get("pitch", 0.5) or 0.5)})')
+    mode = cp.get("mode")
+    lines.append(f'\t\t(connect_pads {mode}' if mode else '\t\t(connect_pads')
+    lines.append(f'\t\t\t(clearance {_fmt(clearance)})')
+    lines.append('\t\t)')
+    lines.append(f'\t\t(min_thickness {_fmt(min_thickness)})')
+    lines.append(f'\t\t(fill {"yes" if fill.get("enabled", True) else "no"}')
+    if fill.get("thermal_gap") is not None:
+        lines.append(f'\t\t\t(thermal_gap {_fmt(fill["thermal_gap"])})')
+    if fill.get("thermal_bridge_width") is not None:
+        lines.append(f'\t\t\t(thermal_bridge_width {_fmt(fill["thermal_bridge_width"])})')
+    if fill.get("smoothing"):
+        lines.append(f'\t\t\t(smoothing {fill["smoothing"]})')
+    if fill.get("radius") is not None:
+        lines.append(f'\t\t\t(radius {_fmt(fill["radius"])})')
+    irm = fill.get("island_removal_mode", 0)
+    lines.append(f'\t\t\t(island_removal_mode {int(irm) if irm is not None else 0})')
+    lines.append('\t\t)')
+    lines.append('\t\t(polygon')
+    lines.append('\t\t\t(pts')
+    pts_str = " ".join(f'(xy {_fmt(x)} {_fmt(y)})' for x, y in outline)
+    lines.append(f'\t\t\t\t{pts_str}')
+    lines.append('\t\t\t)')
+    lines.append('\t\t)')
+    lines.append('\t)')
+    return "\n".join(lines)
+
+
+def propose_plane(
+    project_path: str | Path, net: str, layer: str | None = None,
+) -> dict[str, Any]:
+    """Phase 7.5.5 - propose a candidate copper-pour plane for `net` on
+    `layer` (MCP tool `propose_kicad_plane`). READ-ONLY: never writes,
+    has no ownership restriction (unlike `create_plane`/`modify_plane`) -
+    the result is a suggestion for a human to review, even against a net
+    that already owns one of the six hand-made zones.
+
+    Candidate outline: a grid-based coverage region of the net's own pads
+    and vias on `layer` - the rectilinear hull (here: their bounding box,
+    inflated by each pad/via's own reach plus a fixed margin, "simplified"
+    per the spec) clipped to the board's Edge.Cuts extents. `layer` may be
+    omitted: it is then auto-picked from the board's copper layers,
+    preferring a layer whose `layer_purpose` TYPE matches the net's OWN
+    kind (7.2 - a power net prefers a `power`-type layer, a signal net a
+    `signal`-type one), tie-broken by stack order.
+
+    The outline is then run through the exact 7.5.2 estimation pipeline
+    `audit_plane_islands` uses (`_estimate_layer_components`, minus any
+    HIGHER-priority zone already on `layer` and minus clearance-inflated
+    foreign (other-net) copper) to report `components` (mainland/island/
+    orphan, same 7.5.3 costing) and an `estimate` block, plus a **cost
+    delta** vs the net's CURRENT routed trace cost (`get_trace_cost`; 0.0
+    if the net has no routed copper yet): `projected_plane_cost` (the
+    optimizer's flat `create_plane` cost plus the projected ongoing island
+    cost) minus `current_routing_cost`. This is a simplified ESTIMATE, not
+    a re-route simulation - it does not model what a signal net's cost
+    would become if left as ordinary copper after the plane existed;
+    negative `cost_delta` means the plane looks cheaper than the net's
+    current copper.
+
+    Raises if `net` has no pads/vias at all on the resolved layer, or if
+    the computed outline collapses to zero area after clipping to the
+    board outline.
+    """
+    board_path, _, _ = _pcb._resolve_project_path(project_path)
+    settings = _pcb.load_pcb_settings(project_path)["config"]
+    layer_purpose = settings.get("layer_purpose", {})
+    power_patterns = layer_purpose.get("power_net_patterns", [])
+    plane_cfg = settings.get("plane", {}) or {}
+    autor = settings.get("autorouter", {}) or {}
+    grid_mm = float(autor.get("grid_mm", 0.2)) or 0.2
+    clearance_mm = float(autor.get("clearance_fallback_mm", 0.2))
+    margin_mm = float(plane_cfg.get("propose_outline_margin_mm", 1.0))
+
+    footprints = _pcb._parse_footprint_pads_cached(board_path)
+    tracks = _pcb._parse_tracks_cached(board_path)
+    layers_info = _pcb._parse_board_layers_cached(board_path)
+    all_cu = [l["name"] for l in layers_info] or ["F.Cu", "B.Cu"]
+    stack_order = {name: i for i, name in enumerate(all_cu)}
+    pads_by_net = _group_pads_by_net(footprints)
+
+    net_kind = _pcb._net_kind(net, None, power_patterns)
+
+    if layer is None:
+        layer_types = {l["name"]: l["type"] for l in layers_info}
+        preferred_type = "power" if net_kind == "power" else "signal"
+        candidates = [l for l in all_cu if l.endswith(".Cu")]
+        if not candidates:
+            raise ValueError("Board has no copper layers to propose a plane on")
+        candidates.sort(key=lambda name: (0 if layer_types.get(name) == preferred_type else 1,
+                                          stack_order.get(name, 0)))
+        layer = candidates[0]
+    elif layer not in all_cu:
+        raise ValueError(f"Layer {layer!r} not found on board (copper layers: {all_cu})")
+
+    points: list[tuple[float, float, float]] = []
+    for pad in pads_by_net.get(net, []):
+        if layer not in _pad_layer_set(pad, all_cu):
+            continue
+        pos = pad["position"]
+        points.append((pos["x"], pos["y"], _pad_reach(pad)))
+    for via in tracks.get("vias", []):
+        if via.get("net") != net:
+            continue
+        if layer not in _via_layer_set(via, stack_order, all_cu):
+            continue
+        at = via["at"]
+        points.append((at["x"], at["y"], float(via.get("size", 0.6)) / 2.0))
+    if not points:
+        raise ValueError(
+            f"Net {net!r} has no pads or vias on layer {layer!r} to build a plane "
+            "coverage region from"
+        )
+
+    minx = min(p[0] - p[2] for p in points) - margin_mm
+    maxx = max(p[0] + p[2] for p in points) + margin_mm
+    miny = min(p[1] - p[2] for p in points) - margin_mm
+    maxy = max(p[1] + p[2] for p in points) + margin_mm
+
+    bbminx, bbminy, bbmaxx, bbmaxy = _board_bbox(board_path)
+    minx, miny = max(minx, bbminx), max(miny, bbminy)
+    maxx, maxy = min(maxx, bbmaxx), min(maxy, bbmaxy)
+    if minx >= maxx or miny >= maxy:
+        raise ValueError(
+            "Computed plane outline collapsed to zero area after clipping to the "
+            "board's Edge.Cuts extents"
+        )
+
+    outline = [(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)]
+
+    zones = _parse_zones_cached(board_path)
+    higher_polys = [
+        z["polygon"] for z in zones
+        if layer in z.get("layers", [])
+        and z.get("priority", 0) > 0
+        and len(z.get("polygon") or []) >= 3
+    ]
+    foreign_items = _foreign_copper_items(layer, net, footprints, tracks, stack_order, all_cu, clearance_mm)
+    comps = _estimate_layer_components({"polygon": outline}, layer, higher_polys, foreign_items, grid_mm)
+
+    island_base = float(plane_cfg.get("island_base", 40.0))
+    orphan_island = float(plane_cfg.get("orphan_island", 1000.0))
+
+    comp_records = []
+    for comp in comps:
+        attachments = _component_attachments(comp, layer, net, pads_by_net, tracks, stack_order, all_cu)
+        comp_records.append({
+            "comp": comp, "attachments": attachments,
+            "attachment_count": len(attachments), "area_mm2": comp["area_mm2"],
+        })
+    comp_records.sort(key=lambda r: (-r["attachment_count"], -r["area_mm2"]))
+
+    out_components: list[dict[str, Any]] = []
+    total_island_cost = 0.0
+    island_count = 0
+    orphan_count = 0
+    for idx, rec in enumerate(comp_records):
+        n = rec["attachment_count"]
+        if idx == 0:
+            role, cost = "mainland", 0.0
+        elif n == 0:
+            role, cost = "orphan", orphan_island
+            orphan_count += 1
+        else:
+            role, cost = "island", island_base / n
+            island_count += 1
+        if idx != 0:
+            total_island_cost += cost
+        out_components.append({
+            "role": role, "attachment_count": n, "attachments": rec["attachments"],
+            "area_mm2": round(rec["area_mm2"], 4), "cost": round(cost, 4),
+        })
+
+    create_plane_cost = float(settings.get("optimizer", {}).get("create_plane", 15.0))
+    projected_plane_cost = round(create_plane_cost + total_island_cost, 4)
+
+    try:
+        current = _pcb.get_trace_cost(project_path, net=net)
+        current_total = float(current["cost"]["total"])
+    except KeyError:
+        current_total = 0.0
+
+    return {
+        "board_path": str(board_path),
+        "net": net,
+        "net_kind": net_kind,
+        "layer": layer,
+        "outline": [{"x": round(x, 4), "y": round(y, 4)} for x, y in outline],
+        "outline_area_mm2": round(_polygon_area_mm2(outline), 4),
+        "component_count": len(out_components),
+        "components": out_components,
+        "estimate": {
+            "island_count": island_count,
+            "orphan_count": orphan_count,
+            "total_island_cost": round(total_island_cost, 4),
+            "create_plane_cost": create_plane_cost,
+            "projected_plane_cost": projected_plane_cost,
+        },
+        "current_routing_cost": round(current_total, 4),
+        "cost_delta": round(projected_plane_cost - current_total, 4),
+        "note": (
+            "cost_delta = (create_plane one-time cost + projected ongoing island "
+            "cost) minus the net's CURRENT routed trace cost (0.0 if unrouted); "
+            "negative means the plane looks cheaper than the net's current copper. "
+            "Simplified estimate, not a re-route simulation."
+        ),
+    }
+
+
+def create_plane(
+    project_path: str | Path,
+    net: str,
+    layer: str | None = None,
+    name: str | None = None,
+    priority: int = 0,
+    write: bool = False,
+    allow_while_open: bool = False,
+) -> dict[str, Any]:
+    """Phase 7.5.5 - create a new copper-pour zone for `net` on `layer` (MCP
+    tool `create_kicad_plane`) from `propose_plane`'s candidate outline,
+    copying the board's existing zone fill-setting SHAPE (hatch,
+    connect_pads clearance, min_thickness, thermal gap, smoothing) via
+    `_zone_template_shape` so the new zone looks native - the same
+    "copy an existing definition's shape" pattern `create_netclass` uses
+    for the Default netclass, applied here to zones.
+
+    Same dry-run/write/lock discipline as every writer in this module:
+    write=False (default) returns the exact `(zone ...)` text block that
+    WOULD be appended, without touching the board. write=True appends it
+    (uuid-anchored top-level block, same `_append_top_level_block` surgery
+    `create_group` uses) and records the new zone's uuid in board-local
+    `autorouter_owned.zones` - the only thing that makes it eligible for a
+    later `modify_plane` call (the six hand-made kiln zones are never in
+    that list, so they can never be auto-mutated).
+
+    IMPORTANT: writing the zone block does not fill it with copper - KiCad
+    only computes `filled_polygon` data on its own next "Fill All Zones" /
+    save-triggered refill. Refill + re-run DRC in KiCad after write=True.
+    """
+    board_path, _, _ = _pcb._resolve_project_path(project_path)
+    proposal = propose_plane(project_path, net, layer)
+    layer = proposal["layer"]
+    outline = [(p["x"], p["y"]) for p in proposal["outline"]]
+
+    zones = _parse_zones_cached(board_path)
+    shape = _zone_template_shape(zones)
+    zone_uuid = str(_uuid.uuid4())
+    zone_name = name or f"autorouter_{net.replace('/', '_')}_{layer}"
+    block = _zone_block(net, layer, zone_name, zone_uuid, outline, shape, priority)
+
+    result: dict[str, Any] = {
+        "board_path": str(board_path),
+        "write": write,
+        "written": False,
+        "net": net,
+        "layer": layer,
+        "name": zone_name,
+        "uuid": zone_uuid,
+        "priority": priority,
+        "outline": proposal["outline"],
+        "proposal": proposal,
+        "block": block,
+        "refill_required_note": (
+            "The zone outline is written but NOT filled - refill zones (Fill All "
+            "Zones) and re-run DRC in KiCad after write=True."
+        ),
+    }
+    if write:
+        _pcb._check_not_locked_by_editor(board_path, allow_while_open)
+        text = _pcb._read_text(board_path)
+        new_text = _pcb._append_top_level_block(text, block)
+        with board_path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(new_text)
+        _pcb._invalidate_board_cache(board_path)
+
+        state = _pcb.load_board_local(project_path)
+        data = state["data"]
+        data.setdefault("version", 1)
+        owned = data.setdefault("autorouter_owned", {})
+        owned.setdefault("zones", [])
+        owned["zones"].append(zone_uuid)
+        _pcb.save_board_local(project_path, data)
+        result["written"] = True
+    return result
+
+
+def modify_plane(
+    project_path: str | Path,
+    uuid: str,
+    new_outline: list[dict[str, float]] | list[tuple[float, float]] | None = None,
+    priority: int | None = None,
+    write: bool = False,
+    allow_while_open: bool = False,
+) -> dict[str, Any]:
+    """Phase 7.5.5 - move/grow/shrink and/or reprioritize an EXISTING zone
+    (MCP tool `modify_kicad_plane`) by replacing its `(polygon (pts ...))`
+    block and/or its `(priority N)` line, via the same uuid-anchored s-expr
+    surgery `delete_group`/`unroute_nets` use (locate the enclosing `(zone
+    ...)` block by its uuid, splice only inside it - never a full
+    re-serialize of the board file).
+
+    REFUSES (raises `ValueError`, never silently proceeds) when `uuid` is
+    not recorded in board-local `autorouter_owned.zones` - this tool may
+    ONLY move/resize a zone `create_plane` itself created, never one of the
+    six hand-made kiln zones (mainGnd, safty_gnd, antenna, main3.3, main12v,
+    3.3v_safty). Those can only be *proposed* for change via `propose_plane`
+    (read-only) for a human to review and apply by hand in KiCad.
+
+    At least one of `new_outline`/`priority` must be given. `new_outline` is
+    a list of `{x, y}` dicts or `(x, y)` tuples with at least 3 points.
+
+    write=False (default) previews the new zone block text without
+    touching the board. write=True applies it and reminds the caller that
+    KiCad must refill zones + re-run DRC afterward - same as `create_plane`.
+    """
+    if new_outline is None and priority is None:
+        raise ValueError("Provide new_outline and/or priority - nothing to modify")
+
+    board_path, _, _ = _pcb._resolve_project_path(project_path)
+    state = _pcb.load_board_local(project_path)
+    data = state["data"]
+    owned_zones = set((data.get("autorouter_owned", {}) or {}).get("zones", []) or [])
+    if uuid not in owned_zones:
+        raise ValueError(
+            f"Zone {uuid!r} is not autorouter-owned (not in board-local "
+            "autorouter_owned.zones) - modify_plane refuses to mutate a hand-made "
+            "zone; use propose_plane to suggest a change for the user to review "
+            "and apply in KiCad instead."
+        )
+
+    zones = _parse_zones_cached(board_path)
+    target = next((z for z in zones if z["uuid"] == uuid), None)
+    if target is None:
+        raise KeyError(f"Zone uuid {uuid!r} not found on the board (board may have changed since last parse)")
+
+    text = _pcb._read_text(board_path)
+    marker = f'(uuid "{uuid}")'
+    uidx = text.find(marker)
+    if uidx == -1:
+        raise ValueError("Zone uuid not found in board file text (board changed since last parse)")
+    zone_start = text.rfind("(zone", 0, uidx)
+    if zone_start == -1:
+        raise ValueError("Could not locate the enclosing (zone ...) block")
+
+    depth = 0
+    zone_end = None
+    for i in range(zone_start, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                zone_end = i + 1
+                break
+    if zone_end is None:
+        raise ValueError("Unbalanced parentheses while locating end of (zone ...) block")
+
+    zone_text = text[zone_start:zone_end]
+    new_zone_text = zone_text
+
+    new_outline_pts: list[tuple[float, float]] | None = None
+    if new_outline is not None:
+        new_outline_pts = [
+            (float(p["x"]), float(p["y"])) if isinstance(p, dict) else (float(p[0]), float(p[1]))
+            for p in new_outline
+        ]
+        if len(new_outline_pts) < 3:
+            raise ValueError("new_outline must have at least 3 points")
+        pts_str = " ".join(f'(xy {_fmt(x)} {_fmt(y)})' for x, y in new_outline_pts)
+        poly_match = re.search(r"\(polygon\s*\(pts\b.*?\)\s*\)", new_zone_text, re.DOTALL)
+        if poly_match is None:
+            raise ValueError("Zone has no (polygon (pts ...)) block to replace")
+        new_poly_block = f'(polygon\n\t\t\t(pts\n\t\t\t\t{pts_str}\n\t\t\t)\n\t\t)'
+        new_zone_text = new_zone_text[: poly_match.start()] + new_poly_block + new_zone_text[poly_match.end():]
+
+    if priority is not None:
+        pr_match = re.search(r"\(priority\s+-?\d+\)", new_zone_text)
+        if pr_match is not None:
+            new_zone_text = (
+                new_zone_text[: pr_match.start()] + f'(priority {int(priority)})' + new_zone_text[pr_match.end():]
+            )
+        else:
+            name_match = re.search(r'\(name "[^"]*"\)\n?', new_zone_text)
+            if name_match is not None:
+                idx = name_match.end()
+                new_zone_text = new_zone_text[:idx] + f'\t\t(priority {int(priority)})\n' + new_zone_text[idx:]
+            else:
+                new_zone_text = new_zone_text.replace(
+                    "(zone", f"(zone\n\t\t(priority {int(priority)})", 1,
+                )
+
+    result: dict[str, Any] = {
+        "board_path": str(board_path),
+        "write": write,
+        "written": False,
+        "uuid": uuid,
+        "net": target.get("net"),
+        "layers": target.get("layers"),
+        "new_outline": [{"x": x, "y": y} for x, y in new_outline_pts] if new_outline_pts else None,
+        "new_priority": priority,
+        "block": new_zone_text,
+        "refill_required_note": (
+            "Zone outline/priority is changed on disk only if write=True - KiCad "
+            "must refill zones (Fill All Zones) and re-run DRC before this is "
+            "reflected in copper."
+        ),
+    }
+    if write:
+        _pcb._check_not_locked_by_editor(board_path, allow_while_open)
+        new_text = text[:zone_start] + new_zone_text + text[zone_end:]
+        with board_path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(new_text)
+        _pcb._invalidate_board_cache(board_path)
+        result["written"] = True
+    return result
 
 
 def _build_net_items(
@@ -4369,7 +4919,8 @@ def _compute_plane_components_for(
                 comp_like, layer, net, plane_pads_by_net, plane_tracks,
                 plane_stack_order, all_cu,
             )
-            recs.append((e, len(attachments), _polygon_area_mm2(e["pts"])))
+            area = e["area_mm2"] if "area_mm2" in e else _polygon_area_mm2(e["pts"])
+            recs.append((e, len(attachments), area))
         recs.sort(key=lambda r: (-r[1], -r[2]))
         comps: list[dict[str, Any]] = []
         for idx, (e, n, _area) in enumerate(recs):
@@ -5032,12 +5583,14 @@ def _worker_init(ctx: dict[str, Any]) -> None:
     ctx = dict(ctx)
     recipe = ctx.pop("_obstacle_recipe", None)
     if "base_obstacles" not in ctx and recipe is not None:
-        board_path_str, routable_set, all_cu, edge_clearance, power_patterns = recipe
+        (board_path_str, routable_set, all_cu, edge_clearance, power_patterns,
+         plane_grid_mm, plane_clearance_mm) = recipe
         board_path = Path(board_path_str)
         ctx["base_obstacles"] = _collect_obstacles(
             board_path, routable_set, all_cu, edge_clearance, power_patterns)
         if "plane_by_net" not in ctx:
-            plane_fill_index = _zone_fill_index_cached(board_path)
+            plane_fill_index = _plane_fill_index_with_estimated(
+                board_path, plane_grid_mm, plane_clearance_mm)
             plane_footprints = _pcb._parse_footprint_pads_cached(board_path)
             plane_tracks = _pcb._parse_tracks_cached(board_path)
             plane_pads_by_net = _group_pads_by_net(plane_footprints)
@@ -5122,7 +5675,8 @@ def _run_independent_routes(
             worker_ctx.pop("plane_by_net", None)
             worker_ctx["_obstacle_recipe"] = (
                 board_path_str, worker_ctx["routable_set"], worker_ctx["all_cu"],
-                worker_ctx["rules"]["edge_clearance"], worker_ctx["power_patterns"])
+                worker_ctx["rules"]["edge_clearance"], worker_ctx["power_patterns"],
+                worker_ctx.get("plane_grid_mm", 0.2), worker_ctx.get("plane_clearance_mm", 0.2))
         from concurrent.futures import ProcessPoolExecutor
         with ProcessPoolExecutor(max_workers=min(workers, len(items)),
                                  initializer=_worker_init, initargs=(worker_ctx,)) as ex:
@@ -5602,7 +6156,9 @@ def route_nets(
     attachment_via_cost = float(plane_cfg.get("attachment_via", 8.0))
     island_base = float(plane_cfg.get("island_base", 40.0))
     orphan_island_cost = float(plane_cfg.get("orphan_island", 1000.0))
-    plane_fill_index = _zone_fill_index_cached(board_path)
+    plane_grid_mm = float(autor.get("grid_mm", 0.2)) or 0.2
+    plane_clearance_mm = float(autor.get("clearance_fallback_mm", 0.2))
+    plane_fill_index = _plane_fill_index_with_estimated(board_path, plane_grid_mm, plane_clearance_mm)
     _plane_footprints = _pcb._parse_footprint_pads_cached(board_path)
     _plane_tracks = _pcb._parse_tracks_cached(board_path)
     _plane_pads_by_net = _group_pads_by_net(_plane_footprints)
@@ -5613,11 +6169,11 @@ def route_nets(
         """This net's own fill, per routable layer, as `[{"raster", "factor"}]`
         components (7.5.3 model: mainland factor 1.0, island `island_base /
         attachment_count`, orphan `orphan_island`) - None when `net` does not
-        own a zone (i.e. is not a key in the fill index) at all. Computed once
-        per net and cached; only `_parse_zones_cached`-sourced (KiCad-filled)
-        components are considered - a net whose zone has not been filled yet
-        (no `filled_polygon`) gets no plane moves (documented partial: the
-        7.5.2 "estimated" island fallback is NOT wired into routing).
+        own a zone (i.e. is not a key in the fill index) at all. Both
+        `_parse_zones_cached`-sourced (KiCad-filled, `fill_source: "kicad"`)
+        AND the Phase 7.5.2 estimation fallback (`fill_source: "estimated"`,
+        for a zone/layer KiCad has not filled yet) are considered - see
+        `_plane_fill_index_with_estimated` (residual (a) of 7.5.4 now wired).
 
         POWER-NET GATE (user, 2026-07-24): filled zones are used for plane moves
         ONLY for power/ground nets (`_net_kind == "power"`: GND, 3V3/3.3V, 5V,
@@ -5644,7 +6200,8 @@ def route_nets(
                     comp_like, layer, net, _plane_pads_by_net, _plane_tracks,
                     _plane_stack_order, all_cu,
                 )
-                recs.append((e, len(attachments), _polygon_area_mm2(e["pts"])))
+                area = e["area_mm2"] if "area_mm2" in e else _polygon_area_mm2(e["pts"])
+                recs.append((e, len(attachments), area))
             # mainland = most attachments (ties: larger area, then file order).
             recs.sort(key=lambda r: (-r[1], -r[2]))
             comps: list[dict[str, Any]] = []
@@ -5712,6 +6269,7 @@ def route_nets(
         # through pickle (see `_worker_init`) - never read by `_route_one`.
         "_board_path": str(board_path), "all_cu": all_cu,
         "plane_island_base": island_base, "plane_orphan_island_cost": orphan_island_cost,
+        "plane_grid_mm": plane_grid_mm, "plane_clearance_mm": plane_clearance_mm,
     }
 
     def _route_core(conn: dict[str, Any], owner: int, use_corridor: bool = True) -> dict[str, Any]:
@@ -6425,7 +6983,7 @@ def route_board(
             "global_route": "done",
             "detailed_route": "done",
             "rip_up": "disabled (effort=quick)" if max_ripup == 0 else "active",
-            "plane_aware_routing": "not_implemented (Phase 7.5, M4)",
+            "plane_aware_routing": "partial (Phase 7.5.4 landed for power nets; heuristic not cost-optimal)",
             "whole_board_optimization": "not_implemented (Phase 7.6, M4)",
             "stitching": "not_implemented (Phase 7.5.6, M4)",
         },

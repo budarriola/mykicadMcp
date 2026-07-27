@@ -98,10 +98,13 @@ try:
     from kicad_router_tool import (
         audit_plane_islands,
         benchmark_autoroute,
+        create_plane,
         get_drc_constraints,
         get_ratsnest,
         list_zones,
+        modify_plane,
         open_route_viewer,
+        propose_plane,
         route_board,
         route_nets,
         unroute_nets,
@@ -1179,6 +1182,102 @@ class KiCadMcpServer:
                 },
                 "handler": self._tool_open_route_viewer,
             },
+            "propose_kicad_plane": {
+                "description": (
+                    "Phase 7.5.5 - propose a candidate copper-pour plane for `net` on `layer` "
+                    "(read-only; never writes; no ownership restriction, unlike create/modify - it's a "
+                    "suggestion, even against a hand-made zone/net). Candidate outline: a grid-based "
+                    "coverage region of the net's own pads/vias on the layer (bounding box inflated by "
+                    "pad/via reach plus a margin, clipped to the board's Edge.Cuts extents). Omit layer "
+                    "to auto-pick a copper layer whose layer_purpose TYPE matches the net's own kind "
+                    "(7.2 - power nets prefer power-type layers). Runs the same 7.5.2 estimation "
+                    "pipeline audit_kicad_plane_islands uses (minus higher-priority zones and "
+                    "clearance-inflated foreign copper) to report components (mainland/island/orphan, "
+                    "7.5.3 costing) and a cost_delta vs the net's current routed trace cost "
+                    "(get_kicad_trace_cost) - negative means the plane looks cheaper. Simplified "
+                    "estimate, not a re-route simulation."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "net": {"type": "string"},
+                        "layer": {
+                            "type": "string",
+                            "description": "Copper layer to propose on; omit to auto-pick by net kind / layer purpose.",
+                        },
+                    },
+                    "required": ["project_path", "net"],
+                },
+                "handler": self._tool_propose_plane,
+            },
+            "create_kicad_plane": {
+                "description": (
+                    "Phase 7.5.5 - create a new copper-pour zone for `net` on `layer` from "
+                    "propose_kicad_plane's candidate outline, copying an existing board zone's "
+                    "fill-setting shape (hatch, connect_pads clearance, min_thickness, thermal gap, "
+                    "smoothing) so it looks native - the create_kicad_netclass 'copy Default's shape' "
+                    "pattern, applied to zones. write=false (default) returns the exact (zone ...) text "
+                    "block that would be appended, without touching the board. write=true appends it "
+                    "(uuid-anchored top-level surgery) and records the new zone's uuid in board-local "
+                    "autorouter_owned.zones - the only thing that makes it eligible for a later "
+                    "modify_kicad_plane call. IMPORTANT: writing the zone does not fill it with copper - "
+                    "refill zones (Fill All Zones) and re-run DRC in KiCad afterward."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "net": {"type": "string"},
+                        "layer": {
+                            "type": "string",
+                            "description": "Copper layer to create the zone on; omit to auto-pick by net kind / layer purpose.",
+                        },
+                        "name": {"type": "string", "description": "Zone name; defaults to autorouter_<net>_<layer>."},
+                        "priority": {"type": "integer", "default": 0},
+                        "write": {"type": "boolean", "default": False},
+                        "allow_while_open": {"type": "boolean", "default": False},
+                    },
+                    "required": ["project_path", "net"],
+                },
+                "handler": self._tool_create_plane,
+            },
+            "modify_kicad_plane": {
+                "description": (
+                    "Phase 7.5.5 - move/grow/shrink and/or reprioritize an EXISTING zone by uuid, via "
+                    "uuid-anchored s-expr surgery (same discipline as delete_kicad_group/"
+                    "unroute_kicad_nets - only the (zone ...) block's polygon/priority is spliced, never "
+                    "a full file re-serialize). REFUSES (raises, never silently proceeds) when uuid is "
+                    "not recorded in board-local autorouter_owned.zones - this tool may ONLY move/resize "
+                    "a zone create_kicad_plane itself created, never one of the six hand-made kiln zones "
+                    "(mainGnd, safty_gnd, antenna, main3.3, main12v, 3.3v_safty); those can only be "
+                    "*proposed* for change via propose_kicad_plane for a human to apply by hand in KiCad. "
+                    "At least one of new_outline/priority must be given. write=false (default) previews "
+                    "the new zone block text without touching the board; write=true applies it and "
+                    "reminds the caller that KiCad must refill zones + re-run DRC afterward."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "uuid": {"type": "string"},
+                        "new_outline": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
+                                "required": ["x", "y"],
+                            },
+                            "description": "New polygon outline (>=3 points) to replace the zone's (polygon (pts ...)).",
+                        },
+                        "priority": {"type": "integer"},
+                        "write": {"type": "boolean", "default": False},
+                        "allow_while_open": {"type": "boolean", "default": False},
+                    },
+                    "required": ["project_path", "uuid"],
+                },
+                "handler": self._tool_modify_plane,
+            },
             "benchmark_kicad_autoroute": {
                 "description": (
                     "Phase 7.16 - score route_board against a human-routed board (the user's north star: "
@@ -2044,6 +2143,31 @@ class KiCadMcpServer:
 
     def _tool_open_route_viewer(self, args: dict[str, Any]) -> dict[str, Any]:
         return open_route_viewer(args["project_path"], board=args.get("board"))
+
+    def _tool_propose_plane(self, args: dict[str, Any]) -> dict[str, Any]:
+        return propose_plane(args["project_path"], args["net"], args.get("layer"))
+
+    def _tool_create_plane(self, args: dict[str, Any]) -> dict[str, Any]:
+        return create_plane(
+            args["project_path"],
+            args["net"],
+            layer=args.get("layer"),
+            name=args.get("name"),
+            priority=int(args.get("priority", 0)),
+            write=bool(args.get("write", False)),
+            allow_while_open=bool(args.get("allow_while_open", False)),
+        )
+
+    def _tool_modify_plane(self, args: dict[str, Any]) -> dict[str, Any]:
+        priority = args.get("priority")
+        return modify_plane(
+            args["project_path"],
+            args["uuid"],
+            new_outline=args.get("new_outline"),
+            priority=int(priority) if priority is not None else None,
+            write=bool(args.get("write", False)),
+            allow_while_open=bool(args.get("allow_while_open", False)),
+        )
 
     def _tool_benchmark_autoroute(self, args: dict[str, Any]) -> dict[str, Any]:
         return benchmark_autoroute(

@@ -83,7 +83,11 @@ def test_route_board_pipeline_hooks_declared_not_faked(scratch_board):
     assert pipe["ratsnest"] == "done"
     assert pipe["global_route"] == "done"
     assert pipe["detailed_route"] == "done"
-    for hook in ("plane_aware_routing", "whole_board_optimization", "stitching"):
+    # plane_aware_routing is now honestly "partial" (7.5.4 landed for power
+    # nets; heuristic is not cost-optimal) - the other two hooks are still
+    # fully unimplemented and must stay reported that way.
+    assert pipe["plane_aware_routing"].startswith("partial")
+    for hook in ("whole_board_optimization", "stitching"):
         assert pipe[hook].startswith("not_implemented")
 
 
