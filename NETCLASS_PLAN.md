@@ -1523,7 +1523,7 @@ and removed stitching is re-placed by the final stitching pass anyway.
 Knobs `stitching`: `{target_spacing_mm: 5.0, near_high_speed_mm: 1.0,
 near_high_speed_pitch_mm: 2.0, enabled: true}`.
 
-### 7.6 CORE — LANDED 2026-07-27 (reference anchor; 7.7's decision layer still open, see below)
+### 7.6 CORE — LANDED 2026-07-27 (reference anchor; 7.7's decision layer landed too, see its own anchor below)
 
 Implemented in new module `kicad_optimizer_tool.py` (1075 lines; Opus subagent
 — explicit standing authorization per the 2026-07-24 user decision recorded
