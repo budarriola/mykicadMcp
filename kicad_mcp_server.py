@@ -116,6 +116,17 @@ except Exception as exc:  # pragma: no cover - import safety
 
 
 try:
+    from kicad_optimizer_tool import (
+        get_route_session,
+        optimize_board,
+    )
+except Exception as exc:  # pragma: no cover - import safety
+    log_message(f"Failed to import KiCad optimizer module: {exc}")
+    traceback.print_exc(file=sys.stderr)
+    raise
+
+
+try:
     from kicad_ipc_tool import (
         clear_live_highlight,
         find_live_layout_collisions,
@@ -1321,6 +1332,94 @@ class KiCadMcpServer:
                 },
                 "handler": self._tool_benchmark_autoroute,
             },
+            "optimize_kicad_board": {
+                "description": (
+                    "Phase 7.6 - iterative whole-board optimization. Optimizes ONE number: "
+                    "S = sum of net trace costs (get_kicad_trace_cost's board total, incl. the 7.2 "
+                    "layer-purpose penalties) + sum of plane island costs (audit_kicad_plane_islands) + "
+                    "optimizer.unrouted_penalty x unrouted-connection count (get_kicad_ratsnest) - every "
+                    "term already defined in pcb_settings.json, so 'best' is exactly what the JSON says "
+                    "it is. Each iteration ranks nets by cost contribution (routed nets at their trace "
+                    "cost, unrouted nets at their penalty), takes optimizer.worst_k, and generates up to "
+                    "six candidate moves: rip-up+reroute in a perturbed order, reroute a whole bus bundle "
+                    "on its Phase 5 corridor, swap a net's layer (layer-purpose driven), add a stitching "
+                    "via to a plane island, create a plane for a power net that prices below its copper, "
+                    "and resize an autorouter-owned zone. Every candidate is scored on its own private "
+                    "copy of the board; acceptance follows optimizer.accept ('greedy' = strict "
+                    "improvements only; 'sa' = simulated annealing, worse moves accepted with probability "
+                    "exp(-dS/T), T *= sa_cooling per iteration). `seed` makes a run fully reproducible. "
+                    "RESUMABLE, never a marathon: one call runs at most max_iterations_per_call "
+                    "iterations or max_seconds of wall clock and returns {session_id, state, "
+                    "score_curve, moves, diff}, with state in running|converged|budget_exhausted; pass "
+                    "the session_id back to continue exactly where it stopped (RNG state and all loop "
+                    "state checkpoint to the board-local JSON, so a session survives an MCP restart and "
+                    "is inspectable via get_kicad_route_session). ALL iteration happens on a private "
+                    "scratch copy of the project - write=false (the default) never touches the real "
+                    "board on any call. write=true applies the session's FINAL accepted state (copper, "
+                    "vias and zones together) onto the real board and records it all in "
+                    "autorouter_owned so unroute_kicad_nets still undoes it; it refuses while the "
+                    "session is still running or if the real board changed since the session started. "
+                    "Refill zones + re-run DRC in KiCad after write=true. Human-routed copper and the "
+                    "hand-made zones are read-only inputs throughout - the moves reuse "
+                    "unroute_kicad_nets/modify_kicad_plane, whose own ownership guards they never "
+                    "bypass. Phase 7.7 (AI-in-the-loop decisions) is NOT implemented: there is no "
+                    "'awaiting_decision' state and optimizer.ai_decisions is never read; where 7.7 would "
+                    "pause on a near-tie, this optimizer takes the best-scored move."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "session_id": {
+                            "type": "string",
+                            "description": "Resume this session; omit to start a new one.",
+                        },
+                        "max_iterations_per_call": {"type": "integer", "default": 3},
+                        "max_seconds": {
+                            "type": "number",
+                            "description": "Wall-clock bound for THIS call; omit for iterations-only bounding.",
+                        },
+                        "seed": {"type": "integer", "description": "Overrides optimizer.seed for a new session."},
+                        "accept": {"type": "string", "enum": ["greedy", "sa"]},
+                        "max_iterations": {
+                            "type": "integer",
+                            "description": "Total SESSION iteration budget; defaults to optimizer.max_iterations.",
+                        },
+                        "time_budget_s": {
+                            "type": "number",
+                            "description": "Total SESSION time budget; defaults to optimizer.time_budget_s.",
+                        },
+                        "write": {"type": "boolean", "default": False},
+                        "allow_while_open": {"type": "boolean", "default": False},
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_optimize_board,
+            },
+            "get_kicad_route_session": {
+                "description": (
+                    "Phase 7.6 - READ-ONLY report of an optimize_kicad_board session: its state "
+                    "(running|converged|budget_exhausted), iteration count vs budget, elapsed time, seed, "
+                    "acceptance policy, SA temperature, initial/current/best score, the per-iteration "
+                    "score curve, the full move log (what was tried, whether it was accepted and why), "
+                    "and the scratch board it is iterating on. Does NOT advance the session by a single "
+                    "iteration - use optimize_kicad_board for that. Omit session_id to report the most "
+                    "recently touched session on this board; returns found:false (never raises) when the "
+                    "board has no optimizer session yet."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "session_id": {
+                            "type": "string",
+                            "description": "Omit for the board's most recently touched session.",
+                        },
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_get_route_session,
+            },
             "propose_kicad_netclass": {
                 "description": (
                     "Propose a net-class definition from a confirmed net list (a detect_kicad_buses "
@@ -2176,6 +2275,27 @@ class KiCadMcpServer:
             effort=str(args.get("effort", "balanced")),
             scratch_dir=args.get("scratch_dir"),
         )
+
+    def _tool_optimize_board(self, args: dict[str, Any]) -> dict[str, Any]:
+        max_seconds = args.get("max_seconds")
+        max_iterations = args.get("max_iterations")
+        time_budget_s = args.get("time_budget_s")
+        seed = args.get("seed")
+        return optimize_board(
+            args["project_path"],
+            session_id=args.get("session_id"),
+            max_iterations_per_call=int(args.get("max_iterations_per_call", 3)),
+            max_seconds=float(max_seconds) if max_seconds is not None else None,
+            seed=int(seed) if seed is not None else None,
+            accept=args.get("accept"),
+            max_iterations=int(max_iterations) if max_iterations is not None else None,
+            time_budget_s=float(time_budget_s) if time_budget_s is not None else None,
+            write=bool(args.get("write", False)),
+            allow_while_open=bool(args.get("allow_while_open", False)),
+        )
+
+    def _tool_get_route_session(self, args: dict[str, Any]) -> dict[str, Any]:
+        return get_route_session(args["project_path"], session_id=args.get("session_id"))
 
     def _tool_propose_netclass(self, args: dict[str, Any]) -> dict[str, Any]:
         return propose_netclass_from_nets(args["project_path"], list(args["nets"]), args["name"])
