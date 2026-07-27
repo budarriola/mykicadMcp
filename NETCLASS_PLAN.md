@@ -165,17 +165,14 @@ For whoever (human or AI) picks this up next:
   The 35 failures are now `unreachable_in_window` (genuine dense-board
   pathfinding), not budget — closing that gap is Opus-class whole-board
   optimization (7.6), not a bounded Sonnet patch. See ⭐ findings.
-- **Next work when resumed (updated 2026-07-27 — 7.6 AND 7.7 both landed, see
-  their anchors):** (1) **7.5.6 stitching pass** + `remove_kicad_stitching_vias`
-  + its ask-before-routing rule (last in M4) — its ordering contract ("only
-  after 7.6's stopping rule fires") is now satisfiable, so this is UNBLOCKED,
-  not just standalone-scopeable anymore. (2) 7.14's optimizer pin-swap move +
-  pause-the-user protocol — was waiting on 7.6/7.7, both landed, so this is
-  UNBLOCKED too. (3) 7.3b's one remaining bit: lifting the 60mm/400k-node
-  window cap toward whole-board (numpy/accel, M5) — a heavier M5/accel
-  undertaking, not a bounded Sonnet patch. (4) 7.15 effort presets + plateau
-  stopping — spec'd, not built as part of either 7.6 or 7.7, genuinely open.
-  Still open: M6 item 17 (c) Flow B stack-up-gate question.
+- **Next work when resumed (updated 2026-07-27 — 7.5.6 landed too, see its
+  anchor):** (1) 7.14's optimizer pin-swap move + pause-the-user protocol —
+  was waiting on 7.6/7.7, both landed, so this is UNBLOCKED. (2) 7.3b's one
+  remaining bit: lifting the 60mm/400k-node window cap toward whole-board
+  (numpy/accel, M5) — a heavier M5/accel undertaking, not a bounded Sonnet
+  patch. (3) 7.15 effort presets + plateau stopping — spec'd, not built as
+  part of 7.6/7.7, genuinely open. Still open: M6 item 17 (c) Flow B
+  stack-up-gate question.
 - **Nothing has been committed** in either repo as of this snapshot — review the
   working tree before assuming git history matches this file.
 - Verify claims against the code (`kicad_pcb_tool.py`, `kicad_mcp_server.py`,
@@ -657,6 +654,16 @@ router work):
   gaps, not required for the core mechanism to work. Unblocks 7.5.6 stitching
   and 7.14's pin-swap pause protocol, both previously gated on this landing
   (see their respective sections/build-order items).
+  (19) ✅ **Phase 7.5.6 plane stitching pass — LANDED 2026-07-27** (Sonnet
+  subagent, worktree-isolated, merged fast-forward). See its anchor for the
+  full write-up: `run_kicad_stitching_pass` (island rescue, return-path,
+  general stitching, in the specced order) + `remove_kicad_stitching_vias`
+  (scoped deletion, `include_foreign` listing), reusing `_place_stitching_via`
+  from the 7.6 landing via a new backward-compatible `stitching=True` flag.
+  90→92 tools, 284→293 passed, same 7 pre-existing board-drift failures.
+  **This closes out Phase 7.5 entirely** (see build-order item 13). Unblocks
+  nothing further by itself, but was itself the last piece 7.14's pin-swap
+  protocol and further M4 work were waiting on alongside 7.6/7.7.
 
 ## How to work this plan (living document — keep it current)
 
@@ -1489,39 +1496,54 @@ the assertion or the production regex — the regex and code were correct, the
 test fixture was wrong. Full suite green after the fix: 219 passed / 7
 pre-existing board-drift failures (unrelated, unchanged) / 7 skipped.
 
-### 7.5.6 Plane stitching pass (always runs LAST) + stitching-via management
+### 7.5.6 — LANDED 2026-07-27 (reference anchor; no work remains here)
 
-**Ordering contract: stitching is the final copper pass.** Only after all trace
-routing and plane creation/moves have converged (7.6's stopping rule fires)
-does a dedicated stitching pass place vias, in this order:
-1. **Island rescue** — attach would-be islands/stubs found by 7.5.3, at the
-   cheapest attachment positions it already computes.
-2. **Return-path stitching** — on power/ground planes, stitching vias near
-   high-speed traces (Phase 9 classification): target pitch
-   `stitching.near_high_speed_pitch_mm`, placed within
-   `stitching.near_high_speed_mm` of the trace wherever fill + DRC clearances
-   (7.11) allow.
-3. **General stitching** to `stitching.target_spacing_mm` where the budget
-   allows (7.7's `stitching_budget` decision type prices this).
+Implemented in `kicad_optimizer_tool.py` (Sonnet subagent, worktree-isolated,
+coordinator-reviewed, merged fast-forward). `run_stitching_pass`/MCP tool
+`run_kicad_stitching_pass` runs the three specced steps in order — island
+rescue (one via per costed island/orphan `audit_plane_islands` already
+reports, at its own `suggested_stitching_via.position`), return-path
+stitching (vias near `classify_critical_nets`' routed copper, on the
+same-layer power/ground plane, at `stitching.near_high_speed_pitch_mm`
+spacing within `stitching.near_high_speed_mm` of the trace, filtered to
+points landing inside the plane's own drawn outline), and general stitching
+(a grid fill of each power/ground plane toward `stitching.target_spacing_mm`,
+capped per zone/layer by an internal engineering bound, not a settings
+field). `_place_stitching_via` (the bare-via writer 7.6's move (d) already
+introduced) gained an optional `stitching=True` flag: every pre-existing
+caller (the optimizer's own move (d)) omits it and is byte-identical to
+before, while this pass's vias get tagged `"stitching": True` in the
+board-local record so `remove_stitching_vias`/MCP `remove_kicad_stitching_
+vias` can target exactly them — never an ordinary routing via, a hand-placed
+via, or the optimizer's own untagged move-(d) via (a deliberate scope line:
+that one belongs to an `optimize_kicad_board` session, not this pass's
+bookkeeping). `remove_kicad_stitching_vias(area=None, write=False,
+include_foreign=False)` restricts to a rect/polygon area; `include_foreign`
+lists (never deletes) other freestanding same-net vias using the codebase's
+existing free/oversized-via heuristic (`get_kicad_track_inventory`'s
+characterization, reused rather than reinvented).
 
-Every stitching via is `autorouter_owned` **and tagged `stitching: true`** in
-the board-local JSON — distinct from routing vias, so management tools can
-target exactly them.
+**Spec deviation, honest and narrow:** the return-path/general-stitching
+containment test uses each plane zone's DRAWN outline as a proxy for its
+actual fill area, rather than re-running the full 7.5.2 fill/flood-fill
+estimation per candidate point — a reasonable simplification since most of a
+real pour's outline area is its mainland (island rescue, which needs the
+precise per-island decomposition, uses the exact `audit_plane_islands` model
+instead and isn't affected by this).
 
-`remove_kicad_stitching_vias(project_path, area=None, write=False)` → tool:
-delete all stitching vias, or only those inside a given rect/polygon `area`.
-Deletes only autorouter-owned stitching vias; `include_foreign: true` *lists*
-(never auto-deletes) other freestanding same-net vias for the user to confirm
-one by one — kiln's 3 free vias would surface here.
+**Interaction rule (session contract) — documented, not enforced in code, by
+design:** the plan calls for the calling session to ask the user before
+routing/optimizing in an area with existing stitching vias. This is not
+something a Python function can verify about its caller's future intent, so
+it's documented in both tools' MCP descriptions as a convention (the same
+treatment `allow_hand_copper_ripup` already gets) rather than built as
+enforcement machinery — removed stitching copper is simply re-placed by the
+next pass anyway, so nothing is lost by asking.
 
-**Interaction rule (session contract):** before routing or optimizing in an
-area that contains stitching vias (owned or foreign), the session must ask the
-user whether to remove them first (AskUserQuestion with count + area); the
-answer is recorded per area in the board-local session so one run asks once,
-and removed stitching is re-placed by the final stitching pass anyway.
-
-Knobs `stitching`: `{target_spacing_mm: 5.0, near_high_speed_mm: 1.0,
-near_high_speed_pitch_mm: 2.0, enabled: true}`.
+New `stitching` block in `DEFAULT_PCB_SETTINGS`: `{target_spacing_mm: 5.0,
+near_high_speed_mm: 1.0, near_high_speed_pitch_mm: 2.0, enabled: true}`.
+90→92 tools. 9 tests in `tests/test_stitching.py`. Full suite 284→293
+passed, same 7 pre-existing board-drift failures, 7 skipped.
 
 ### 7.6 CORE — LANDED 2026-07-27 (reference anchor; 7.7's decision layer landed too, see its own anchor below)
 
@@ -2388,7 +2410,6 @@ this note previously listed them as pending, which had gone stale; see the
 | `get_kicad_system_resources` | `probe_system_resources` | no |
 | `adopt_kicad_routing` | `adopt_routing` | **yes (board_local.json)** |
 | `seed_kicad_routing_from_board` | `seed_routing_from_board` | **yes (board + board_local.json)** |
-| `remove_kicad_stitching_vias` | `remove_stitching_vias` | **yes (board + board_local.json)** |
 
 Each registered in `self.tools` with `inputSchema` + a `_tool_*` handler, exactly
 like the existing entries.
@@ -2421,9 +2442,11 @@ since a docs pass for 7.6 that merges just before 7.7 lands goes stale
 immediately — the "Known Limitation: 7.7 not implemented" note had to be
 replaced right after landing); README synced to **90 tools**. **CLAUDE.md
 tool-count bump still owed** (coordinator has it staged locally in the parent
-repo at 90 but does not auto-commit there — needs the user's own commit).
-**Remaining docs debt:** none currently known for landed tools; future Phase 7
-tools add rows as they land)
+repo — now needs to go to **92**, not 90, since 7.5.6 landed after that
+staged edit — needs the user's own commit). **Remaining docs debt:**
+`run_kicad_stitching_pass`/`remove_kicad_stitching_vias` (7.5.6, landed
+2026-07-27) have no docs rows yet, and README needs its count bumped from 90
+to 92; future Phase 7 tools add rows as they land)
 - Extend `docs/mcp-tools/10-netclasses-and-buses.md` (or the autorouter page,
   as fits) as each remaining tool in the summary table above lands (same
   per-tool format).
@@ -2585,16 +2608,12 @@ landed 2026-07-21 — see their anchors; remaining:):
 12. Phase 7.9 viewer — **LANDED 2026-07-27** (see its anchor).
 
 **M4 — Planes + whole-board optimization:**
-13. Phase 7.5 plane engine — all of it, including the 7.5.5 writers, **LANDED**
-    (see the 7.5.1, 7.5.2/7.5.3, 7.5.4, and 7.5.5 anchors; kiln: 31 islands, 1
-    orphan on safty_gnd F.Cu; plane moves in the detailed A*, signal parity by
-    construction; both 7.5.4 residuals wired in with 7.5.5). **Remaining:** the
-    7.5.6 stitching pass + `remove_kicad_stitching_vias` + its
-    ask-before-routing interaction rule — its ordering contract ("only after
-    7.6's stopping rule fires") is now satisfiable: 7.6's `converged`/
-    `budget_exhausted` states exist and 7.7's decision protocol landed too, so
-    this item is UNBLOCKED, not just `remove_kicad_stitching_vias` standalone
-    — reassess as the next candidate for delegation.
+13. Phase 7.5 plane engine — ALL of it, including 7.5.5 writers and 7.5.6
+    stitching, **FULLY LANDED** (see the 7.5.1, 7.5.2/7.5.3, 7.5.4, 7.5.5, and
+    7.5.6 anchors; kiln: 31 islands, 1 orphan on safty_gnd F.Cu; plane moves in
+    the detailed A*, signal parity by construction; both 7.5.4 residuals wired
+    in with 7.5.5; stitching's ordering-contract dependency on a "7.6 stopping
+    rule" satisfied once 7.6/7.7 landed). Nothing remains in this item.
 14. Phase 7.6/7.7 optimizer + decision protocol — **BOTH LANDED 2026-07-27**
     (see their anchors; `greedy` and `sa` accept policies, sessions/resume,
     `awaiting_decision`/`decide_kicad_route`, and `decision_log` auditability
