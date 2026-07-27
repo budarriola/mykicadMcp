@@ -466,14 +466,40 @@ router work):
   `KILN_USE_LIVE_BOARD=1` overrides). LATENT BUG FOUND (not fixed, out of scope):
   `unroute_nets` corrupts an **LF**-line-ending board (unbalanced parens) — never
   triggers from KiCad's CRLF output, but worth a line-ending-agnostic fix someday.
-  **NOW (6): the remaining completion gaps, in
-  descending value:** (a) **rip-up demotion for `self_check_failed`** (6 nets — a
-  plane-via route is found but skims real copper; demote to the rip-up loop
-  instead of failing hard — measured that a finer grid does NOT clear these); (b)
-  **hierarchical / multilevel windowing for the long inter-module nets** (40–113
-  mm, coarse-grid `unreachable`); (c) the genuinely-sealed pads need rip-up of
-  hand copper (which we never do) — accept or flag. THEN quality/score work vs
-  8552.276. `benchmark` is the standing gate throughout.
+  (9) ✅ **Rip-up demotion for `self_check_failed` — LANDED 2026-07-26 (Sonnet
+  subagent, coordinator-verified, `c98bed2`).** `_self_check` now tags every
+  violation with `owner` (None = existing/human board copper — zone, pad, edge,
+  hand track, never rippable; int = the autorouter connection id owning the
+  colliding copper — rippable). `_route_one`'s self-check-failed branch keeps
+  the found `path` and full `violations` list instead of discarding them. The
+  worklist's Step-4 rip-up loop gained a parallel branch: when a self-check
+  failure's violations are against rippable copper, it rips those owners'
+  placements and re-`_finalize_core`s the SAME path (no re-search needed — it
+  was already geometrically fine except for the named conflicts) against the
+  reduced obstacle set; a skim whose violations are ALL against non-rippable
+  copper (`owner is None` everywhere) is untouched and correctly stays a hard
+  failure, same as before. 3 new tests (`tests/test_ripup_selfcheck.py`) fault-
+  inject a synthetic self-check failure to prove: a rippable-owner skim gets
+  demoted and both nets end up routed; an `owner=None` skim stays hard-failed;
+  repeated runs are byte-identical. 154 passed/55 skipped (was 151/55) — no
+  regressions. **Measured against the live board today: only 2 unrouted
+  connections remain** (the board has been routed further since the 6-net
+  measurement that motivated this item) — `3.3V_Main` (self_check_failed
+  against an unconnected pad, `owner` always None for pads, correctly stays
+  terminal) and `Net-(U6-BIAS)` (`unreachable_in_window` against the
+  `GND_Safty` zone fill, unrelated to this item). Board score unchanged
+  (`get_trace_cost` total 10367.891) since neither remaining failure was
+  eligible for demotion — this item's value will show up once more
+  self-check-failed nets exist to demote (e.g. after hierarchical windowing
+  below routes more of the long nets and any of ITS results skim).
+  **NOW: the remaining completion gaps, in
+  descending value:** (a) **hierarchical / multilevel windowing for the long
+  inter-module nets** (40–113 mm, coarse-grid `unreachable` — the wide-margin
+  ladder rungs get forced onto a grid too coarse, ~0.5–0.8 mm, to thread the
+  real ≤0.5–2 mm channels next to GND/power planes these nets need); (b) the
+  genuinely-sealed pads need rip-up of hand copper (which we never do) —
+  accept or flag. THEN quality/score work vs 8552.276. `benchmark` is the
+  standing gate throughout.
 
 ## How to work this plan (living document — keep it current)
 
@@ -1011,7 +1037,6 @@ both self-check clean, kicad-cli DRC NEW=0; two write/unroute cycles
 byte-identical (deterministic); a net blocked only by solid GND copper fails
 with `nearest_blocker.net=="GND"` and GND intact (human copper never ripped).
 2 tests added (146 suite total). **Rip-up residuals (accepted, in-code):**
-self-check clearance failures are hard failures, not demoted back to rip-up;
 incremental window patching is within the failing net's window (each ripped net
 rebuilds its own per-connection window — there is no full-board window, so the
 "no full rebuild" contract still holds); congestion cell mapping is
@@ -1025,8 +1050,7 @@ applied); pad escape lands on nearest free node (not direction-aware);
 termination is on the `to` point (not "any same-net copper"); window doubling
 is **capped at 60 mm span / 400k-node budget**, not whole-board (a whole-kiln
 0.2 mm 4-layer raster ~2.3M×4 nodes is infeasible in pure Python — lift with
-numpy/accel, M5). Demoting self-check failures back into the rip-up loop is
-also open.
+numpy/accel, M5).
 
 **Stage 1 LANDED 2026-07-21** (anchor): `kicad_router_tool.py` exists with
 `build_connectivity` (union-find islands per net) + `get_ratsnest` → tool
@@ -2232,8 +2256,7 @@ landed 2026-07-21 — see their anchors; remaining:):
     incremental window clears, deterministic, human copper never ripped — see
     the stage-2 anchor). **Remaining to close 7.3b:** 7.12
     neck-down on the pad-escape stub, direction-aware pad escape, "any same-net
-    copper" termination, demoting self-check failures into the rip-up loop, and
-    lifting the 60 mm / 400k-node window cap toward
+    copper" termination, and lifting the 60 mm / 400k-node window cap toward
     whole-board (needs the memory planner + numpy/multi-core waves — those slip
     to M5's accel work; the cpu tier remains the reference everything else must
     match). Plane-aware via-drops through pours need M4's 7.5 zone model.
