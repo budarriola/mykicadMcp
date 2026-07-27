@@ -101,6 +101,7 @@ from __future__ import annotations
 import json
 import math
 import random
+import re
 import shutil
 import tempfile
 import time
@@ -399,7 +400,9 @@ def _migrate_session(session: dict[str, Any], config: dict[str, Any]) -> dict[st
 # Stitching-via writer - the one piece of board surgery this module owns
 # --------------------------------------------------------------------------- #
 
-def _place_stitching_via(project_path: str | Path, net: str, x: float, y: float) -> dict[str, Any]:
+def _place_stitching_via(
+    project_path: str | Path, net: str, x: float, y: float, stitching: bool = False,
+) -> dict[str, Any]:
     """Append ONE bare `(via ...)` on `net` at `(x, y)`, spanning the full
     copper stack, and record its uuid in board-local `autorouter_owned` so
     `unroute_nets` can undo it exactly like any routed via.
@@ -418,6 +421,17 @@ def _place_stitching_via(project_path: str | Path, net: str, x: float, y: float)
     island's own same-net pour - the caller (the optimizer's move (d)) only
     ever passes such a point, and the result is reported as needing a KiCad
     refill + DRC pass like every other write in this codebase.
+
+    `stitching` (default False - unchanged behavior for every pre-existing
+    caller, i.e. the optimizer's own move (d)) tags the board-local record
+    `"stitching": True` when set. This is Phase 7.5.6's distinguishing mark:
+    `run_stitching_pass` is the only caller that ever passes `stitching=True`,
+    so `remove_stitching_vias` (MCP `remove_kicad_stitching_vias`) can target
+    exactly the vias IT placed without ever touching an ordinary routing via
+    or the optimizer's own island-cost move. The key is omitted entirely (not
+    even written as `False`) when unset, so every existing reader of
+    `autorouter_owned["records"]` - which only ever reads `uuid`/`net` - sees
+    byte-identical records to before this change.
     """
     board_path, _, _ = _pcb._resolve_project_path(project_path)
     settings = _pcb.load_pcb_settings(project_path)["config"]
@@ -439,7 +453,12 @@ def _place_stitching_via(project_path: str | Path, net: str, x: float, y: float)
     data.setdefault("version", 1)
     owned = data.setdefault("autorouter_owned", {})
     owned.setdefault("vias", []).append(via_uuid)
-    owned.setdefault("records", []).append({"uuid": via_uuid, "net": net, "kind": "via"})
+    record: dict[str, Any] = {"uuid": via_uuid, "net": net, "kind": "via"}
+    if stitching:
+        record["stitching"] = True
+        record["x"] = x
+        record["y"] = y
+    owned.setdefault("records", []).append(record)
     _pcb.save_board_local(project_path, data)
     return {"uuid": via_uuid, "net": net, "x": x, "y": y}
 
@@ -1459,3 +1478,416 @@ def _apply_session(session: dict[str, Any], project_path: str | Path,
     session["applied"] = True
     session["board_fingerprint"] = _board_fingerprint(project_path)
     return True, None
+
+
+# =========================================================================== #
+# Phase 7.5.6 - the plane stitching pass (`run_stitching_pass`, MCP
+# `run_kicad_stitching_pass`) and its undo (`remove_stitching_vias`, MCP
+# `remove_kicad_stitching_vias`)
+#
+# The plan's own ordering contract: stitching is the FINAL copper pass, run
+# only after routing and plane creation/moves have converged - it is not one
+# of the 7.6 optimizer's per-iteration candidate moves (move (d) already
+# covers a single opportunistic island-rescue via inside the score loop; this
+# is a dedicated, one-shot sweep run once the board is otherwise settled).
+#
+# Three ordered steps, each reusing an already-landed read/analysis tool
+# rather than inventing new geometry:
+#   1. Island rescue        - `audit_plane_islands`'s own `suggested_stitching_
+#                              via` per costed island/orphan (exact reuse of
+#                              the optimizer's move (d) targeting, but applied
+#                              to EVERY island in one pass, not one per
+#                              iteration).
+#   2. Return-path stitching- vias near `classify_critical_nets` nets, on the
+#                              power/ground PLANE (not the signal net's own
+#                              layer), at `stitching.near_high_speed_pitch_mm`
+#                              within `stitching.near_high_speed_mm` of the
+#                              trace.
+#   3. General stitching     - a grid fill of the remaining plane area toward
+#                              `stitching.target_spacing_mm`.
+#
+# Every via this pass places goes through `_place_stitching_via(..., stitching
+# =True)`, so it is `autorouter_owned` AND carries the `"stitching": True` tag
+# `remove_stitching_vias` filters on - never touching an ordinary routing via,
+# a hand-placed via, or the optimizer's own untagged move-(d) vias.
+#
+# SESSION-CONTRACT NOTE (not enforced here - see the tool docstrings below):
+# the plan asks that before routing/optimizing in an area containing
+# stitching vias (owned or foreign), the calling AI session ask the user
+# whether to remove them first. That is a convention for the SESSION to
+# follow (the same kind of documented-not-enforced contract as `allow_hand_
+# copper_ripup` on `route_nets`/`route_board`), not something a Python
+# function can verify about its caller's future intentions - removed
+# stitching copper is simply re-placed by the next `run_stitching_pass`
+# anyway, so nothing is lost by asking.
+# =========================================================================== #
+
+# Implementation cost bound (same idea as `_MAX_CANDIDATES_PER_ITERATION`): the
+# most general-stitching vias one pass will place per zone/layer. A dense
+# ground pour's interior area can be huge, so an unbounded grid fill could
+# place thousands of vias in one call; this is an engineering guard against
+# that, not a `pcb_settings.json` design knob.
+_MAX_GENERAL_STITCHING_VIAS_PER_ZONE_LAYER = 60
+
+
+def _net_owning_zone_polygons(project_path: str | Path) -> list[dict[str, Any]]:
+    """Board-level, net-owning, non-keepout zones with a real (>=3-point)
+    outline - the same filter `_zone_island_model` applies before treating a
+    zone as costable. Returns the zones as parsed (`uuid`/`name`/`net`/
+    `layers`/`polygon`/...), for containment tests against the zone's own
+    DRAWN outline (not the per-island fill decomposition step 1 already
+    handles precisely via `suggested_stitching_via`) - a documented scope
+    simplification for steps 2/3: most of a real pour's outline area IS its
+    mainland, so testing against the outline is a reasonable proxy without
+    re-running the full 7.5.2 fill/flood-fill estimation for every candidate
+    point."""
+    board_path, _, _ = _pcb._resolve_project_path(project_path)
+    zones = _r._parse_zones_cached(board_path)
+    return [
+        z for z in zones
+        if z.get("net") and not z.get("keepout") and len(z.get("polygon") or []) >= 3
+    ]
+
+
+def _is_power_ground_net(net_name: str, settings: dict[str, Any]) -> bool:
+    """A stitching via belongs on the RETURN-PATH plane, not the signal net's
+    own layer - reuses the exact `layer_purpose.power_net_patterns` regex list
+    `classify_critical_nets`/`propose_plane` already use to recognize a
+    power/ground net by name, rather than inventing a second pattern list."""
+    patterns = settings.get("layer_purpose", {}).get("power_net_patterns", [])
+    return any(re.search(pat, net_name) for pat in patterns)
+
+
+def _offset_points_along_segment(
+    seg: dict[str, Any], pitch_mm: float, offset_mm: float,
+) -> list[tuple[float, float]]:
+    """Candidate return-path stitching-via positions along one routed track
+    segment: points spaced `pitch_mm` apart along the centerline, each pushed
+    `offset_mm` to BOTH sides (perpendicular to the trace direction). The
+    caller filters these by plane-outline containment, so a point that lands
+    off the plane (or on the wrong side, off-board, etc.) is simply dropped -
+    never faked into a placement."""
+    if pitch_mm <= 0:
+        return []
+    x0, y0 = seg["start"]["x"], seg["start"]["y"]
+    x1, y1 = seg["end"]["x"], seg["end"]["y"]
+    length = math.hypot(x1 - x0, y1 - y0)
+    if length <= 0:
+        return []
+    ux, uy = (x1 - x0) / length, (y1 - y0) / length
+    perp_x, perp_y = -uy, ux  # 90-degree rotation of the trace direction
+
+    points: list[tuple[float, float]] = []
+    steps = max(1, int(length // pitch_mm) + 1)
+    for i in range(steps + 1):
+        t = min(i * pitch_mm, length)
+        cx, cy = x0 + ux * t, y0 + uy * t
+        for sign in (1.0, -1.0):
+            points.append((cx + perp_x * offset_mm * sign, cy + perp_y * offset_mm * sign))
+    return points
+
+
+def run_stitching_pass(project_path: str | Path, write: bool = False) -> dict[str, Any]:
+    """Phase 7.5.6 - the plane stitching pass (MCP tool `run_kicad_stitching_
+    pass`). Intended to run LAST, once routing and plane creation/moves have
+    converged (after `route_kicad_board`/`optimize_kicad_board`), never mid-
+    routing - a stitching via placed early would just become an obstacle/
+    congestion source for routing that comes after it.
+
+    Three ordered steps (`stitching.enabled: false` makes this a no-op, still
+    reporting `enabled: false` and empty plans):
+    1. Island rescue - one via per costed island/orphan `audit_kicad_plane_
+       islands` already reports, at its own `suggested_stitching_via.position`
+       (exactly the optimizer's move (d) target, applied to every island in
+       one sweep rather than one per iteration).
+    2. Return-path stitching - vias near `classify_kicad_critical_nets`
+       nets' OWN routed copper, placed on same-layer power/ground PLANES
+       (`stitching.near_high_speed_pitch_mm` apart, within `stitching.
+       near_high_speed_mm` of the trace), wherever a candidate point actually
+       lands inside that plane's own drawn outline.
+    3. General stitching - a grid fill of each power/ground plane's outline
+       toward `stitching.target_spacing_mm`, skipping any point already
+       covered by a step 1/2 via at that spacing.
+
+    Every via is placed via `_place_stitching_via(..., stitching=True)`: it is
+    `autorouter_owned` (undoable via `unroute_kicad_nets`) AND tagged
+    `"stitching": True` in the board-local record, so `remove_kicad_
+    stitching_vias` can target exactly the vias this pass placed - never an
+    ordinary routing via, a hand-placed via, or the optimizer's own untracked
+    move-(d) via (which is not tagged, by design - see `_place_stitching_via`).
+
+    write=False (default) previews the full plan (every via's net/zone/layer/
+    position and, for island rescue, its projected cost) without touching the
+    board. write=True places every planned via for real and additionally
+    returns each one's uuid; refill zones + re-run DRC in KiCad afterward,
+    same as every other copper writer here.
+
+    SESSION CONVENTION (documented, not enforced): before routing or
+    optimizing in an area that already contains stitching vias (owned or
+    foreign), the calling session should ask the user whether to remove them
+    first (see `remove_kicad_stitching_vias`) - this function cannot know
+    what the session plans to do next, so it does not attempt to gate on it;
+    removed stitching copper is simply re-placed by the next run of this pass.
+    """
+    settings = _pcb.load_pcb_settings(project_path)["config"]
+    st_cfg = settings.get("stitching", {}) or {}
+    enabled = bool(st_cfg.get("enabled", True))
+    target_spacing_mm = float(st_cfg.get("target_spacing_mm", 5.0))
+    near_hs_mm = float(st_cfg.get("near_high_speed_mm", 1.0))
+    near_hs_pitch_mm = float(st_cfg.get("near_high_speed_pitch_mm", 2.0))
+
+    board_path, _, _ = _pcb._resolve_project_path(project_path)
+    result: dict[str, Any] = {
+        "board_path": str(board_path),
+        "write": write,
+        "enabled": enabled,
+        "island_rescue": [],
+        "return_path": [],
+        "general": [],
+        "planned_count": 0,
+        "placed_count": 0,
+    }
+    if not enabled:
+        return result
+
+    planned: list[dict[str, Any]] = []
+    # (net, layer) -> positions already claimed this pass, so step 3 (and step
+    # 2's own pitch spacing) never stacks a via on top of one step 1/2 already
+    # placed there.
+    claimed: dict[tuple[str, str], list[tuple[float, float]]] = {}
+
+    def _claim(net: str, layer: str, x: float, y: float, min_sep: float) -> bool:
+        key = (net, layer)
+        existing = claimed.setdefault(key, [])
+        if any(math.hypot(x - ex, y - ey) < min_sep for ex, ey in existing):
+            return False
+        existing.append((x, y))
+        return True
+
+    # --- Step 1: island rescue --------------------------------------------
+    audit = _r.audit_plane_islands(project_path)
+    for zone in audit["zones"]:
+        for layer in zone["layers"]:
+            for comp in layer["components"]:
+                suggestion = comp.get("suggested_stitching_via")
+                if comp["role"] not in ("island", "orphan") or not suggestion:
+                    continue
+                x, y = suggestion["position"]["x"], suggestion["position"]["y"]
+                _claim(zone["net"], layer["layer"], x, y, 1e-6)
+                entry = {
+                    "kind": "island_rescue",
+                    "net": zone["net"],
+                    "zone": zone["name"],
+                    "layer": layer["layer"],
+                    "x": x, "y": y,
+                    "current_cost": comp["cost"],
+                    "projected_cost": suggestion["projected_cost"],
+                }
+                planned.append(entry)
+                result["island_rescue"].append(entry)
+
+    # --- Step 2: return-path stitching near critical/high-speed nets ------
+    zones = _net_owning_zone_polygons(project_path)
+    power_zones = [z for z in zones if _is_power_ground_net(z["net"], settings)]
+
+    try:
+        critical = _pcb.classify_critical_nets(project_path)
+    except Exception:  # pragma: no cover - defensive, matches other callers
+        critical = {"critical_nets": []}
+    critical_net_names = sorted({rec["net"] for rec in critical.get("critical_nets", [])})
+
+    tracks = _pcb._parse_tracks_cached(board_path)
+    segments_by_net: dict[str, list[dict[str, Any]]] = {}
+    for seg in tracks["segments"]:
+        if seg.get("net"):
+            segments_by_net.setdefault(seg["net"], []).append(seg)
+
+    for net_name in critical_net_names:
+        for seg in segments_by_net.get(net_name, []):
+            layer = seg["layer"]
+            for zone in power_zones:
+                if layer not in zone.get("layers", []):
+                    continue
+                for (cx, cy) in _offset_points_along_segment(seg, near_hs_pitch_mm, near_hs_mm):
+                    if not _r._point_in_poly(cx, cy, zone["polygon"]):
+                        continue
+                    if not _claim(zone["net"], layer, cx, cy, near_hs_pitch_mm * 0.9):
+                        continue
+                    entry = {
+                        "kind": "return_path",
+                        "net": zone["net"],
+                        "zone": zone["name"],
+                        "layer": layer,
+                        "x": round(cx, 4), "y": round(cy, 4),
+                        "near_net": net_name,
+                    }
+                    planned.append(entry)
+                    result["return_path"].append(entry)
+
+    # --- Step 3: general stitching toward target_spacing_mm ---------------
+    if target_spacing_mm > 0:
+        for zone in power_zones:
+            poly = zone["polygon"]
+            xs = [p[0] for p in poly]
+            ys = [p[1] for p in poly]
+            minx, maxx, miny, maxy = min(xs), max(xs), min(ys), max(ys)
+            for layer in zone.get("layers", []):
+                placed_here = 0
+                y = miny
+                while y <= maxy and placed_here < _MAX_GENERAL_STITCHING_VIAS_PER_ZONE_LAYER:
+                    x = minx
+                    while x <= maxx and placed_here < _MAX_GENERAL_STITCHING_VIAS_PER_ZONE_LAYER:
+                        if _r._point_in_poly(x, y, poly) and _claim(
+                            zone["net"], layer, x, y, target_spacing_mm,
+                        ):
+                            entry = {
+                                "kind": "general",
+                                "net": zone["net"],
+                                "zone": zone["name"],
+                                "layer": layer,
+                                "x": round(x, 4), "y": round(y, 4),
+                            }
+                            planned.append(entry)
+                            result["general"].append(entry)
+                            placed_here += 1
+                        x += target_spacing_mm
+                    y += target_spacing_mm
+
+    result["planned_count"] = len(planned)
+    if write:
+        placed_records = []
+        for entry in planned:
+            placed = _place_stitching_via(project_path, entry["net"], entry["x"], entry["y"], stitching=True)
+            placed_records.append({**entry, "uuid": placed["uuid"]})
+        result["placed"] = placed_records
+        result["placed_count"] = len(placed_records)
+    return result
+
+
+def _point_in_area(x: float, y: float, area: dict[str, Any] | None) -> bool:
+    """`area` is either omitted (everywhere matches), a rect `{"x_min",
+    "x_max", "y_min", "y_max"}` (any bound may be omitted for an open side),
+    or a polygon `{"points": [[x, y], ...]}` tested with the same even-odd
+    `_point_in_poly` the router's own island/zone containment tests use."""
+    if area is None:
+        return True
+    if "points" in area:
+        poly = [(float(p[0]), float(p[1])) for p in area["points"]]
+        return _r._point_in_poly(x, y, poly)
+    xmin = float(area.get("x_min", -math.inf))
+    xmax = float(area.get("x_max", math.inf))
+    ymin = float(area.get("y_min", -math.inf))
+    ymax = float(area.get("y_max", math.inf))
+    return xmin <= x <= xmax and ymin <= y <= ymax
+
+
+def remove_stitching_vias(
+    project_path: str | Path,
+    area: dict[str, Any] | None = None,
+    write: bool = False,
+    include_foreign: bool = False,
+    allow_while_open: bool = False,
+) -> dict[str, Any]:
+    """Undo for `run_stitching_pass` (MCP tool `remove_kicad_stitching_vias`).
+    Deletes ONLY autorouter-owned vias tagged `"stitching": True` in the
+    board-local `autorouter_owned["records"]` - never an ordinary routing via,
+    never a hand-placed via, and never the optimizer's own untagged move-(d)
+    stitching via (a deliberate scope line: that one is scored and tracked by
+    an `optimize_kicad_board` session, not this pass's bookkeeping).
+
+    `area` restricts the deletion to a region: a rect `{"x_min", "x_max",
+    "y_min", "y_max"}` (any bound omittable) or a polygon `{"points": [[x,
+    y], ...]}`; omit for the whole board. write=False (default) previews the
+    uuids that would be removed without touching the board.
+
+    `include_foreign=True` additionally LISTS (never deletes) every OTHER via
+    in the resolved area that this tool does not own - reusing this
+    codebase's existing `get_project_track_inventory` notion of a "free"
+    via (`net == ""`, an unconnected stitching/mounting via) plus an
+    "oversized" flag (more than 3x the Default netclass via diameter) so a
+    real board's already-present freestanding vias (kiln has 3 known free/
+    oversized ones) surface for a human to confirm removal one at a time,
+    exactly as those tools already characterize them. This is NOT a full
+    connectivity trace (it does not prove a same-net via has no track
+    soldered to it) - it is the same free/oversized heuristic this codebase
+    already uses elsewhere, applied here as an honest, cheap first pass.
+
+    SESSION CONVENTION (documented, not enforced): the plan asks that before
+    routing or optimizing in an area containing stitching vias (owned or
+    foreign), the calling AI session ask the user whether to remove them
+    first - the same kind of session-level contract as `route_kicad_nets`'s
+    `allow_hand_copper_ripup` opt-in. This function does the deletion asked
+    of it; the "ask first" step is the calling session's responsibility, not
+    something enforceable from inside a single tool call.
+    """
+    board_path, _, _ = _pcb._resolve_project_path(project_path)
+    state = _pcb.load_board_local(project_path)
+    data = state["data"]
+    owned = data.get("autorouter_owned", {}) or {}
+    records = owned.get("records", []) or []
+
+    stitching_records = [
+        rec for rec in records
+        if rec.get("kind") == "via" and rec.get("stitching")
+        and _point_in_area(rec.get("x", 0.0), rec.get("y", 0.0), area)
+    ]
+    remove_uuids = {rec["uuid"] for rec in stitching_records}
+
+    removed = 0
+    written = False
+    if write and remove_uuids:
+        _pcb._check_not_locked_by_editor(board_path, allow_while_open)
+        text = _pcb._read_text(board_path)
+        text, removed = _r._delete_blocks_by_uuid(text, remove_uuids)
+        with board_path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        _pcb._invalidate_board_cache(board_path)
+        via_set = set(owned.get("vias", []) or [])
+        owned["vias"] = [u for u in via_set if u not in remove_uuids]
+        owned["records"] = [rec for rec in records if rec["uuid"] not in remove_uuids]
+        _pcb.save_board_local(project_path, data)
+        written = True
+
+    foreign_vias: list[dict[str, Any]] = []
+    if include_foreign:
+        tracks = _pcb._parse_tracks_cached(board_path)
+        owned_via_uuids = set(owned.get("vias", []) or [])
+        project_cfg = _pcb.load_pcb_settings(project_path)["config"]
+        board_path2, project_file, _ = _pcb._resolve_project_path(project_path)
+        existing_netclasses: list[dict[str, Any]] = []
+        if project_file.exists():
+            try:
+                pro_data = json.loads(project_file.read_text(encoding="utf-8"))
+                existing_netclasses = pro_data.get("net_settings", {}).get("classes", [])
+            except (json.JSONDecodeError, OSError):
+                existing_netclasses = []
+        default_via_diameter = next(
+            (float(c["via_diameter"]) for c in existing_netclasses
+             if c.get("name") == "Default" and _pcb._is_number(str(c.get("via_diameter", "")))),
+            None,
+        )
+        for via in tracks["vias"]:
+            if via["uuid"] in owned_via_uuids:
+                continue
+            x, y = via["at"]["x"], via["at"]["y"]
+            if not _point_in_area(x, y, area):
+                continue
+            is_free = via["net"] == ""
+            is_oversized = default_via_diameter is not None and via["size"] > default_via_diameter * 3
+            foreign_vias.append({
+                "uuid": via["uuid"], "net": via["net"], "x": x, "y": y,
+                "size": via["size"], "drill": via["drill"],
+                "free": is_free, "oversized": is_oversized,
+            })
+
+    return {
+        "board_path": str(board_path),
+        "area": area,
+        "write": write,
+        "written": written,
+        "candidates": len(remove_uuids),
+        "removed": removed,
+        "removed_uuids": sorted(remove_uuids),
+        "include_foreign": include_foreign,
+        "foreign_vias": foreign_vias,
+    }

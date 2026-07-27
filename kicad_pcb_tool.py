@@ -4893,6 +4893,12 @@ DEFAULT_PCB_SETTINGS: dict[str, Any] = {
         "min_length_mm": 0.5,
         "max_length_mm": 3.0,
     },
+    "stitching": {
+        "target_spacing_mm": 5.0,
+        "near_high_speed_mm": 1.0,
+        "near_high_speed_pitch_mm": 2.0,
+        "enabled": True,
+    },
     "schematic_checks": {
         "cap_voltage": {
             "derating_min_ratio": 2.0,

@@ -120,6 +120,8 @@ try:
         decide_route,
         get_route_session,
         optimize_board,
+        remove_stitching_vias,
+        run_stitching_pass,
     )
 except Exception as exc:  # pragma: no cover - import safety
     log_message(f"Failed to import KiCad optimizer module: {exc}")
@@ -1467,6 +1469,82 @@ class KiCadMcpServer:
                 },
                 "handler": self._tool_decide_route,
             },
+            "run_kicad_stitching_pass": {
+                "description": (
+                    "Phase 7.5.6 - the plane stitching pass. Run this LAST, once routing and plane "
+                    "creation/moves have converged (after route_kicad_board / optimize_kicad_board), "
+                    "never mid-routing - a stitching via placed early just becomes an obstacle for "
+                    "routing that comes after it. Three ordered steps (skipped entirely, reporting "
+                    "enabled:false, when stitching.enabled is false): (1) island rescue - one via per "
+                    "costed island/orphan audit_kicad_plane_islands already reports, at its own "
+                    "suggested_stitching_via.position; (2) return-path stitching - vias near detect_kicad_"
+                    "critical_nets' routed copper, placed on the same-layer power/ground PLANE at "
+                    "stitching.near_high_speed_pitch_mm spacing within stitching.near_high_speed_mm of "
+                    "the trace, wherever the candidate point actually lands inside that plane's own drawn "
+                    "outline; (3) general stitching - a grid fill of each power/ground plane's outline "
+                    "toward stitching.target_spacing_mm. Every via is autorouter_owned AND tagged "
+                    "stitching:true - distinct from an ordinary routing via, a hand-placed via, and the "
+                    "optimizer's own untagged move-(d) stitching via - so remove_kicad_stitching_vias can "
+                    "target exactly these. write=false (default) previews the full plan (every via's "
+                    "net/zone/layer/position, and for island rescue its projected cost) without touching "
+                    "the board; write=true places every planned via for real. Refill zones + re-run DRC "
+                    "in KiCad afterward, same as every other copper writer here. SESSION CONVENTION "
+                    "(documented, not enforced): before routing or optimizing in an area that already "
+                    "contains stitching vias (owned or foreign), ask the user whether to remove them "
+                    "first via remove_kicad_stitching_vias - removed stitching copper is simply re-placed "
+                    "by the next run of this pass, so nothing is lost by asking."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "write": {"type": "boolean", "default": False},
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_run_stitching_pass,
+            },
+            "remove_kicad_stitching_vias": {
+                "description": (
+                    "Undo for run_kicad_stitching_pass. Deletes ONLY autorouter-owned vias tagged "
+                    "stitching:true in board-local autorouter_owned - never an ordinary routing via, "
+                    "never a hand-placed via, and never the optimize_kicad_board optimizer's own untagged "
+                    "move-(d) stitching via (that one belongs to an optimizer session, not this pass's "
+                    "bookkeeping). area restricts the deletion to a region: a rect {x_min, x_max, y_min, "
+                    "y_max} (any bound omittable) or a polygon {points: [[x, y], ...]}; omit for the whole "
+                    "board. write=false (default) previews the uuids that would be removed without "
+                    "touching the board. include_foreign=true additionally LISTS (never deletes) every "
+                    "OTHER via in the resolved area this tool does not own, using this codebase's existing "
+                    "free/oversized via heuristic (net=='' means an unconnected stitching/mounting via; "
+                    "more than 3x the Default netclass via diameter means oversized) - the same "
+                    "get_kicad_track_inventory characterization, applied here so a real board's already-"
+                    "present freestanding vias (kiln has 3 known free/oversized ones) surface for a human "
+                    "to confirm removal one at a time. This is NOT a full connectivity trace. SESSION "
+                    "CONVENTION (documented, not enforced): before routing or optimizing in an area "
+                    "containing stitching vias (owned or foreign), the calling session should ask the "
+                    "user whether to remove them first - the same kind of contract as route_kicad_nets' "
+                    "allow_hand_copper_ripup opt-in; this tool performs the deletion asked of it, the "
+                    "'ask first' step is the calling session's own responsibility."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "area": {
+                            "type": "object",
+                            "description": (
+                                "Omit for the whole board. Rect: {x_min, x_max, y_min, y_max} (any bound "
+                                "omittable). Polygon: {points: [[x, y], ...]}."
+                            ),
+                        },
+                        "write": {"type": "boolean", "default": False},
+                        "include_foreign": {"type": "boolean", "default": False},
+                        "allow_while_open": {"type": "boolean", "default": False},
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_remove_stitching_vias,
+            },
             "propose_kicad_netclass": {
                 "description": (
                     "Propose a net-class definition from a confirmed net list (a detect_kicad_buses "
@@ -2351,6 +2429,18 @@ class KiCadMcpServer:
             args["decision_id"],
             args["choice"],
             rationale=args.get("rationale"),
+        )
+
+    def _tool_run_stitching_pass(self, args: dict[str, Any]) -> dict[str, Any]:
+        return run_stitching_pass(args["project_path"], write=bool(args.get("write", False)))
+
+    def _tool_remove_stitching_vias(self, args: dict[str, Any]) -> dict[str, Any]:
+        return remove_stitching_vias(
+            args["project_path"],
+            area=args.get("area"),
+            write=bool(args.get("write", False)),
+            include_foreign=bool(args.get("include_foreign", False)),
+            allow_while_open=bool(args.get("allow_while_open", False)),
         )
 
     def _tool_propose_netclass(self, args: dict[str, Any]) -> dict[str, Any]:
