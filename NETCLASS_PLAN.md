@@ -527,15 +527,62 @@ router work):
   whose failure mode actually is grid-resolution-driven) but does not itself
   unblock the current 6 nets** — board score and routed-count unchanged
   (8552.276 / no new copper on the real board).
-  **NOW: the remaining completion gap — the genuinely-enclosed nets** (the 6
-  long inter-module nets, converged with the "genuinely-sealed pads" item:
-  both are the same underlying problem, a pad/net topologically walled in by
-  hand-routed/plane copper with no legal channel at any resolution) **need
-  rip-up of HAND copper, which the router never does today** — accept as a
-  routing-completion ceiling and flag for the user, or scope a deliberate
-  hand-copper-rip-up feature (a materially bigger, riskier capability than
-  the autorouter-copper-only rip-up in item 9 — would need explicit user
-  sign-off given it touches copper the user placed by hand). THEN
+  (11) ✅ **Opt-in hand-copper rip-up — LANDED 2026-07-27 (Sonnet subagent,
+  coordinator-verified, `5f13c53`), per explicit user authorization.**
+  `allow_hand_copper_ripup: bool = False` (per-call argument on `route_nets`/
+  `route_board`, plus CLI `--allow-hand-copper-ripup` and both MCP tool
+  schemas — deliberately NOT a persisted `pcb_settings.json` field, since
+  ripping a human's own routed copper is materially more destructive than
+  the autorouter-copper-only rip-up in item 9, so permission is asked fresh
+  every call, same convention as `write=`). `_Obst` gained `is_pad`/`uuid`;
+  `_is_hand_copper_obstacle` (`kicad_router_tool.py` ~4082) scopes eligibility
+  to hand-routed TRACK/ARC segments and VIAS ONLY — footprint pads, zone
+  fills, and Edge.Cuts are structurally excluded and stay hard blockers
+  regardless of the flag. Both Step-4 rip-up branches (`unreachable_in_window`
+  and `self_check_failed`, ~5700-5830) offer a live `hand_copper_pool` when
+  the flag is set; a ripped piece is removed from the pool immediately
+  (anti-double-rip guard) and recorded in `human_copper_ripped` (uuid, net,
+  kind, layer, geometry) on both the connection record and the top-level
+  result/`summary.human_copper_ripped_count` — the audit trail to review
+  before ever setting `write=true` for real. `write=True` deletes exactly
+  those uuids from the board text via the same `_delete_blocks_by_uuid`
+  surgery `unroute_nets` already uses. A latent correctness gap the flag
+  exposed was fixed in the same landing: the 7.8b speculative pass previously
+  treated every failure as terminal on the reasoning that rip-up only frees
+  autorouter copper it never saw — false once hand copper (already in the
+  base obstacle set) is rippable; now falls through to the serial worklist
+  instead when the flag is on and the pool is non-empty. 7 new tests
+  (`tests/test_hand_copper_ripup.py`) on a synthetic board cover flag-off
+  no-touch, flag-on rip+route, write=True actually removing the board text,
+  pad/zone/edge exclusion, and determinism. 208 passed/7 skipped with the
+  flag off — byte-identical to before this landing (the 7 pre-existing
+  failures below are unrelated board drift, not caused by this feature).
+  **Real-board dry-run audit (`write=False`, git-HEAD committed snapshot):**
+  the board has been hand-routed substantially further since the "6 sealed
+  nets" diagnosis (item 10) was written — only **1** connection is unrouted
+  today, `Net-(U6-BIAS)`, blocked by the `GND_Safty` **zone fill** (not hand
+  track/via copper) — exactly the case this flag correctly still cannot help
+  and honestly reports as still blocked. `human_copper_ripped_count: 0` on
+  the real board today; the feature is real, tested, and working, it simply
+  has nothing left to demonstrate on since the user's own hand-routing closed
+  the rest.
+  **BOARD-DRIFT NOTE (coordinator, 2026-07-27): the golden reference stats
+  (6 zones / 39 missing connections) are now stale.** The user committed
+  `d2f19fc "progress"` mid-session (2026-07-26 23:11) — substantial further
+  hand-routing/re-pouring (6→14 zones, 39→16 missing connections, file
+  112k→130k lines since the `1aa5abe` commit those numbers were pinned to).
+  7 golden tests now fail against current HEAD (`test_kiln_finds_six_known_
+  zones`, `test_kiln_ratsnest_still_39_missing_connections_after_zone_port`,
+  and others downstream of those counts) — confirmed identical on unmodified
+  pre-item-11 code, so this is board drift, not a regression from any of
+  items 9-11. Per the standing rule ("do NOT re-baseline until the user
+  explicitly asks"), the reference stats have NOT been touched — ask the user
+  whether to re-baseline to the new committed board before doing so.
+  **NOW: nothing left in the routing-completion arc** — the one remaining
+  real-board gap (`U6-BIAS` vs. a zone fill) is a structurally different,
+  bigger feature (zone-shape editing, not track/via rip-up) than anything
+  scoped so far; not started, needs explicit scoping if pursued. Otherwise:
+  re-baseline the golden stats (pending user go-ahead, see above), then
   quality/score work vs 8552.276. `benchmark` is the standing gate
   throughout.
 
