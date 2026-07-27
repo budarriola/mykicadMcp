@@ -1142,14 +1142,13 @@ rebuilds its own per-connection window — there is no full-board window, so the
 nearest-node between global/window grids (≤½-cell off when unaligned — fine for
 a soft field).
 
-**Still open in 7.3b (do NOT treat 7.3b as closed):** **plane-aware routing
-(7.5.4)** — plane-net via-drops through pours currently *fail* rather than emit
-DRC-violating copper (needs Phase 7.5 zone model, M4); **7.12 neck-down** (not
-applied); pad escape lands on nearest free node (not direction-aware);
-termination is on the `to` point (not "any same-net copper"); window doubling
-is **capped at 60 mm span / 400k-node budget**, not whole-board (a whole-kiln
-0.2 mm 4-layer raster ~2.3M×4 nodes is infeasible in pure Python — lift with
-numpy/accel, M5).
+**Still open in 7.3b (do NOT treat 7.3b as closed):** (plane-aware routing was
+the other open item here at the time this was written — landed since as 7.5.4,
+see its anchor) **7.12 neck-down** (not applied); pad escape lands on nearest
+free node (not direction-aware); termination is on the `to` point (not "any
+same-net copper"); window doubling is **capped at 60 mm span / 400k-node
+budget**, not whole-board (a whole-kiln 0.2 mm 4-layer raster ~2.3M×4 nodes is
+infeasible in pure Python — lift with numpy/accel, M5).
 
 **Stage 1 LANDED 2026-07-21** (anchor): `kicad_router_tool.py` exists with
 `build_connectivity` (union-find islands per net) + `get_ratsnest` → tool
@@ -2200,15 +2199,15 @@ planned-not-implemented. **Docs sync LANDED 2026-07-23 (Haiku):**
 `audit_kicad_plane_islands` (7.5.2/7.5.3) now have full rows on
 `11-autorouter.md`; README + CLAUDE.md synced to **82 tools / 11 groups**
 (CLAUDE.md gained "route the board" + zone/island Common-Tasks entries).
-**Docs sync LANDED 2026-07-27 (Haiku):** `benchmark_kicad_autoroute` (7.16) and
-`open_kicad_route_viewer` (7.9) now have full rows on `11-autorouter.md`;
-README synced to **84 tools** (CLAUDE.md bump to 87 still owed, see below).
-**Remaining docs debt (as of 2026-07-27, 87 tools):** `propose_kicad_plane`/
-`create_kicad_plane`/`modify_kicad_plane` (7.5.5) have no docs rows yet and
-README/CLAUDE.md now lag at 84 → bump to 87; the `route_kicad_nets`/
-`route_kicad_board` pages get revised as 7.12 neck-down lands (plane-aware
-routing's page already reflects its "partial" status), and future Phase 7
-tools add rows as they land)
+**Docs sync LANDED 2026-07-27 (Haiku, two passes):** `benchmark_kicad_autoroute`
+(7.16), `open_kicad_route_viewer` (7.9), and `propose_kicad_plane`/
+`create_kicad_plane`/`modify_kicad_plane` (7.5.5) now have full rows on
+`11-autorouter.md`; README synced to **87 tools**. **CLAUDE.md tool-count bump
+to 87 still owed** (coordinator has it staged locally in the parent repo but
+does not auto-commit there — needs the user's own commit). **Remaining docs
+debt:** the `route_kicad_nets`/`route_kicad_board` pages get revised as 7.12
+neck-down lands (plane-aware routing's page already reflects its "partial"
+status), and future Phase 7 tools add rows as they land)
 - Extend `docs/mcp-tools/10-netclasses-and-buses.md` (or the autorouter page,
   as fits) as each remaining tool in the summary table above lands (same
   per-tool format).
