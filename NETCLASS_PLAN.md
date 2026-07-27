@@ -165,16 +165,18 @@ For whoever (human or AI) picks this up next:
   The 35 failures are now `unreachable_in_window` (genuine dense-board
   pathfinding), not budget — closing that gap is Opus-class whole-board
   optimization (7.6), not a bounded Sonnet patch. See ⭐ findings.
-- **Next work when resumed (updated 2026-07-27 — 7.12 landed, see its anchor):**
-  (1) **7.5.6 stitching pass** + `remove_kicad_stitching_vias` + its
-  ask-before-routing rule (last in M4) — NOTE its ordering contract ("only
+- **Next work when resumed (updated 2026-07-27 — 7.12 and 7.3d landed, see
+  their anchors):** (1) **7.5.6 stitching pass** + `remove_kicad_stitching_vias`
+  + its ask-before-routing rule (last in M4) — NOTE its ordering contract ("only
   after 7.6's stopping rule fires") gates the automatic placement pass on the
   not-yet-built 7.6 optimizer; `remove_kicad_stitching_vias` itself
   (listing/deleting existing stitching vias) has no such dependency and could
-  land standalone if scoped that way. (2) 7.3b's remaining bits:
-  direction-aware pad escape, whole-board windowing (numpy/accel, M5) — 7.12
-  neck-down is now done; neither of the remaining two depends on 7.6. Still
-  open: M6 item 17 (c) Flow B stack-up-gate question, and 7.14's optimizer
+  land standalone if scoped that way. (2) 7.3b's one remaining bit: lifting
+  the 60mm/400k-node window cap toward whole-board (numpy/accel, M5) — both
+  neck-down and direction-aware pad escape are now done; this is the only
+  item left that doesn't depend on 7.6, and it's a heavier M5/accel
+  undertaking, not a bounded Sonnet patch. Still open: M6 item 17 (c) Flow B
+  stack-up-gate question, and 7.14's optimizer
   pin-swap move + pause-the-user protocol (both wait on 7.6).
 - **Nothing has been committed** in either repo as of this snapshot — review the
   working tree before assuming git history matches this file.
@@ -605,6 +607,22 @@ router work):
   no new MCP tool), 237→243-test suite green, same 7 pre-existing board-drift
   failures. Honest residual: the hierarchical last-resort routing tier is
   deliberately not wired for neck-down (documented in-code and in the anchor).
+  (15) ✅ **Phase 7.3d direction-aware pad escape — LANDED 2026-07-27** (Sonnet
+  subagent, worktree-isolated, merged fast-forward). See its anchor for the
+  full write-up. 87 tools (unchanged), 243→247-test suite green, same 7
+  pre-existing board-drift failures. Deliberately scoped as a new
+  default-`false` setting rather than a plain behavior change, since
+  `nearest_free` is called unconditionally for every routed connection today —
+  flag off is byte-identical parity, proven both by dedicated tests and the
+  unchanged full-suite results. Flipping the default to `true` needs a
+  real-board `benchmark_kicad_autoroute` before/after comparison and the
+  user's sign-off first — not done, tracked as a follow-up.
+  (16) Session housekeeping: also fixed two stale `docs/mcp-tools/
+  11-autorouter.md` claims that had drifted behind the code for a while —
+  rip-up & reroute and plane-aware routing were still documented as "NOT YET
+  IMPLEMENTED" despite landing 2026-07-23/2026-07-24 respectively (Haiku docs
+  pass, coordinator-merged with one mechanical conflict against the
+  concurrent 7.12-mention docs pass — same paragraphs, no logic conflict).
 
 ## How to work this plan (living document — keep it current)
 
@@ -1148,69 +1166,44 @@ rebuilds its own per-connection window — there is no full-board window, so the
 nearest-node between global/window grids (≤½-cell off when unaligned — fine for
 a soft field).
 
-**Still open in 7.3b (do NOT treat 7.3b as closed):** (plane-aware routing and
-7.12 neck-down were the other two open items here at the time this was
-written — both landed since, as 7.5.4 and 7.12, see their anchors) pad escape
-lands on nearest free node (not direction-aware — spec'd as 7.3d below);
-termination is on the `to` point (not "any same-net copper"); window doubling
-is **capped at 60 mm span / 400k-node budget**, not whole-board (a whole-kiln
-0.2 mm 4-layer raster ~2.3M×4 nodes is infeasible in pure Python — lift with
-numpy/accel, M5).
+**Still open in 7.3b (do NOT treat 7.3b as closed):** (plane-aware routing,
+7.12 neck-down, and direction-aware pad escape were the other open items here
+at the time this was written — all landed since, as 7.5.4, 7.12, and 7.3d, see
+their anchors) termination is on the `to` point (not "any same-net copper");
+window doubling is **capped at 60 mm span / 400k-node budget**, not
+whole-board (a whole-kiln 0.2 mm 4-layer raster ~2.3M×4 nodes is infeasible in
+pure Python — lift with numpy/accel, M5).
 
-### 7.3d Direction-aware pad escape (newly spec'd 2026-07-27, not yet implemented)
+### 7.3d — LANDED 2026-07-27 (reference anchor; no work remains here)
 
-**Why this is scoped differently from 7.5.5/7.9/7.12:** those three were pure
-additions gated behind a feature flag/new tool — a caller who never touched
-the new surface got byte-identical behavior "for free," so they were safe to
-default-enable. This one is NOT like that: `_FineWindow.nearest_free`
-(`kicad_router_tool.py` ~line 4186) is called unconditionally for **every**
-connection's start AND goal cell (`s_cell`/`g_cell` in `_route_one`, and again
-per-leg in `_route_hierarchical`) — it is not behind any flag today, so
-changing its tie-break logic changes routing geometry for the whole board,
-not just new cases. **Default this OFF** (`autorouter.pad_escape_direction_
-aware: false` in `pcb_settings.json`) so every currently-passing test (incl.
-exact `length_mm`/geometry assertions and the `benchmark_kicad_autoroute`
-score, which is compared against a fixed human baseline) stays byte-identical
-until explicitly opted into and evaluated — do NOT flip the default to `true`
-without a deliberate before/after `benchmark_kicad_autoroute` comparison and
-the user's sign-off, since unlike 7.12 this can only be judged by whether it
-measurably improves geometry on the real board, not by parity alone.
+Implemented in `kicad_router_tool.py` (Sonnet subagent, worktree-isolated,
+coordinator-reviewed, merged fast-forward). `_FineWindow.nearest_free` gained
+an optional `toward_xy` parameter: when the winning ring has more than one
+free-layer candidate, the tie-break is biased toward the candidate whose
+vector from `(x, y)` has the largest dot product with the direction toward
+`toward_xy` (the connection's other endpoint) instead of pure Euclidean
+distance — "escape toward where you're going," not "escape to the closest
+open spot." Wired into both call sites (`_route_one`'s `s_cell`/`g_cell`,
+`_route_hierarchical`'s per-leg `s_cell`/`g_cell`) via a new picklable
+`ctx["pad_escape_direction_aware"]` bool, gating whether `toward_xy` is passed
+at all. **Strict parity, as specced:** `toward_xy=None` (every call site when
+`autorouter.pad_escape_direction_aware` — new knob, default `false` — is off)
+and any ring with only one free candidate reproduce the exact pre-7.3d code
+path (the `biased` list is `None` and simply never built). 4 tests in
+`tests/test_pad_escape_direction_aware.py`, exercising `nearest_free` directly
+against hand-built `blocked_track` fixtures (isolating the ring-search/
+tie-break logic from obstacle-geometry conversion, which other tests already
+cover): flag off picks the pure-nearest "wrong side" node; flag on picks the
+farther but direction-aligned node instead; a single-candidate ring is
+unaffected by the flag either way; and the no-`toward_xy`-argument call shape
+every real call site uses is pinned. 87 tools (unchanged), full suite
+243→247 passed, same 7 pre-existing board-drift failures, 7 skipped.
 
-**The problem (verified in `nearest_free`, current code):** the ring-search
-picks the grid node in the nearest ring that has any free layer, tie-broken
-by pure Euclidean distance to the exact pad point — it has no notion of which
-direction the path is actually going. On a dense pin field (e.g. an IC's BGA
-or a tight header), the nearest free node can be on the FAR side of the pad
-relative to the connection's other endpoint, forcing the fine A* to route
-back around the pad body/neighboring pins to reach it — this is the
-mechanism behind the residual "termination is on the `to` point" note and the
-pad-escape-related zigzag findings from the 2026-07-24 real-board session
-(see the ⭐ findings section above).
-
-**Design, gated by the new flag:** when `pad_escape_direction_aware` is true,
-`nearest_free` (or a new sibling function `nearest_free_toward`, called only
-from the two call sites above and passed the OTHER endpoint's xy) breaks ties
-within the same ring by preferring the candidate whose vector from `(x, y)`
-has the largest dot product with the direction toward the other endpoint
-(`to_xy` for the start cell, `from_xy` for the goal cell) — i.e. "escape
-toward where you're going," not just "escape to the closest open spot."
-When there is only one free candidate in the minimal ring (the common case
-on an uncongested board), behavior is unchanged regardless of the flag — the
-bias only matters when the minimal ring offers a real choice.
-
-**Testing requirement:** a synthetic dense-pin-field fixture (several tightly
-packed pads on one side of the target pad, an open ring on the other) proving
-that with the flag OFF, `nearest_free` picks the pure-nearest node (possibly
-on the wrong side), and with it ON, it picks the direction-biased node instead
-— plus the mandatory parity test: flag OFF must reproduce today's exact
-`nearest_free` output on every existing fixture that already has tests
-covering it (do not regress the existing `_FineWindow`/pad-escape test
-coverage). A real-board measurement is NOT required to land the flag (it's
-off by default) but IS required before ever flipping the default — track that
-as a follow-up, not part of this landing.
-
-Knob: `autorouter.pad_escape_direction_aware: false` (new, added to
-`DEFAULT_PCB_SETTINGS`).
+**Still open, by design:** the flag remains `false` — flipping the DEFAULT to
+`true` requires a deliberate before/after `benchmark_kicad_autoroute`
+comparison on the real board plus the user's sign-off (this cannot be judged
+by parity alone, unlike 7.12), and has not been done. Track that as a
+follow-up if/when pursued.
 
 **Stage 1 LANDED 2026-07-21** (anchor): `kicad_router_tool.py` exists with
 `build_connectivity` (union-find islands per net) + `get_ratsnest` → tool
@@ -2449,12 +2442,14 @@ landed 2026-07-21 — see their anchors; remaining:):
     registered, integer milli-cost quantization done. **Step 4 rip-up & reroute
     LANDED 2026-07-23** (negotiated congestion, owner-tagged obstacles,
     incremental window clears, deterministic, human copper never ripped — see
-    the stage-2 anchor). 7.12 neck-down landed 2026-07-27 (see its anchor).
-    **Remaining to close 7.3b:** direction-aware pad escape, "any same-net
-    copper" termination, and lifting the 60 mm / 400k-node window cap toward
-    whole-board (needs the memory planner + numpy/multi-core waves — those slip
-    to M5's accel work; the cpu tier remains the reference everything else must
-    match). Plane-aware via-drops through pours landed as 7.5.4 (see its anchor).
+    the stage-2 anchor). 7.12 neck-down and 7.3d direction-aware pad escape
+    both landed 2026-07-27 (see their anchors; 7.3d's default stays `false`
+    pending a real-board benchmark comparison + sign-off before ever flipping
+    it). **Remaining to close 7.3b:** "any same-net copper" termination, and
+    lifting the 60 mm / 400k-node window cap toward whole-board (needs the
+    memory planner + numpy/multi-core waves — those slip to M5's accel work;
+    the cpu tier remains the reference everything else must match).
+    Plane-aware via-drops through pours landed as 7.5.4 (see its anchor).
 11h. **[HEADLINE] Phase 7.17 minimal `route_board` — LANDED 2026-07-23** (see
     the 7.17 anchor): the one-command router (MCP tool `route_kicad_board` +
     `python kicad_router_tool.py route <project>` CLI), a thin orchestrator over
