@@ -448,6 +448,24 @@ router work):
   pass runs for ALL worker counts incl. 1 (so `workers` is a pure execution
   detail, not an algorithm switch — an earlier draft that gated it behind
   `workers>1` produced non-identical geometry and was caught/fixed).
+  (8) ✅ **Window-build rasterization cache — LANDED 2026-07-24 (Sonnet subagent,
+  coordinator-verified).** Profiling the parallel run showed `_FineWindow.build`
+  → `obstacle_cells` was ~38% of per-connection time (re-rasterizing board-
+  spanning plane fills on EVERY `_route_attempts` ladder rung). Now
+  `_prefilter_window_obstacles` filters obstacles to the connection's max-margin
+  window bound ONCE, and `_build_zone_edge_cache` builds each zone's
+  `_ZoneEdgeGrid`/clipped edges once per connection (reused across rungs). Both
+  proven byte-identical (safe because the bound is a superset of every rung's
+  window/reach). Build cumtime −12% on the 6-net sample; 205-test suite green.
+  **Test-infra note (coordinator, 2026-07-24):** the kiln GOLDEN tests now run
+  against a git-HEAD **committed board snapshot** (`tests/conftest.py`
+  `kiln_project_path`, CRLF-normalized), NOT the live working-tree board — the
+  user edits `kiln.kicad_pcb` in KiCad continuously, which drifts the 6-zone/
+  39-missing invariants; pinning to the committed board keeps the golden tests
+  stable without regenerating ref stats (do NOT regenerate until the user asks;
+  `KILN_USE_LIVE_BOARD=1` overrides). LATENT BUG FOUND (not fixed, out of scope):
+  `unroute_nets` corrupts an **LF**-line-ending board (unbalanced parens) — never
+  triggers from KiCad's CRLF output, but worth a line-ending-agnostic fix someday.
   **NOW (6): the remaining completion gaps, in
   descending value:** (a) **rip-up demotion for `self_check_failed`** (6 nets — a
   plane-via route is found but skims real copper; demote to the rip-up loop
