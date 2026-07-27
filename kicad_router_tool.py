@@ -3142,17 +3142,29 @@ class _Obst:
 
     __slots__ = ("kind", "net", "layers", "half", "x1", "y1", "x2", "y2",
                  "raster", "pts", "minx", "miny", "maxx", "maxy", "is_edge", "owner",
-                 "via_transparent")
+                 "via_transparent", "is_pad", "uuid")
 
     def __init__(self, kind: str, net: str, layers: frozenset[str], half: float,
                  x1: float, y1: float, x2: float, y2: float,
                  raster: "_FillRaster | None" = None, is_edge: bool = False,
                  pts: list[tuple[float, float]] | None = None,
-                 owner: int | None = None, via_transparent: bool = False) -> None:
+                 owner: int | None = None, via_transparent: bool = False,
+                 is_pad: bool = False, uuid: str = "") -> None:
         self.kind = kind      # "seg" | "pt" | "zone" | "edge"
         self.net = net
         self.layers = layers
         self.half = half
+        # is_pad: True only for a footprint-pad "pt" obstacle (as opposed to a
+        # via, which is also kind "pt"). Needed to keep pads OUT of the
+        # hand-copper rip-up scope (a pad is a component pin, not routed
+        # copper - see `_is_hand_copper_obstacle`). uuid: the board-file
+        # `(uuid ...)` of the underlying (segment)/(arc)/(via) block, when
+        # known - lets a rippable hand-copper obstacle be identified back to
+        # its exact board block for `_delete_blocks_by_uuid` removal. Empty
+        # for zone/edge/pad obstacles and for autorouter-emitted obstacles
+        # (those are ripped by owner id, not uuid; see `_obstacles_from_emit`).
+        self.is_pad = is_pad
+        self.uuid = uuid
         # via_transparent: a foreign POWER/GND plane fill yields an ANTI-PAD around
         # a via that crosses it, so it does NOT block a via by itself (it still
         # blocks a same-layer TRACK). Set only for power/gnd zone fills - the
@@ -3304,14 +3316,15 @@ def _collect_obstacles(board_path: Path, routable: set[str], all_cu: list[str],
         if seg["layer"] not in routable:
             continue
         obs.append(_Obst("seg", seg["net"], frozenset([seg["layer"]]), seg["width"] / 2.0,
-                         seg["start"]["x"], seg["start"]["y"], seg["end"]["x"], seg["end"]["y"]))
+                         seg["start"]["x"], seg["start"]["y"], seg["end"]["x"], seg["end"]["y"],
+                         uuid=seg.get("uuid", "")))
     for via in tracks["vias"]:
         at = via["at"]
         layers = _via_layer_set(via, stack, all_cu)
         layers = frozenset(l for l in layers if l in routable) or frozenset(
             l for l in via.get("layers", []) if l in routable)
         obs.append(_Obst("pt", via["net"], layers, via.get("size", 0.6) / 2.0,
-                         at["x"], at["y"], at["x"], at["y"]))
+                         at["x"], at["y"], at["x"], at["y"], uuid=via.get("uuid", "")))
     for fp in footprints.values():
         for pad in fp["pads"]:
             layers = frozenset(l for l in _pad_layer_set(pad, all_cu) if l in routable)
@@ -3319,7 +3332,7 @@ def _collect_obstacles(board_path: Path, routable: set[str], all_cu: list[str],
                 continue
             pos = pad["position"]
             obs.append(_Obst("pt", pad.get("net", ""), layers, _pad_reach(pad),
-                             pos["x"], pos["y"], pos["x"], pos["y"]))
+                             pos["x"], pos["y"], pos["x"], pos["y"], is_pad=True))
     for net_name, fill_list in fills.items():
         is_plane = _pcb._net_kind(net_name, None, power_patterns) == "power"
         for zf in fill_list:
@@ -4066,6 +4079,18 @@ def _dedup(pts: list[tuple[float, float]]) -> list[tuple[float, float]]:
 # Self-check (Python clearance pass before any write)
 # --------------------------------------------------------------------------- #
 
+def _is_hand_copper_obstacle(ob: "_Obst") -> bool:
+    """True for an obstacle that is human-placed, ripup-eligible copper: a
+    hand-routed track/arc segment or via (owner is None - never autorouter-
+    placed) with a known board uuid. Explicitly EXCLUDES footprint pads
+    (`is_pad`), zone fills (`kind == "zone"`), and Edge.Cuts (`kind ==
+    "edge"`) - those are never rip-up candidates even with
+    `allow_hand_copper_ripup=True` (see `route_nets` docstring / NETCLASS_PLAN
+    item 10 scoping notes)."""
+    return (ob.owner is None and ob.kind in ("seg", "pt") and not ob.is_pad
+            and not ob.is_edge and bool(ob.uuid))
+
+
 def _self_check(
     net: str, segments: list[dict[str, Any]], vias: list[dict[str, Any]],
     obstacles: list["_Obst"], rules: dict[str, Any], via_radius: float,
@@ -4097,7 +4122,10 @@ def _self_check(
             if ob.seg_within(s["x1"], s["y1"], s["x2"], s["y2"], need):
                 violations.append({"kind": "segment", "layer": s["layer"],
                                    "against_net": ob.net, "against_kind": ob.kind,
-                                   "required_mm": round(need, 4), "owner": ob.owner})
+                                   "required_mm": round(need, 4), "owner": ob.owner,
+                                   "against_is_pad": ob.is_pad,
+                                   "obstacle_uuid": ob.uuid,
+                                   "hand_copper": _is_hand_copper_obstacle(ob)})
         if ob.via_transparent:
             # a power/gnd plane yields an anti-pad to a crossing via - the plane
             # copper is cut back around the via on KiCad refill, so a via is NOT a
@@ -4111,7 +4139,10 @@ def _self_check(
             if ob.point_within(v["x"], v["y"], need):
                 violations.append({"kind": "via", "against_net": ob.net,
                                    "against_kind": ob.kind, "required_mm": round(need, 4),
-                                   "owner": ob.owner})
+                                   "owner": ob.owner,
+                                   "against_is_pad": ob.is_pad,
+                                   "obstacle_uuid": ob.uuid,
+                                   "hand_copper": _is_hand_copper_obstacle(ob)})
     return violations
 
 
@@ -5188,6 +5219,7 @@ def route_nets(
     allow_while_open: bool = False,
     max_ripup_iterations: int | None = None,
     refill_zones: bool = False,
+    allow_hand_copper_ripup: bool = False,
 ) -> dict[str, Any]:
     """Phase 7.3b detailed (fine, windowed) routing.
 
@@ -5242,6 +5274,34 @@ def route_nets(
     a given input routes identically run to run. The result reports
     `ripup_active: true` plus per-run rip-up stats (`ripup_iterations`,
     `connections_ripped`, `congestion_escalations`).
+
+    `allow_hand_copper_ripup` (default False - NETCLASS_PLAN item 10): when
+    True, the SAME two Step-4 branches above ALSO consider owner-is-None
+    obstacles rippable, IF AND ONLY IF they are hand-routed TRACK/ARC
+    segments or VIAS (`_is_hand_copper_obstacle` - never a footprint pad,
+    never a zone fill, never Edge.Cuts; those stay hard blockers exactly as
+    today regardless of this flag). This is a PER-CALL argument, not a
+    persisted `pcb_settings.json` field - deliberately: ripping a human's own
+    routed copper is a materially more destructive action than ripping the
+    autorouter's own prior placements (the everyday case Step 4 already
+    handles), so "explicit permission" is asked fresh on every invocation
+    that wants it, the same way `write=True` is never inherited from a
+    settings file either. Default False means every existing caller/test that
+    does not pass this flag gets byte-identical behavior to before this
+    feature landed - human copper is NEVER touched. Each hand-copper piece
+    that gets ripped is reported once, with its board uuid/net/kind/layer/
+    geometry, in `human_copper_ripped` on both the owning connection's record
+    and the top-level result (and `summary.human_copper_ripped_count`) - the
+    audit trail a caller MUST review before ever trusting `write=True` against
+    a real board. A ripped hand-copper obstacle is removed from the shared
+    obstacle pool the moment it is ripped, so it can never be ripped a second
+    time in the same run (the natural anti-thrash/determinism guard for
+    unowned copper, which - unlike an autorouter connection id - has no
+    "net that displaced it" to protect against re-ripping). write=True
+    additionally deletes the exact ripped (segment)/(via) blocks from the
+    board text via the same uuid-block-delete surgery `unroute_nets` already
+    uses for autorouter-owned copper, so the write stays DRC-consistent with
+    what was reported.
 
     Still simplified vs. the full spec (documented honestly): pad escape lands
     on the nearest free grid node rather than a pad-direction-aware exact stub;
@@ -5470,6 +5530,46 @@ def route_nets(
     ripup_iterations = 0
     connections_ripped = 0
     congestion_escalations = 0
+    # allow_hand_copper_ripup bookkeeping (default-off feature; see docstring).
+    # `hand_copper_pool` is the live set of still-rippable hand-copper _Obst
+    # objects, keyed by board uuid - it starts as every eligible obstacle and
+    # SHRINKS as pieces get ripped, which is what guarantees a given piece can
+    # never be ripped twice in one run (no uuid stays in the pool after its
+    # first rip). `human_copper_ripped` accumulates the audit-trail record for
+    # every piece actually ripped this run, in rip order.
+    hand_copper_pool: dict[str, _Obst] = {}
+    if allow_hand_copper_ripup:
+        hand_copper_pool = {ob.uuid: ob for ob in obstacles if _is_hand_copper_obstacle(ob)}
+    human_copper_ripped: list[dict[str, Any]] = []
+
+    def _hand_copper_record(ob: "_Obst", ripped_for_net: str) -> dict[str, Any]:
+        return {
+            "uuid": ob.uuid,
+            "net": ob.net,
+            "kind": "via" if ob.kind == "pt" else "segment",
+            "layers": sorted(ob.layers),
+            "x1": round(ob.x1, 4), "y1": round(ob.y1, 4),
+            "x2": round(ob.x2, 4), "y2": round(ob.y2, 4),
+            "ripped_for_net": ripped_for_net,
+        }
+
+    def _commit_hand_copper_rip(uuids: set[str], ripped_for_net: str) -> list[dict[str, Any]]:
+        """Remove each ripped hand-copper piece from BOTH the shared board-wide
+        `obstacles` list (so later connections in this run see it as gone,
+        exactly like a written change would be) and `hand_copper_pool` (so it
+        cannot be selected again - the anti-double-rip guard). Returns the
+        audit records, in canonical (sorted uuid) order for determinism."""
+        recs: list[dict[str, Any]] = []
+        for uid in sorted(uuids):
+            ob = hand_copper_pool.pop(uid, None)
+            if ob is None:
+                continue
+            try:
+                obstacles.remove(ob)
+            except ValueError:
+                pass
+            recs.append(_hand_copper_record(ob, ripped_for_net))
+        return recs
 
     def active_obstacles_for(owner: int) -> list[_Obst]:
         act = list(obstacles)
@@ -5558,7 +5658,21 @@ def route_nets(
         if res is None:
             continue
         if not res["routed"]:
-            failures[owner] = res["rec"]
+            # allow_hand_copper_ripup exception to the "speculative failure is
+            # terminal" rule (see the big comment above this loop): that rule's
+            # argument is "rip-up only removes AUTOROUTER-PLACED copper, which
+            # the speculative pass never saw in the first place" - true when
+            # hand copper is never rippable, but WRONG once it can be: the
+            # speculative pass runs against the BASE obstacle set, which DOES
+            # include hand copper, and hand-copper rip-up (Step 4) can free
+            # exactly that. So when the flag is on and there is still
+            # something in the hand-copper pool to try, don't finalize this as
+            # a terminal failure - fall through to `pending` instead, where
+            # the serial worklist re-searches for real and Step 4 gets its
+            # normal chance. (When the flag is off, or the pool is already
+            # empty, this is a no-op and behavior is unchanged.)
+            if not (allow_hand_copper_ripup and hand_copper_pool):
+                failures[owner] = res["rec"]
             continue
         violations = _self_check(res["net"], res["segments"], res["vias"],
                                  active_obstacles_for(owner), rules, via_radius)
@@ -5584,15 +5698,24 @@ def route_nets(
         reason = failure.get("reason")
         did_rip = False
         if (reason == "unreachable_in_window" and core["win"] is not None
-                and placements and ripup_iterations < max_ripup_iterations):
+                and (placements or (allow_hand_copper_ripup and hand_copper_pool))
+                and ripup_iterations < max_ripup_iterations):
             win = core["win"]
             # Anti-thrash: a net does not rip the net that just displaced it.
             protect = {displaced_by[owner]} if owner in displaced_by else set()
             rippable = [ob for oid, pl in placements.items() if oid not in protect
                         for ob in pl["obstacles"]]
-            # Incrementally clear the rippable autorouter copper from THIS window
-            # (no full rebuild) and re-search.
+            # allow_hand_copper_ripup (default off): the whole still-rippable
+            # hand-copper pool is also offered to this window - geometry-gated
+            # exactly like every other obstacle (`obstacle_cells`/`remove_
+            # obstacle` bbox-reject anything far outside the window), so this
+            # is cheap even though the pool is board-wide.
+            hand_candidates: list[_Obst] = list(hand_copper_pool.values()) if allow_hand_copper_ripup else []
+            # Incrementally clear the rippable autorouter copper (+ hand copper,
+            # when enabled) from THIS window (no full rebuild) and re-search.
             for ob in rippable:
+                win.remove_obstacle(ob)
+            for ob in hand_candidates:
                 win.remove_obstacle(ob)
             win_cong = _project_congestion(win, congestion, board_min[0], board_min[1], grid)
             free_path = _fine_search(backend, win, core["net_kind"], weights, layer_purpose, directions,
@@ -5608,10 +5731,16 @@ def route_nets(
                         continue
                     if any(_obstacle_on_path(win, ob, free_path, via_nodes) for ob in pl["obstacles"]):
                         blockers.add(oid)
-                if blockers:
+                hand_blocker_objs: set[_Obst] = set()
+                if hand_candidates:
+                    for ob in hand_candidates:
+                        if _obstacle_on_path(win, ob, free_path, via_nodes):
+                            hand_blocker_objs.add(ob)
+                if blockers or hand_blocker_objs:
                     # Place THIS connection on the freed path; self-check against
-                    # human copper + the placements we are KEEPING (non-blockers).
-                    keep_obs = list(obstacles)
+                    # human copper + the placements we are KEEPING (non-blockers),
+                    # minus any hand-copper obstacle(s) being ripped.
+                    keep_obs = [ob for ob in obstacles if ob not in hand_blocker_objs]
                     for oid, pl in placements.items():
                         if oid not in blockers:
                             keep_obs.extend(pl["obstacles"])
@@ -5631,13 +5760,19 @@ def route_nets(
                         rec = dict(core["rec"])
                         rec.update(rec_updates)
                         rec["ripped_to_place"] = sorted(blockers)
+                        if hand_blocker_objs:
+                            hand_recs = _commit_hand_copper_rip(
+                                {ob.uuid for ob in hand_blocker_objs}, core["net"])
+                            human_copper_ripped.extend(hand_recs)
+                            rec["human_copper_ripped"] = hand_recs
                         _place(owner, core["net"], segments, vias, rec)
                         # re-queue the ripped connections (canonical order).
                         pending = deque(sorted(set(pending) | blockers))
                         did_rip = True
 
         elif (reason == "self_check_failed" and core.get("path") is not None
-                and core["win"] is not None and placements
+                and core["win"] is not None
+                and (placements or (allow_hand_copper_ripup and core.get("violations")))
                 and ripup_iterations < max_ripup_iterations):
             # A path was FOUND (it cleared the A* obstacle model) but the exact
             # `_finalize_core` self-check rejected it - a plane-skim. Unlike the
@@ -5648,15 +5783,26 @@ def route_nets(
             # RIPPABLE violation (owner is not None) and re-finalize the SAME
             # path against the reduced obstacle set. A violation with
             # `owner is None` (filled zone/plane, pad, edge, hand copper) can
-            # never be freed this way, so its owning net is left out of
-            # `blockers` - if every violation is against such copper, `blockers`
-            # is empty and this connection correctly stays a hard failure below.
+            # never be freed this way UNLESS `allow_hand_copper_ripup` is set
+            # AND the violation is specifically against hand-routed track/via
+            # copper (`v["hand_copper"]` - see `_is_hand_copper_obstacle`; a
+            # violation against a pad, zone, or edge is never eligible even
+            # then) - if every violation is against non-rippable copper,
+            # `blockers`/`hand_blockers` are both empty and this connection
+            # correctly stays a hard failure below.
             win = core["win"]
             protect = {displaced_by[owner]} if owner in displaced_by else set()
-            blockers = {v["owner"] for v in (core.get("violations") or [])
+            all_violations = core.get("violations") or []
+            blockers = {v["owner"] for v in all_violations
                        if v.get("owner") is not None} - protect
-            if blockers:
-                keep_obs = list(obstacles)
+            hand_blockers: set[str] = set()
+            if allow_hand_copper_ripup:
+                hand_blockers = {v["obstacle_uuid"] for v in all_violations
+                                 if v.get("hand_copper") and v.get("obstacle_uuid")
+                                 and v["obstacle_uuid"] in hand_copper_pool}
+            if blockers or hand_blockers:
+                hand_blocker_objs = {hand_copper_pool[uid] for uid in hand_blockers}
+                keep_obs = [ob for ob in obstacles if ob not in hand_blocker_objs]
                 for oid, pl in placements.items():
                     if oid not in blockers:
                         keep_obs.extend(pl["obstacles"])
@@ -5676,6 +5822,10 @@ def route_nets(
                     rec = dict(core["rec"])
                     rec.update(rec_updates)
                     rec["ripped_to_place"] = sorted(blockers)
+                    if hand_blockers:
+                        hand_recs = _commit_hand_copper_rip(hand_blockers, core["net"])
+                        human_copper_ripped.extend(hand_recs)
+                        rec["human_copper_ripped"] = hand_recs
                     _place(owner, core["net"], segments, vias, rec)
                     # re-queue the ripped connections (canonical order).
                     pending = deque(sorted(set(pending) | blockers))
@@ -5704,7 +5854,8 @@ def route_nets(
     # ---- emit (write) -------------------------------------------------------
     written = False
     owned_added = {"segments": [], "vias": []}
-    if write and (emit_segments or emit_vias):
+    hand_copper_removed = 0
+    if write and (emit_segments or emit_vias or human_copper_ripped):
         _pcb._check_not_locked_by_editor(board_path, allow_while_open)
         blocks: list[str] = []
         records: list[dict[str, Any]] = []
@@ -5722,6 +5873,15 @@ def route_nets(
             owned_added["vias"].append(uid)
         text = _pcb._read_text(board_path)
         newline = _pcb._detect_newline(text)
+        # allow_hand_copper_ripup write path: physically remove every ripped
+        # hand-copper (segment)/(via) block from the board TEXT, same uuid-
+        # block-delete surgery `unroute_nets` uses for autorouter-owned copper
+        # (`_delete_blocks_by_uuid`) - so a write stays DRC-consistent with
+        # what was reported. No-op (0 uuids) when the flag was off or nothing
+        # was ripped.
+        if human_copper_ripped:
+            hand_uuids = {r["uuid"] for r in human_copper_ripped}
+            text, hand_copper_removed = _delete_blocks_by_uuid(text, hand_uuids)
         for block in blocks:
             text = _pcb._append_top_level_block(text, block)
         with board_path.open("w", encoding="utf-8", newline="") as handle:
@@ -5758,12 +5918,23 @@ def route_nets(
         "rules": rules,
         "max_ripup_iterations": max_ripup_iterations,
         "ripup_active": True,
+        "allow_hand_copper_ripup": allow_hand_copper_ripup,
         "ripup": {
             "iterations": ripup_iterations,
             "connections_ripped": connections_ripped,
             "congestion_escalations": congestion_escalations,
             "max_ripup_iterations": max_ripup_iterations,
         },
+        # The human-copper audit trail (NETCLASS_PLAN item 10): empty unless
+        # `allow_hand_copper_ripup=True` AND a hand-routed track/via was
+        # actually ripped to complete a route. `write=False` (default) reports
+        # what WOULD be removed without touching the board; `write=True`
+        # additionally deletes exactly these uuids from the board text (see
+        # `hand_copper_removed` below, which counts the blocks that were
+        # actually found and deleted - it can be < len(human_copper_ripped)
+        # only if the board text changed out from under this call, same
+        # honesty convention as `unroute_nets`'s `removed` vs `candidates`).
+        "human_copper_ripped": human_copper_ripped,
         "connections": out_conns,
         "summary": {
             "total_connections": len(out_conns),
@@ -5775,6 +5946,8 @@ def route_nets(
             "ripup_iterations": ripup_iterations,
             "connections_ripped": connections_ripped,
             "congestion_escalations": congestion_escalations,
+            "human_copper_ripped_count": len(human_copper_ripped),
+            "human_copper_removed_from_board": hand_copper_removed,
         },
     }
 
@@ -5869,6 +6042,7 @@ def route_board(
     write: bool = False,
     effort: str = "balanced",
     allow_while_open: bool = False,
+    allow_hand_copper_ripup: bool = False,
 ) -> dict[str, Any]:
     """Phase 7.17 - the ONE command to route the board (CLI + MCP).
 
@@ -5894,6 +6068,10 @@ def route_board(
 
     `write=False` (default) previews without touching the board; `write=True` is
     the explicit apply. Reversible with `unroute_nets` / `unroute_kicad_nets`.
+
+    `allow_hand_copper_ripup` (default False) is passed straight through to
+    `route_nets` - see its docstring. Left off, this call is byte-identical to
+    before the flag existed: human-placed copper is never a rip-up candidate.
     """
     effort = (effort or "balanced").lower()
     if effort not in _EFFORT_RIPUP:
@@ -5913,6 +6091,7 @@ def route_board(
         write=write,
         allow_while_open=allow_while_open,
         max_ripup_iterations=max_ripup,
+        allow_hand_copper_ripup=allow_hand_copper_ripup,
     )
     d_summary = detailed.get("summary", {})
 
@@ -5930,6 +6109,8 @@ def route_board(
         "total_routed_length_mm": d_summary.get("total_length_mm", 0.0),
         "vias_emitted": d_summary.get("vias_emitted", 0),
         "ripup": detailed.get("ripup", {}),
+        "allow_hand_copper_ripup": allow_hand_copper_ripup,
+        "human_copper_ripped": detailed.get("human_copper_ripped", []),
         "connections": detailed.get("connections", []),
         "detailed_result": detailed,   # full route_nets result for callers who want it
         "pipeline": {
@@ -6348,6 +6529,12 @@ def _cli_print_route_report(report: dict[str, Any]) -> None:
         print(f"  rip-up: iterations={rip.get('iterations')} "
               f"ripped={rip.get('connections_ripped')} "
               f"escalations={rip.get('congestion_escalations')}")
+    hand_ripped = report.get("human_copper_ripped") or []
+    if hand_ripped:
+        print(f"  HAND COPPER RIPPED ({len(hand_ripped)}, allow_hand_copper_ripup=True):")
+        for r in hand_ripped:
+            print(f"    - {r['kind']} uuid={r['uuid']} net={r['net']} "
+                  f"layers={r['layers']} for net={r['ripped_for_net']}")
     for c in report.get("connections", []):
         if c.get("routed"):
             print(f"    [OK]   {c['net']}: {c.get('length_mm')} mm, "
@@ -6380,6 +6567,10 @@ def main(argv: list[str] | None = None) -> int:
     p_route.add_argument("--effort", choices=sorted(_EFFORT_RIPUP), default="balanced")
     p_route.add_argument("--allow-while-open", action="store_true",
                          help="route even if the board looks open in an editor")
+    p_route.add_argument("--allow-hand-copper-ripup", action="store_true",
+                         help="opt in (default off) to letting rip-up remove hand-routed "
+                              "track/via copper (never pads/zones/edges) when it is the "
+                              "blocker; reported in the report's human_copper_ripped list")
     p_route.add_argument("--json", action="store_true", help="print the raw JSON report")
 
     p_unroute = sub.add_parser("unroute", help="delete autorouter-owned copper (undo)")
@@ -6397,6 +6588,7 @@ def main(argv: list[str] | None = None) -> int:
             write=args.write,
             effort=args.effort,
             allow_while_open=args.allow_while_open,
+            allow_hand_copper_ripup=args.allow_hand_copper_ripup,
         )
         if args.json:
             print(json.dumps(report, indent=2))

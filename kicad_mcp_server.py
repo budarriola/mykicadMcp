@@ -1041,7 +1041,13 @@ class KiCadMcpServer:
                     "optimization (7.6), and stitching (7.5.6) are declared TODO pipeline hooks (M4), not yet "
                     "wired - the report's `pipeline` block says so; the signature will not change when they "
                     "land. write=false (default) previews without touching the board; reversible via "
-                    "unroute_kicad_nets."
+                    "unroute_kicad_nets. allow_hand_copper_ripup (default false) opts in to letting "
+                    "rip-up remove hand-routed track/via copper (never footprint pads, zone fills, or "
+                    "Edge.Cuts) when it is the actual blocker - a per-call opt-in, not a persisted "
+                    "setting, since it is materially more destructive than ripping the autorouter's own "
+                    "prior placements (the default behavior). Every piece ripped is reported in "
+                    "human_copper_ripped (uuid/net/kind/layer/geometry) - review that BEFORE trusting "
+                    "write=true."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -1059,6 +1065,16 @@ class KiCadMcpServer:
                             "default": "balanced",
                         },
                         "allow_while_open": {"type": "boolean", "default": False},
+                        "allow_hand_copper_ripup": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": (
+                                "Opt in (per-call, default off) to letting rip-up remove hand-routed "
+                                "track/via copper when it is the blocker. Never removes pads, zone "
+                                "fills, or Edge.Cuts even when true. See human_copper_ripped in the "
+                                "report for exactly what was/would be removed."
+                            ),
+                        },
                     },
                     "required": ["project_path"],
                 },
@@ -1093,6 +1109,16 @@ class KiCadMcpServer:
                         "write": {"type": "boolean", "default": False},
                         "allow_while_open": {"type": "boolean", "default": False},
                         "max_ripup_iterations": {"type": "integer"},
+                        "allow_hand_copper_ripup": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": (
+                                "Opt in (per-call, default off) to letting rip-up remove hand-routed "
+                                "track/via copper (never pads/zone fills/Edge.Cuts) when it is the "
+                                "blocker. See the result's human_copper_ripped list for exactly what "
+                                "was/would be removed."
+                            ),
+                        },
                     },
                     "required": ["project_path"],
                 },
@@ -1961,6 +1987,7 @@ class KiCadMcpServer:
             write=bool(args.get("write", False)),
             effort=str(args.get("effort", "balanced")),
             allow_while_open=bool(args.get("allow_while_open", False)),
+            allow_hand_copper_ripup=bool(args.get("allow_hand_copper_ripup", False)),
         )
 
     def _tool_route_nets(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -1972,6 +1999,7 @@ class KiCadMcpServer:
             write=bool(args.get("write", False)),
             allow_while_open=bool(args.get("allow_while_open", False)),
             max_ripup_iterations=int(mri) if mri is not None else None,
+            allow_hand_copper_ripup=bool(args.get("allow_hand_copper_ripup", False)),
         )
 
     def _tool_unroute_nets(self, args: dict[str, Any]) -> dict[str, Any]:
