@@ -284,6 +284,13 @@ net's actual routed dominant values (`get_kicad_net_track_widths`).
 
 Reports per-net mismatches, e.g. `"net is in class SPI (0.2 mm) but routed at 0.3 mm."` Read-only.
 
+**Phase 7.12 neck-down awareness:** Every segment narrower than its class's `track_width` is
+evaluated individually to see if it qualifies as a legitimate neck (narrowed to fit a pad, within
+configured length bounds, terminating on that pad). If all off-class-width segments pass this check,
+the track_width mismatch is suppressed and the result row reports `neck_segments` (the count of
+accepted necks) instead of flagging the net. A segment that is merely narrow but does not meet the
+neck geometry still fails the check, so the mismatch is flagged exactly as before.
+
 **Args:** `project_path`
 
 **Example output:**
