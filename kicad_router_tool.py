@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid as _uuid
@@ -5211,6 +5212,195 @@ def _feasibility_screen(ctx: dict[str, Any], conn: dict[str, Any],
     return node_cap
 
 
+# =========================================================================== #
+# Phase 7.9 - live progress viewer: JSONL event stream + cancel-flag support.
+#
+# Companion stream to `<board>.board_local.json`, same "disposable, machine-
+# local, gitignored" contract: `<board_stem>.route_progress.jsonl` next to the
+# board file. Append-only while `route_nets`/`route_board` run; TRUNCATED at
+# the start of each call (never accumulates across runs, so a stale file from
+# a previous session can't be misread as live). A separate process
+# (`kicad_route_viewer.py`) tails this file - the router never talks to the
+# viewer directly, it only ever appends here. See NETCLASS_PLAN.md Phase 7.9.
+#
+# `_load_kicad_layer_colors` lives in `kicad_route_viewer.py` (so the color-
+# resolution logic is testable/importable without pulling in tkinter) but is
+# ALSO needed here to bake the resolved palette into the header event (the
+# viewer stays a dumb renderer - no KiCad-config knowledge in the GUI
+# process, and a recorded event file replays with the colors it was recorded
+# with). Imported defensively: a broken/missing viewer module must never take
+# down routing, only progress coloring.
+try:
+    from kicad_route_viewer import _load_kicad_layer_colors as _viewer_load_colors
+except Exception:
+    def _viewer_load_colors(color_theme: str = "auto") -> dict[str, Any]:
+        return {}
+
+
+def _tk_available() -> bool:
+    """Whether this Python environment can import tkinter at all (headless CI/
+    containers frequently cannot). The viewer is observational-only, so a
+    missing tkinter must degrade to a clear reported reason, never a crash -
+    see `open_route_viewer`."""
+    try:
+        import tkinter  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _progress_path(project_path: str | Path) -> Path:
+    board_path, _, _ = _pcb._resolve_project_path(project_path)
+    return board_path.with_name(f"{board_path.stem}.route_progress.jsonl")
+
+
+def _progress_reset(project_path: str | Path) -> Path:
+    """Truncate (or create) the progress file at the START of a route call -
+    each run's stream starts clean, so a viewer that (re)opens mid-run never
+    replays a previous run's events."""
+    path = _progress_path(project_path)
+    try:
+        path.write_text("", encoding="utf-8", newline="\n")
+    except OSError:
+        pass
+    return path
+
+
+def _progress_append(path: Path | None, event: dict[str, Any]) -> None:
+    """Append one JSONL event. Best-effort: a progress-file write failure
+    (disk full, permissions) must never fail the actual route."""
+    if path is None:
+        return
+    try:
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(event) + "\n")
+    except OSError:
+        pass
+
+
+def _board_geometry_snapshot(board_path: Path) -> dict[str, Any]:
+    """Existing copper (segments/vias) + zone outlines, for the viewer's
+    initial draw before any progress event arrives. Reuses the same cached
+    parsers the rest of the router already uses - no new board-parsing logic
+    is introduced for this feature."""
+    tracks = _pcb._parse_tracks_cached(board_path)
+    segments = [
+        {
+            "uuid": s.get("uuid") or "", "net": s.get("net", ""), "layer": s.get("layer", ""),
+            "width": s.get("width", 0.0), "start": s.get("start"), "end": s.get("end"),
+        }
+        for s in tracks.get("segments", []) if s.get("uuid")
+    ]
+    vias = [
+        {
+            "uuid": v.get("uuid") or "", "net": v.get("net", ""),
+            "size": v.get("size", 0.0), "drill": v.get("drill", 0.0),
+            "layers": v.get("layers", []), "at": v.get("at"),
+        }
+        for v in tracks.get("vias", []) if v.get("uuid")
+    ]
+    zones: list[dict[str, Any]] = []
+    try:
+        zones = list_zones(str(board_path)).get("zones", [])
+    except Exception:
+        zones = []
+    return {"segments": segments, "vias": vias, "zones": zones}
+
+
+def _progress_header_event(
+    project_path: str | Path, board_path: Path, settings: dict[str, Any], session: dict[str, Any],
+) -> dict[str, Any]:
+    progress_cfg = (settings.get("autorouter", {}) or {}).get("progress", {}) or {}
+    color_theme = str(progress_cfg.get("color_theme", "auto"))
+    try:
+        colors = _viewer_load_colors(color_theme)
+    except Exception:
+        colors = {}
+    return {
+        "event": "header",
+        "ts": time.time(),
+        "session": session,
+        "board_path": str(board_path),
+        "colors": colors,
+        "geometry": _board_geometry_snapshot(board_path),
+        # No 7.6/7.7 optimizer/decision protocol exists yet - this is a
+        # left-in hook so a future decision event slots in without a schema
+        # change (see the viewer's "awaiting_decision" banner hook).
+        "decision_protocol": None,
+    }
+
+
+def _reset_route_cancel_flag(project_path: str | Path) -> None:
+    """Clear a stale `route_cancel_requested` flag at the START of a run - a
+    stop request only ever applies to the run that receives it, never
+    silently cancels the NEXT call too."""
+    try:
+        state = _pcb.load_board_local(project_path)
+        data = state["data"]
+        if data.get("route_cancel_requested"):
+            data["route_cancel_requested"] = False
+            _pcb.save_board_local(project_path, data)
+    except Exception:
+        pass
+
+
+def _route_cancel_requested(project_path: str | Path) -> bool:
+    """Poll the board-local cancel flag the viewer's 'Stop after this
+    iteration' button writes. Best-effort: a read failure must never abort a
+    route that would otherwise have succeeded."""
+    try:
+        return bool(_pcb.load_board_local(project_path)["data"].get("route_cancel_requested"))
+    except Exception:
+        return False
+
+
+def open_route_viewer(project_path: str | Path, board: str | None = None) -> dict[str, Any]:
+    """Phase 7.9 - spawn the detached `kicad_route_viewer.py <board_path>`
+    process that tails `<board>.route_progress.jsonl`. Decoupled by
+    construction: the router only ever appends to that file, so the viewer
+    can be opened, closed, or crash without touching (or blocking) routing.
+    Also called internally by `route_nets`/`route_board` when
+    `autorouter.progress.open_viewer` is true.
+
+    Observational-only failure honesty: if tkinter is unavailable (headless
+    CI/container), this returns `{"launched": False, "reason": ...}` instead
+    of raising - the MCP server must keep running headless even though the
+    viewer cannot.
+    """
+    if not _tk_available():
+        return {
+            "launched": False,
+            "reason": (
+                "tkinter is not available in this Python environment; the route "
+                "viewer is observational-only and cannot run headless."
+            ),
+        }
+    board_path, _, _ = _pcb._resolve_project_path(project_path)
+    if board:
+        board_path = Path(board)
+    viewer_script = Path(__file__).resolve().with_name("kicad_route_viewer.py")
+    if not viewer_script.exists():
+        return {"launched": False, "reason": f"viewer script not found: {viewer_script}"}
+    popen_kwargs: dict[str, Any] = {
+        "cwd": str(viewer_script.parent),
+        "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(
+            [sys.executable or "python", str(viewer_script), str(board_path)], **popen_kwargs)
+    except OSError as exc:
+        return {"launched": False, "reason": f"failed to launch viewer subprocess: {exc}"}
+    return {
+        "launched": True, "pid": proc.pid, "board_path": str(board_path),
+        "viewer_script": str(viewer_script),
+    }
+
+
 def route_nets(
     project_path: str | Path,
     nets: list[str] | None = None,
@@ -5337,6 +5527,20 @@ def route_nets(
     settings = _pcb.load_pcb_settings(project_path)["config"]
     autor = settings.get("autorouter", {})
     backend = _resolve_backend(settings)
+
+    # Phase 7.9 live progress viewer: reset the JSONL event stream and any
+    # stale cancel flag at the START of this call (never accumulate across
+    # runs; a stop request only ever applies to the run that receives it).
+    progress_cfg = autor.get("progress", {}) or {}
+    progress_enabled = bool(progress_cfg.get("events", True))
+    progress_path = _progress_reset(project_path) if progress_enabled else None
+    _reset_route_cancel_flag(project_path)
+    _progress_session = {
+        "session_id": _uuid.uuid4().hex, "started": time.time(), "backend": backend,
+        "command": "route_nets",
+    }
+    _progress_conns_done = 0
+    cancelled = False
     # The node budget is INTENTIONALLY the same for both backends: it selects the
     # detailed grid (`_choose_grid`), so an identical budget is what guarantees
     # cpu and numpy pick the same grid and thus route-level bit-identical geometry
@@ -5521,6 +5725,15 @@ def route_nets(
 
     owner_conns = list(conns)                       # index == owner id (canonical)
     n_conns = len(owner_conns)
+    if progress_enabled:
+        _progress_session["total_connections"] = n_conns
+        _progress_append(progress_path, _progress_header_event(
+            project_path, board_path, settings, _progress_session))
+        if bool(progress_cfg.get("open_viewer", False)):
+            try:
+                open_route_viewer(project_path)
+            except Exception:
+                pass
     placements: dict[int, dict[str, Any]] = {}      # owner -> {segments, vias, rec, net, obstacles}
     failures: dict[int, dict[str, Any]] = {}        # owner -> failed record
     congestion: dict[tuple[int, int, str], int] = {}
@@ -5580,13 +5793,58 @@ def route_nets(
         return act
 
     def _place(owner: int, net: str, segments: list[dict[str, Any]],
-               vias: list[dict[str, Any]], rec: dict[str, Any]) -> None:
+               vias: list[dict[str, Any]], rec: dict[str, Any],
+               ripped_local_geometry: list[dict[str, Any]] | None = None) -> None:
         placements[owner] = {
             "segments": segments, "vias": vias, "rec": rec, "net": net,
             "obstacles": _obstacles_from_emit(net, segments, vias, track_half,
                                               via_radius, routable_layers, owner),
         }
         failures.pop(owner, None)
+        if progress_enabled:
+            _emit_connection_progress(owner, net, True, segments, vias, ripped_local_geometry)
+
+    # Phase 7.9: per-connection progress event, called from every commit site
+    # above (`_place`) and every terminal-failure site below. `owner` doubles
+    # as a stable LOCAL id for this run's segments/vias (`f"{owner}:seg:{i}"` /
+    # `f"{owner}:via:{i}"`) - HONEST SIMPLIFICATION: the real board uuid for
+    # written copper is only assigned once, in a single batch, at the very end
+    # of this function (see `emit_segments`/`emit_vias` below), so a
+    # per-connection event necessarily uses a progress-stream-local id rather
+    # than the eventual board uuid; the viewer only needs a stable id to
+    # incrementally add/remove canvas items by, not the final board identity.
+    def _local_geometry(owner: int, segments: list[dict[str, Any]],
+                        vias: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        items = []
+        for i, s in enumerate(segments):
+            items.append({"kind": "segment", "uuid": f"{owner}:seg:{i}", "net": s.get("net"),
+                         "layer": s.get("layer"), "width": s.get("width"),
+                         "start": s.get("start"), "end": s.get("end")})
+        for i, v in enumerate(vias):
+            items.append({"kind": "via", "uuid": f"{owner}:via:{i}", "net": v.get("net"),
+                         "size": v.get("size"), "drill": v.get("drill"), "at": v.get("at")})
+        return items
+
+    def _emit_connection_progress(owner: int, net: str, routed: bool,
+                                   segments: list[dict[str, Any]] | None,
+                                   vias: list[dict[str, Any]] | None,
+                                   ripped_local_geometry: list[dict[str, Any]] | None) -> None:
+        nonlocal _progress_conns_done
+        _progress_conns_done += 1
+        added = _local_geometry(owner, segments or [], vias or [])
+        _progress_append(progress_path, {
+            "event": "connection",
+            "ts": time.time(),
+            "connection_index": _progress_conns_done,
+            "total_connections": n_conns,
+            "owner": owner,
+            "net": net,
+            "routed": routed,
+            "iteration": ripup_iterations,
+            "score": round(sum(pl["rec"].get("length_mm", 0.0) for pl in placements.values()), 4),
+            "changed": {"added": added, "removed": ripped_local_geometry or []},
+            "decision_protocol": None,
+        })
 
     # -- 7.8b speculative parallel pass: route EVERY connection concurrently -- #
     # against the BASE board (no placements, no congestion), across processes,
@@ -5673,6 +5931,8 @@ def route_nets(
             # empty, this is a no-op and behavior is unchanged.)
             if not (allow_hand_copper_ripup and hand_copper_pool):
                 failures[owner] = res["rec"]
+                if progress_enabled:
+                    _emit_connection_progress(owner, res["net"], False, None, None, None)
             continue
         violations = _self_check(res["net"], res["segments"], res["vias"],
                                  active_obstacles_for(owner), rules, via_radius)
@@ -5684,6 +5944,19 @@ def route_nets(
     done_speculatively = set(placements.keys()) | set(failures.keys())
     pending: "deque[int]" = deque(i for i in range(n_conns) if i not in done_speculatively)
     while pending:
+        # Phase 7.9 cancel support: the viewer's "Stop after this iteration"
+        # button writes `route_cancel_requested` into board-local state;
+        # checked between connections (never mid-search) so a cancelled run
+        # always stops on a clean, self-consistent boundary and returns
+        # whatever is routed so far, marked cancelled below.
+        if _route_cancel_requested(project_path):
+            cancelled = True
+            if progress_enabled:
+                _progress_append(progress_path, {
+                    "event": "cancelled", "ts": time.time(),
+                    "connections_done": _progress_conns_done, "total_connections": n_conns,
+                })
+            break
         owner = pending.popleft()
         core = _route_core(owner_conns[owner], owner, use_corridor=owner not in rerouted)
         if core["routed"]:
@@ -5752,7 +6025,11 @@ def route_nets(
                         congestion_escalations += _raise_path_congestion(
                             congestion, win, free_path, board_min[0], board_min[1],
                             grid, congestion_bump)
+                        ripped_geometry: list[dict[str, Any]] = []
                         for b in sorted(blockers):
+                            if progress_enabled and b in placements:
+                                ripped_geometry.extend(
+                                    _local_geometry(b, placements[b]["segments"], placements[b]["vias"]))
                             placements.pop(b, None)
                             displaced_by[b] = owner
                             rerouted.add(b)
@@ -5765,7 +6042,9 @@ def route_nets(
                                 {ob.uuid for ob in hand_blocker_objs}, core["net"])
                             human_copper_ripped.extend(hand_recs)
                             rec["human_copper_ripped"] = hand_recs
-                        _place(owner, core["net"], segments, vias, rec)
+                            ripped_geometry.extend(
+                                {"kind": r["kind"], "uuid": r["uuid"], "net": r["net"]} for r in hand_recs)
+                        _place(owner, core["net"], segments, vias, rec, ripped_geometry)
                         # re-queue the ripped connections (canonical order).
                         pending = deque(sorted(set(pending) | blockers))
                         did_rip = True
@@ -5814,7 +6093,11 @@ def route_nets(
                     congestion_escalations += _raise_path_congestion(
                         congestion, win, core["path"], board_min[0], board_min[1],
                         grid, congestion_bump)
+                    ripped_geometry: list[dict[str, Any]] = []
                     for b in sorted(blockers):
+                        if progress_enabled and b in placements:
+                            ripped_geometry.extend(
+                                _local_geometry(b, placements[b]["segments"], placements[b]["vias"]))
                         placements.pop(b, None)
                         displaced_by[b] = owner
                         rerouted.add(b)
@@ -5826,13 +6109,17 @@ def route_nets(
                         hand_recs = _commit_hand_copper_rip(hand_blockers, core["net"])
                         human_copper_ripped.extend(hand_recs)
                         rec["human_copper_ripped"] = hand_recs
-                    _place(owner, core["net"], segments, vias, rec)
+                        ripped_geometry.extend(
+                            {"kind": r["kind"], "uuid": r["uuid"], "net": r["net"]} for r in hand_recs)
+                    _place(owner, core["net"], segments, vias, rec, ripped_geometry)
                     # re-queue the ripped connections (canonical order).
                     pending = deque(sorted(set(pending) | blockers))
                     did_rip = True
 
         if not did_rip:
             failures[owner] = core["rec"]
+            if progress_enabled:
+                _emit_connection_progress(owner, core["net"], False, None, None, None)
 
     # Assemble outputs in canonical owner order.
     out_conns: list[dict[str, Any]] = []
@@ -5848,8 +6135,17 @@ def route_nets(
                 emit_segments.append((pl["net"], s, str(_uuid.uuid4())))
             for v in pl["vias"]:
                 emit_vias.append((pl["net"], v, str(_uuid.uuid4())))
-        else:
+        elif owner in failures:
             out_conns.append(failures[owner])
+        else:
+            # Phase 7.9: `cancelled` left this owner in neither map - the
+            # per-connection loop stopped before reaching it. Reported
+            # honestly as "not attempted" rather than a routing failure.
+            out_conns.append({
+                "net": owner_conns[owner].get("net"), "routed": False,
+                "length_mm": 0.0, "cancelled": True,
+                "failure": {"reason": "cancelled_before_attempt"},
+            })
 
     # ---- emit (write) -------------------------------------------------------
     written = False
@@ -5909,11 +6205,19 @@ def route_nets(
     if written and refill_zones:
         refill = refill_zones_with_kicad(board_path)
 
-    return {
+    if progress_enabled:
+        _progress_append(progress_path, {
+            "event": "run_complete", "ts": time.time(), "cancelled": cancelled,
+            "connections_routed": routed_count, "total_connections": n_conns,
+            "written": written,
+        })
+
+    result = {
         "board_path": str(board_path),
         "grid_mm": grid,
         "write": write,
         "written": written,
+        "cancelled": cancelled,
         "refill": refill,
         "rules": rules,
         "max_ripup_iterations": max_ripup_iterations,
@@ -5950,6 +6254,9 @@ def route_nets(
             "human_copper_removed_from_board": hand_copper_removed,
         },
     }
+    if progress_enabled:
+        result["progress_path"] = str(progress_path)
+    return result
 
 
 def unroute_nets(
