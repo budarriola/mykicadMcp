@@ -4673,6 +4673,176 @@ _FINE_INF = 1 << 60
 # free or negative. Only ever consulted on the discounted branch of `via`.
 _MIN_VIA_MILLI = 1
 
+# Phase 7.19.1 DIAGNOSTIC counters for the most recent `_fine_astar` call:
+# `expansions` = A* states expanded, `field_expansions` = cells the backward
+# goal-distance wavefront settled. Written unconditionally, read only by tests
+# and reports - nothing in the router branches on them, so they cannot affect
+# determinism (and are meaningless under the multi-process pool, where each
+# worker has its own copy).
+_FINE_SEARCH_STATS: dict[str, int] = {"expansions": 0, "field_expansions": 0}
+
+
+# --------------------------------------------------------------------------- #
+# Phase 7.19.1 - obstacle-aware goal-distance field (the fine A*'s heuristic).
+# --------------------------------------------------------------------------- #
+
+class _GoalDistanceField:
+    """Backward (goal-rooted) cost-to-go LOWER BOUND for the fine detailed A*.
+
+    WHAT IT IS. A Dijkstra wavefront run BACKWARD from the goal over a
+    deliberately RELAXED version of the very problem the forward A* solves:
+
+      * state space collapsed from (cell, layer, heading) to (cell) - the layer
+        and the incoming heading are simply dropped;
+      * a cell is passable if it is unblocked on ANY routable layer (the real
+        search must be unblocked on the layer it is actually travelling, which
+        is a strictly stronger requirement);
+      * every move costs `floor(dist_units x unit_milli)`, where `unit_milli` is
+        a hard floor on what one distance-unit of ANY planar move can cost (see
+        `unit_floor_milli` below);
+      * via moves cost 0 (a layer change does not move the cell, so it cannot
+        change this field's value at all).
+
+    Because every one of those is a relaxation - more edges, never-larger edge
+    costs - the resulting distance is <= the true optimal fine cost from the same
+    cell to the goal. That makes it ADMISSIBLE. It is also CONSISTENT: it is a
+    shortest-path metric on a graph whose edges are a superset of the real moves'
+    projections with costs <= the real ones, so `h(a) <= cost(a->b) + h(b)` holds
+    for every real planar move, and for a via move `h` does not change at all
+    while the move costs >= 0.
+
+    WHY IT BEATS OCTILE. Plain octile distance is this same field with all
+    obstacles deleted, so this field DOMINATES octile everywhere (obstacles can
+    only lengthen a shortest path, never shorten it) - and dominates it a lot
+    exactly where octile is worst: a goal behind a wall, in a pocket, or reachable
+    only the long way round. Cells the field proves unreachable get `_FINE_INF`,
+    which prunes them outright.
+
+    WHY NOT THE 7.3a COARSE GRID (deviation from the phase's original sketch,
+    recorded deliberately). `_CoarseModel`'s per-cell values are a CAPACITY /
+    CONGESTION model, not a lower bound on fine cost: a coarse cell is "capacity
+    0" when a foreign zone-fill covers its CENTRE, which says nothing about
+    whether the fine grid can pass through the rest of that 2 mm cell, and its
+    `congestion` term ADDS cost the fine model may not charge. A field built on
+    those weights can therefore OVERSTATE the true fine cost - i.e. be
+    inadmissible - and inadmissibility here is not a small error: it silently
+    changes which path is returned. The relaxation above is built from the
+    window's OWN blocked sets (literally the obstacle model the fine A* enforces)
+    so admissibility is a property of the construction rather than a hope. See
+    the phase report for the worked argument.
+
+    LAZINESS. The wavefront is expanded on demand (`value()` settles just far
+    enough to answer), so a search that terminates early never pays for the rest
+    of the window. Settled values are final (ordinary Dijkstra), so repeated
+    queries are O(1) once settled."""
+
+    __slots__ = ("_win", "_dist", "_heap", "_settled", "_unit", "_diag",
+                 "_straight", "_layers", "_goal_cells", "_goal_set",
+                 "_exhausted", "expansions")
+
+    def __init__(self, win: "_FineWindow", goal_cells: "list[tuple[int, int]]",
+                 unit_milli: int) -> None:
+        self._win = win
+        self._layers = list(win.layers)
+        self._unit = max(0, int(unit_milli))
+        # Per-edge FLOOR (never a round-half-up) so a summed field can never
+        # creep above the true cost through rounding - see `unit_floor_milli`.
+        self._straight = self._unit
+        self._diag = int(math.floor(self._unit * _SQRT2))
+        self._dist: dict[tuple[int, int], int] = {}
+        self._settled: set[tuple[int, int]] = set()
+        self._heap: list[tuple[int, int, int]] = []
+        self._goal_cells = list(goal_cells)
+        self._goal_set = set(self._goal_cells)
+        self._exhausted = False
+        self.expansions = 0
+        for (gx, gy) in self._goal_cells:
+            if win.in_bounds(gx, gy) and self._dist.get((gx, gy), 1) != 0:
+                self._dist[(gx, gy)] = 0
+                heapq.heappush(self._heap, (0, gx, gy))
+
+    def _enterable(self, ix: int, iy: int) -> bool:
+        """Can a planar move LAND here? Unblocked on at least one routable layer
+        (the relaxation - the real move must be unblocked on the layer it is
+        actually travelling), or the goal cell, which `planar` always lets a
+        move enter.
+
+        Note the asymmetry this encodes, and why it matters: `planar` gates the
+        DESTINATION of a move, never its source, so a blocked cell still has a
+        finite cost-to-go (a route may start on one - `nearest_free` can hand
+        the search a blocked start node) but may never be travelled THROUGH.
+        The backward wavefront therefore tests enterability on the cell it is
+        expanding FROM, and lets any neighbour be relaxed as a source."""
+        if (ix, iy) in self._goal_set:
+            return True
+        for layer in self._layers:
+            blocked = self._win.blocked_track.get(layer)
+            if blocked is None or (ix, iy) not in blocked:
+                return True
+        return False
+
+    def value(self, ix: int, iy: int) -> int:
+        """Lower bound on the cost of any legal fine route from (ix, iy) to the
+        goal. `_FINE_INF` when the relaxed problem itself has no route (which
+        proves the real one has none either)."""
+        if (ix, iy) in self._settled:
+            return self._dist[(ix, iy)]
+        while self._heap:
+            d, cx, cy = heapq.heappop(self._heap)
+            if (cx, cy) in self._settled:
+                continue
+            if d != self._dist.get((cx, cy)):
+                continue
+            self._settled.add((cx, cy))
+            self.expansions += 1
+            # Relax BEFORE answering: the wavefront is resumable, so a cell must
+            # never be settled without its neighbours having been offered - an
+            # early return here would silently truncate the field on the next
+            # query and report reachable cells as unreachable.
+            if self._enterable(cx, cy):
+                for (dx, dy) in _MOVES:
+                    nx, ny = cx + dx, cy + dy
+                    if not self._win.in_bounds(nx, ny):
+                        continue
+                    if (nx, ny) in self._settled:
+                        continue
+                    nd = d + (self._diag if (dx and dy) else self._straight)
+                    if nd < self._dist.get((nx, ny), _FINE_INF):
+                        self._dist[(nx, ny)] = nd
+                        heapq.heappush(self._heap, (nd, nx, ny))
+            if (cx, cy) == (ix, iy):
+                return d
+        self._exhausted = True
+        self._settled.add((ix, iy))
+        if (ix, iy) not in self._dist:
+            self._dist[(ix, iy)] = _FINE_INF
+        return self._dist[(ix, iy)]
+
+
+def unit_floor_milli(weights: _Weights, layer_purpose: dict[str, Any],
+                     net_kind: str, layer_types: dict[str, str],
+                     layers: "list[str]") -> int:
+    """A hard integer-milli FLOOR on what one distance-unit of any planar move
+    can cost in `_build_fine_cost`'s `planar`, for the NON-plane branch.
+
+    `planar` charges `q(step x dist_units x layer_purpose x direction_factor +
+    extras)` where `q` is round-half-even, `direction_factor >= min(1,
+    off_direction)` and every `extra` (away-from-home, off-corridor, turn) and
+    the post-quantization congestion overlay are non-negative. Flooring the
+    per-unit term (instead of rounding it, as the octile heuristic does) makes
+    the bound safe against `q`'s rounding in BOTH directions: `round(y) >=
+    floor(y) >= floor(floor(x) x du)` for `y = x x du`.
+
+    Deliberately NOT used for a plane-owning net: there `planar` can take the
+    `plane_step x island_factor` branch, which an aggressive `plane.step` can
+    price BELOW this floor. `_build_fine_cost` gates the field off entirely for
+    those nets rather than weakening the floor for every net."""
+    lp_kind = layer_purpose.get(net_kind, {})
+    min_lp = min([float(lp_kind.get(layer_types[l], 1.0)) for l in layers] or [1.0])
+    dir_min = min(1.0, float(weights.off_direction))
+    per_unit = float(weights.step) * min_lp * dir_min
+    return max(0, int(math.floor(per_unit * 1000.0)))
+
 
 def _build_fine_cost(
     win: "_FineWindow", net_kind: str, weights: _Weights,
@@ -4685,6 +4855,7 @@ def _build_fine_cost(
     goal_cell: tuple[int, int], goal_layers: set[str],
     multilayer_attachment: bool = False,
     return_path: dict[str, Any] | None = None,
+    goal_field: bool = False,
 ) -> dict[str, Any]:
     """The ONE integer-milli cost model for the fine detailed search.
 
@@ -4787,10 +4958,56 @@ def _build_fine_cost(
             _rp_cache[key] = hit
         return hit
 
-    def heuristic(cx: int, cy: int) -> int:
+    def octile_heuristic(cx: int, cy: int) -> int:
         ax, ay = abs(cx - gx), abs(cy - gy)
         octile = (ax + ay) + (_SQRT2 - 2.0) * min(ax, ay)
         return int(math.floor(octile * step_milli_per_unit))
+
+    # ---- 7.19.1 heuristic selection ------------------------------------- #
+    # `tiebreak_heuristic` is ALWAYS octile. It is the ordering `_fine_backtrace`
+    # (and the numpy tier's goal-state pick) uses to choose among tight optimal
+    # predecessors, and pinning it makes reconstruction a pure function of the
+    # optimal cost field - i.e. INDEPENDENT of which heuristic drove the search.
+    # That pin is what turns "a tighter heuristic explores less" into "a tighter
+    # heuristic explores less and returns the identical bytes".
+    #
+    # The FIELD is gated off for a plane-owning net: `planar`'s plane branch can
+    # undercut `unit_floor_milli` (see its docstring), which would make the field
+    # inadmissible - and an inadmissible heuristic changes the answer, silently.
+    # Signal nets (every net with `plane_layers is None`, the overwhelming
+    # majority) get the field; plane nets keep plain octile.
+    use_field = bool(goal_field) and plane is None and plane_goal is None
+    field: "_GoalDistanceField | None" = None
+    if use_field:
+        field = _GoalDistanceField(
+            win, [goal_cell],
+            unit_floor_milli(weights, layer_purpose, net_kind, layer_types, layers))
+
+    if field is None:
+        heuristic = octile_heuristic
+    else:
+        _f = field
+
+        def heuristic(cx: int, cy: int) -> int:  # type: ignore[misc]
+            # The FIELD ALONE - deliberately NOT `max(octile, field)`.
+            #
+            # `max` looks free (the max of two admissible heuristics is
+            # admissible) but is not, because OCTILE IS NOT ACTUALLY ADMISSIBLE
+            # HERE: it floors `octile_units x step_milli_per_unit` once for the
+            # whole distance, while the real cost is a SUM of independently
+            # `round`-ed per-move costs, so on some cells it overstates the true
+            # optimum by a milli or two. (`tests/test_goal_field_heuristic.py::
+            # test_octile_heuristic_is_marginally_inadmissible` pins that as a
+            # measured property of today's code, not a claim.) It is harmless
+            # for its two remaining jobs - ordering the legacy frontier and
+            # breaking reconstruction ties deterministically - but folding it in
+            # here would import the defect into the bound the drain relies on.
+            #
+            # The price is that on a wide-open straight run the field can sit a
+            # milli or two BELOW octile. That costs a handful of extra
+            # expansions in exactly the case where the search is already
+            # trivial, and buys a heuristic whose admissibility is provable.
+            return _f.value(cx, cy)
 
     def planar(ncx: int, ncy: int, layer: str, di: int, prev_d: int) -> int | None:
         """Integer milli-cost of the planar move in direction `di` INTO
@@ -4856,6 +5073,9 @@ def _build_fine_cost(
 
     return {
         "planar": planar, "via": via, "heuristic": heuristic, "is_goal": is_goal,
+        # 7.19.1: the canonical, heuristic-INDEPENDENT reconstruction ordering.
+        "tiebreak_heuristic": octile_heuristic,
+        "goal_field": field,
         "plane_factor": plane_factor, "li": li,
         "step_milli_per_unit": step_milli_per_unit, "goal_cell": goal_cell,
         "goal_layers": goal_layers,
@@ -4889,7 +5109,10 @@ def _fine_backtrace(
     consumes."""
     planar = model["planar"]
     via = model["via"]
-    heuristic = model["heuristic"]
+    # 7.19.1: ALWAYS the octile tie-break, never the (possibly field-informed)
+    # search heuristic - reconstruction must be a pure function of the optimal
+    # cost field, so that a better-informed search returns identical geometry.
+    heuristic = model.get("tiebreak_heuristic") or model["heuristic"]
     li = model["li"]
     layers = win.layers
     start_set = set(start_states)
@@ -4960,6 +5183,7 @@ def _fine_astar(
     attachment_via_cost: float = 0.0,
     multilayer_attachment: bool = False,
     return_path: dict[str, Any] | None = None,
+    goal_field: bool = False,
 ) -> list[tuple[int, int, str]] | None:
     """Integer-milli-cost A* over fine (cx, cy, layer) nodes with an octile
     heuristic, mirroring the 7.3a coarse A* cost model (step x layer-purpose x
@@ -4995,15 +5219,47 @@ def _fine_astar(
     only termination relaxed for plane nets - see `is_goal` below). When both
     are None (every signal-net call, and any plane-net call whose goal does not
     already touch its own fill), every branch below that checks them is False
-    and the search is byte-identical to the pre-7.5.4 behaviour (parity)."""
+    and the search is byte-identical to the pre-7.5.4 behaviour (parity).
+
+    PHASE 7.19.1 (`goal_field`, from `autorouter.goal_field_heuristic`): replaces
+    the octile heuristic with `_GoalDistanceField` - an obstacle-aware backward
+    Dijkstra lower bound that DOMINATES octile, so the search expands strictly
+    less of the window for the identical answer. Two things make "the identical
+    answer" a proof rather than an observation:
+
+      1. `_fine_backtrace` and the numpy tier's goal-state pick are pinned to the
+         OCTILE tie-break (`model["tiebreak_heuristic"]`), so reconstruction is a
+         pure function of the optimal cost field, not of the search order.
+      2. The loop below does not stop at the first goal pop when the field is in
+         use; it DRAINS every state whose `f <= C*` (`C*` = the optimal cost, the
+         first goal's `g`). With a consistent heuristic those are exactly the
+         states A* pops with their OPTIMAL `g`, and every predecessor that can
+         tightly explain an optimal path satisfies `g* + h <= g* + h* = C*` for
+         any admissible `h`. So the set of tight predecessors the backtrace sees
+         is the same set for ANY admissible/consistent heuristic - including the
+         plain octile one, i.e. today's.
+
+    The drain is affordable precisely because the field dominates octile: the
+    drained set `{g* + h_field <= C*}` is a SUBSET of `{g* + h_octile <= C*}`,
+    which is what today's search already expands (minus its `f == C*` fringe)."""
     model = _build_fine_cost(
         win, net_kind, weights, layer_purpose, directions, home_layer,
         corridor_cells, congestion, plane_layers, goal_planes, plane_step,
         attachment_via_cost, goal_cell, goal_layers,
-        multilayer_attachment, return_path)
+        multilayer_attachment, return_path, goal_field)
     planar = model["planar"]
     via = model["via"]
     heuristic = model["heuristic"]
+    tiebreak_h = model["tiebreak_heuristic"]
+    # Drain mode is coupled to the field being ACTUALLY in use (it is gated off
+    # for plane-owning nets inside `_build_fine_cost`), so a run without the
+    # field executes the legacy break-on-first-goal loop unchanged.
+    drain = model.get("goal_field") is not None
+    # Reset the diagnostic counters up front so an EARLY return (blocked start,
+    # or the field proving the goal unreachable) reports this call's real zero
+    # rather than the previous call's leftovers.
+    _FINE_SEARCH_STATS["expansions"] = 0
+    _FINE_SEARCH_STATS["field_expansions"] = 0
     is_goal = model["is_goal"]
     li = model["li"]
     layers = win.layers
@@ -5022,22 +5278,49 @@ def _fine_astar(
     heap: list[tuple[int, int, int, int, int, int]] = []
     for (sx, sy, l, d) in start_states:
         st = (sx, sy, l, d)
+        h0 = heuristic(sx, sy)
+        if drain and h0 >= _FINE_INF:
+            # 7.19.1: the goal-distance field is a RELAXATION of the real
+            # problem, so "no route in the relaxation" proves "no route at all".
+            # The legacy search discovers that only by exhausting the window.
+            continue
         best_g[st] = 0
-        heapq.heappush(heap, (heuristic(sx, sy), 0, sx, sy, li[l], d))
+        heapq.heappush(heap, (h0, 0, sx, sy, li[l], d))
+    if drain and not heap:
+        _FINE_SEARCH_STATS["field_expansions"] = model["goal_field"].expansions
+        return None
 
     expansions = 0
     goal_state: tuple[int, int, str, int] | None = None
+    # 7.19.1 drain bookkeeping (all inert when `drain` is False).
+    limit: int | None = None
+    goal_states: list[tuple[int, int, str, int]] = []
     while heap:
         f, gc, cx, cy, layer_i, d = heapq.heappop(heap)
+        if limit is not None and f > limit:
+            break  # nothing at f <= C* is left: the drained field is complete
         layer = layers[layer_i]
         st = (cx, cy, layer, d)
         if gc != best_g.get(st):
             continue
         if is_goal(cx, cy, layer):
-            goal_state = st
-            break
+            if not drain:
+                goal_state = st
+                break
+            # Drain mode: record every optimal-cost goal state and keep going
+            # until the f <= C* frontier is exhausted. Goal states are never
+            # EXPANDED (matching the legacy loop, which stops here).
+            if limit is None:
+                limit = gc  # first goal popped: f == g == C*
+            goal_states.append(st)
+            continue
         expansions += 1
         if expansions > _FINE_ASTAR_MAX_EXPANSIONS:
+            if limit is not None:
+                # A goal was already proved optimal; stop draining rather than
+                # discard it. Only reachable on a pathological window - the
+                # drained set is a subset of what the legacy search expands.
+                break
             return None
 
         for di, (dx, dy) in enumerate(_MOVES):
@@ -5050,8 +5333,14 @@ def _fine_astar(
             ng = gc + move_milli
             nst = (ncx, ncy, layer, di)
             if nst not in best_g or ng < best_g[nst]:
+                h = heuristic(ncx, ncy)
+                if h >= _FINE_INF:
+                    continue  # the relaxation proves the goal is unreachable here
+                nf = ng + h
+                if limit is not None and nf > limit:
+                    continue  # provably off every optimal path (h admissible)
                 best_g[nst] = ng
-                heapq.heappush(heap, (ng + heuristic(ncx, ncy), ng, ncx, ncy, layer_i, di))
+                heapq.heappush(heap, (nf, ng, ncx, ncy, layer_i, di))
 
         # via moves - layer change at the same node; needs a clear via cell.
         for other in layers:
@@ -5063,9 +5352,28 @@ def _fine_astar(
             ng = gc + move_milli
             nst = (cx, cy, other, d)
             if nst not in best_g or ng < best_g[nst]:
+                h = heuristic(cx, cy)
+                if h >= _FINE_INF:
+                    continue
+                nf = ng + h
+                if limit is not None and nf > limit:
+                    continue
                 best_g[nst] = ng
-                heapq.heappush(heap, (ng + heuristic(cx, cy), ng, cx, cy, li[other], d))
+                heapq.heappush(heap, (nf, ng, cx, cy, li[other], d))
 
+    # Diagnostic only (7.19.1 gate): how much of the window the last search had
+    # to look at. Never read by the router itself - see `_FINE_SEARCH_STATS`.
+    _FINE_SEARCH_STATS["expansions"] = expansions
+    _FINE_SEARCH_STATS["field_expansions"] = (
+        model["goal_field"].expansions if model.get("goal_field") is not None else 0)
+    if drain and goal_states:
+        # Pick the goal state by the SAME canonical rule the numpy tier uses -
+        # the octile tie-break over the optimal-cost goal states - so cpu and
+        # numpy select identically no matter which heuristic drove the search.
+        goal_state = min(
+            goal_states,
+            key=lambda s: (best_g[s] + tiebreak_h(s[0], s[1]), best_g[s],
+                           s[0], s[1], li[s[2]], s[3]))
     if goal_state is None:
         return None
     return _fine_backtrace(win, model, best_g.get, goal_state, start_states)
@@ -5329,13 +5637,22 @@ def _delete_blocks_by_uuid(text: str, uuids: set[str]) -> tuple[str, int]:
 # --------------------------------------------------------------------------- #
 
 def _corridor_from_global(win: _FineWindow, global_conn: dict[str, Any] | None,
-                          coarse_grid: float, coarse_min: tuple[float, float]) -> set[tuple[int, int]] | None:
+                          coarse_grid: float, coarse_min: tuple[float, float],
+                          candidate_index: int = 0) -> set[tuple[int, int]] | None:
     """Fine window nodes within one coarse cell of the global stage's chosen
     coarse path - the soft corridor the detailed search is discounted to stay
-    inside (leaving it costs off_corridor)."""
+    inside (leaving it costs off_corridor).
+
+    `candidate_index` selects WHICH of 7.3a's ranked candidates to follow. It is
+    0 for every call the router makes today; Phase 7.19.2's fallback tier is the
+    only thing that ever passes anything else, and only after candidate 0 has
+    already failed outright."""
     if not global_conn or not global_conn.get("candidates"):
         return None
-    coarse_path = global_conn["candidates"][0].get("coarse_path") or []
+    cands = global_conn["candidates"]
+    if candidate_index >= len(cands):
+        return None
+    coarse_path = cands[candidate_index].get("coarse_path") or []
     if not coarse_path:
         return None
     radius = coarse_grid
@@ -5942,9 +6259,132 @@ def _build_zone_edge_cache(
     return cache
 
 
+# --------------------------------------------------------------------------- #
+# Phase 7.19.2 - cheap pre-ranking of the global stage's alternate candidates.
+# --------------------------------------------------------------------------- #
+
+# Milli-cost charged per LAYER CHANGE along a coarse candidate, on top of its own
+# `est_cost_milli`, when deciding whether the candidate is worth detail-routing.
+# Deliberately a fixed constant and NOT a re-derivation of the real via cost: the
+# whole point of the pre-rank is that it costs nothing to compute (no grid, no
+# window, no search), so it must not go looking anything up. Overridable via
+# `autorouter.candidate_fallback.via_penalty_milli`.
+_PRERANK_VIA_PENALTY_MILLI = 25_000
+
+
+def _candidate_layer_changes(candidate: dict[str, Any]) -> int:
+    """Layer changes along a coarse candidate path - a pure count over data
+    7.3a already emitted (`coarse_path` is `[[cx, cy, layer], ...]`)."""
+    path = candidate.get("coarse_path") or []
+    changes = 0
+    prev: str | None = None
+    for entry in path:
+        layer = entry[2] if len(entry) > 2 else None
+        if prev is not None and layer != prev:
+            changes += 1
+        prev = layer
+    return changes
+
+
+def _prerank_candidates(gconn: dict[str, Any] | None,
+                        cfg: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Rank 7.3a's candidates by a CHEAP estimate and mark which are worth ever
+    detail-routing. No fine grid, no window, no A* - just the coarse cost 7.3a
+    already computed plus a fixed per-layer-change constant.
+
+    Returns one record per candidate IN THE ORIGINAL ORDER (candidate 0 stays
+    candidate 0 - this never re-orders what the router tries first, it only
+    decides how far down the list is worth trying at all):
+    `{index, est_cost_milli, layer_changes, prerank_milli, worth}`.
+
+    `worth` is False when `prerank_milli` exceeds
+    `top_prerank x max_cost_ratio + slack_milli`, i.e. when the candidate is so
+    much more expensive than the best one that paying a full windowed A* to find
+    out is not justified even as a fallback. Candidate 0 is ALWAYS worth (it is
+    what the router routes today, and the ratio is measured against it)."""
+    cands = (gconn or {}).get("candidates") or []
+    cfg = cfg or {}
+    via_pen = int(cfg.get("via_penalty_milli", _PRERANK_VIA_PENALTY_MILLI))
+    ratio = float(cfg.get("max_cost_ratio", 1.35))
+    slack = int(cfg.get("slack_milli", 0))
+    max_c = int(cfg.get("max_candidates", 3))
+    out: list[dict[str, Any]] = []
+    for i, c in enumerate(cands):
+        changes = _candidate_layer_changes(c)
+        est = int(c.get("est_cost_milli", 0))
+        out.append({"index": i, "est_cost_milli": est, "layer_changes": changes,
+                    "prerank_milli": est + via_pen * changes, "worth": True})
+    if not out:
+        return out
+    budget = int(out[0]["prerank_milli"] * ratio) + slack
+    for rec in out:
+        if rec["index"] == 0:
+            continue
+        rec["worth"] = rec["index"] < max_c and rec["prerank_milli"] <= budget
+    return out
+
+
 def _route_one(
     ctx: dict[str, Any], conn: dict[str, Any], active_obstacles: list["_Obst"],
     congestion: dict[tuple[int, int, str], int], use_corridor: bool = True,
+) -> dict[str, Any]:
+    """Detailed routing for ONE connection, including Phase 7.19.2's alternate-
+    candidate fallback.
+
+    THE FLOW THIS REPLACES (verified against the code, not assumed): 7.3a emits
+    1-3 ranked coarse candidates per connection, and detailed routing used
+    candidate 0 and ONLY candidate 0 - `_corridor_from_global` and
+    `_hier_world_waypoints` both indexed `[0]` unconditionally, so candidates 1
+    and 2 were computed by the global stage and then thrown away. There was
+    therefore no "try them in order until one succeeds" loop to make cheaper;
+    there was a discarded resource and no fallback at all.
+
+    What this adds, all of it behind `autorouter.candidate_fallback.enabled`
+    (default False, so an untuned project stays byte-identical):
+      * a FALLBACK - if candidate 0 fails outright, retry the whole ladder along
+        candidate 1's (then 2's) corridor and hierarchical waypoints;
+      * the CHEAP GATE that is the actual phase deliverable - `_prerank_candidates`
+        decides from the coarse cost alone whether a lower-ranked candidate is
+        worth a full windowed A*, so a hopeless alternate is skipped without ever
+        being searched.
+
+    A connection whose candidate 0 succeeds never reaches any of this, which is
+    what keeps "the top candidate already works" byte-identical - the fallback
+    can only ever turn a failure into a route, never move a success."""
+    raw_cfg = ctx.get("candidate_fallback")
+    cfg = raw_cfg if isinstance(raw_cfg, dict) else {}
+    if not cfg.get("enabled"):
+        return _route_one_candidate(ctx, conn, active_obstacles, congestion,
+                                    use_corridor, 0)
+    out = _route_one_candidate(ctx, conn, active_obstacles, congestion,
+                               use_corridor, 0)
+    if out["routed"] or not use_corridor:
+        return out
+    net = conn["net"]
+    from_xy, to_xy = _conn_endpoints(conn)
+    gkey = (net, round(from_xy[0], 3), round(from_xy[1], 3),
+            round(to_xy[0], 3), round(to_xy[1], 3))
+    ranked = _prerank_candidates(ctx["global_by_key"].get(gkey), cfg)
+    skipped: list[int] = []
+    for rec in ranked[1:]:
+        if not rec["worth"]:
+            skipped.append(rec["index"])
+            continue
+        alt = _route_one_candidate(ctx, conn, active_obstacles, congestion,
+                                   use_corridor, rec["index"])
+        if alt["routed"]:
+            alt["rec"]["candidate_index"] = rec["index"]
+            alt["rec"]["candidates_prerank_skipped"] = skipped
+            return alt
+    if skipped:
+        out["rec"]["candidates_prerank_skipped"] = skipped
+    return out
+
+
+def _route_one_candidate(
+    ctx: dict[str, Any], conn: dict[str, Any], active_obstacles: list["_Obst"],
+    congestion: dict[tuple[int, int, str], int], use_corridor: bool = True,
+    candidate_index: int = 0,
 ) -> dict[str, Any]:
     """Window-doubling detailed search + self-check for ONE connection against a
     GIVEN obstacle set + congestion field. Pure function of (ctx, conn,
@@ -6020,6 +6460,8 @@ def _route_one(
     # `plane.return_path_bonus` > 0 (7.18.3) - `plane_layers` is None for every
     # signal net (the 2026-07-24 power-net gate), so the two never overlap.
     ml_attach = bool(ctx.get("multilayer_attachment", False))
+    # Phase 7.19.1 obstacle-aware goal-distance heuristic (default off).
+    goal_field = bool(ctx.get("goal_field_heuristic", False))
     return_path = (ctx.get("return_path_by_net") or {}).get(net)
 
     # Ordered (margin, grid) attempts: attempt 1 is the legacy (base_margin,
@@ -6069,7 +6511,8 @@ def _route_one(
                                   toward_xy=to_xy if pad_escape_aware else None) or win.cell_of(*from_xy)
         g_cell = win.nearest_free(to_xy[0], to_xy[1], list(goal_layers),
                                   toward_xy=from_xy if pad_escape_aware else None) or win.cell_of(*to_xy)
-        corridor = _corridor_from_global(win, gconn, coarse_grid, coarse_min) if use_corridor else None
+        corridor = (_corridor_from_global(win, gconn, coarse_grid, coarse_min,
+                                          candidate_index) if use_corridor else None)
         win_cong = _project_congestion(win, congestion, board_min[0], board_min[1], grid)
         out.update({"win": win, "s_cell": s_cell, "g_cell": g_cell,
                     "corridor": corridor, "margin": margin,
@@ -6079,7 +6522,7 @@ def _route_one(
                             s_cell, start_layers, g_cell, goal_layers,
                             home_layer, corridor, win_cong,
                             plane_layers, goal_planes, plane_step, attachment_via_cost,
-                            ml_attach, return_path,
+                            ml_attach, return_path, goal_field,
                             _settings=ctx.get("gpu_settings"))
         if path is None:
             continue  # unreachable at this (margin, grid) - try the next ladder rung
@@ -6120,7 +6563,7 @@ def _route_one(
         # reaches this call and is byte-identical to before this tier existed.
         hier = _route_hierarchical(ctx, net, net_kind, from_xy, to_xy, start_layers,
                                    goal_layers, active_obstacles, gconn, home_layer,
-                                   plane_layers, goal_planes)
+                                   plane_layers, goal_planes, candidate_index)
         if hier is not None:
             rec_updates, segments, vias = hier
             result_rec.update(rec_updates)
@@ -6237,6 +6680,8 @@ def _route_wide_lazy(
     # cost model as one the ordinary ladder routes, or the two tiers would
     # disagree about the same board.
     ml_attach = bool(ctx.get("multilayer_attachment", False))
+    # Phase 7.19.1 obstacle-aware goal-distance heuristic (default off).
+    goal_field = bool(ctx.get("goal_field_heuristic", False))
     return_path = (ctx.get("return_path_by_net") or {}).get(net)
 
     minx = board_bbox[0] - grid
@@ -6272,7 +6717,7 @@ def _route_wide_lazy(
                         ctx["directions"], s_cell, start_layers, g_cell, goal_layers,
                         home_layer, None, win_cong, plane_layers, goal_planes,
                         ctx["plane_step"], ctx["attachment_via_cost"],
-                        ml_attach, return_path,
+                        ml_attach, return_path, goal_field,
                         _settings=ctx.get("gpu_settings"))
     if path is None:
         return None
@@ -6330,6 +6775,7 @@ _HIER_WINDOW_MARGIN_MM = 3.0
 def _hier_world_waypoints(
     gconn: dict[str, Any] | None, coarse_grid: float, coarse_min: tuple[float, float],
     from_xy: tuple[float, float], to_xy: tuple[float, float],
+    candidate_index: int = 0,
 ) -> list[tuple[float, float, str]] | None:
     """Deterministically decimate the global stage's winning coarse path (a
     (cx, cy, layer) cell sequence at `coarse_grid` resolution, see
@@ -6342,7 +6788,10 @@ def _hier_world_waypoints(
     sub-windows along (nothing for this tier to do)."""
     if not gconn or not gconn.get("candidates"):
         return None
-    coarse_path = gconn["candidates"][0].get("coarse_path") or []
+    cands = gconn["candidates"]
+    if candidate_index >= len(cands):
+        return None
+    coarse_path = cands[candidate_index].get("coarse_path") or []
     if not coarse_path:
         return None
     cmnx, cmny = coarse_min
@@ -6385,6 +6834,7 @@ def _route_hierarchical(
     home_layer: str | None,
     plane_layers: dict[str, list[dict[str, Any]]] | None,
     goal_planes: dict[str, list[dict[str, Any]]] | None,
+    candidate_index: int = 0,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]] | None:
     """Last-resort tier: chain small fine-grid `_FineWindow`s along the global
     stage's own coarse path, ONLY called after the full `_route_attempts`
@@ -6427,7 +6877,8 @@ def _route_hierarchical(
     grid, or the end-to-end self-check rejects the stitched geometry."""
     coarse_grid = ctx["coarse_grid"]
     coarse_min = ctx["coarse_min"]
-    waypoints = _hier_world_waypoints(gconn, coarse_grid, coarse_min, from_xy, to_xy)
+    waypoints = _hier_world_waypoints(gconn, coarse_grid, coarse_min, from_xy, to_xy,
+                                      candidate_index)
     if waypoints is None:
         return None
 
@@ -6452,6 +6903,8 @@ def _route_hierarchical(
     # Phase 7.18: identical reads to `_route_one`, so this last-resort tier
     # costs a leg exactly the way the ordinary tier costs a window.
     ml_attach = bool(ctx.get("multilayer_attachment", False))
+    # Phase 7.19.1 obstacle-aware goal-distance heuristic (default off).
+    goal_field = bool(ctx.get("goal_field_heuristic", False))
     return_path = (ctx.get("return_path_by_net") or {}).get(net)
 
     all_segments: list[dict[str, Any]] = []
@@ -6502,6 +6955,7 @@ def _route_hierarchical(
                             s_cell, cur_layers, g_cell, leg_goal_layers,
                             home_layer, None, None, plane_layers, leg_goal_planes,
                             plane_step, attachment_via_cost, ml_attach, return_path,
+                            goal_field,
                             _settings=ctx.get("gpu_settings"))
         if path is None and not is_last and leg_goal_layers != set(routable_layers):
             # Intermediate waypoint only: the coarse stage's layer preference
@@ -6514,6 +6968,7 @@ def _route_hierarchical(
                                 s_cell, cur_layers, g_cell, leg_goal_layers,
                                 home_layer, None, None, plane_layers, leg_goal_planes,
                                 plane_step, attachment_via_cost, ml_attach, return_path,
+                                goal_field,
                                 _settings=ctx.get("gpu_settings"))
         if path is None:
             return None  # this leg is unreachable even at the finest grid - terminal
@@ -7327,6 +7782,14 @@ def route_nets(
         "global_by_key": global_by_key, "tw": tw, "plane_by_net": plane_by_net,
         "base_obstacles": obstacles,
         "multilayer_attachment": ml_attach,
+        # Phase 7.19.1: `autorouter.goal_field_heuristic`. Default False keeps
+        # the legacy octile-heuristic, break-on-first-goal A* byte-for-byte.
+        "goal_field_heuristic": bool(autor.get("goal_field_heuristic", False)),
+        # Phase 7.19.2: `autorouter.candidate_fallback`. Default (absent, or
+        # `enabled: false`) means detailed routing uses coarse candidate 0 only,
+        # exactly as before this phase existed. Small picklable primitives, so
+        # a spawned worker gates identically to the parent.
+        "candidate_fallback": dict(autor.get("candidate_fallback", {}) or {}),
         "return_path_by_net": return_path_by_net,
         # Phase 7.12 neck-down: config + per-(ref, pad) copper size + the
         # board's min_track_width DRC floor. Small, picklable primitives -
@@ -7634,6 +8097,7 @@ def route_nets(
                                      core["plane_layers"], core["goal_planes"],
                                      plane_step, attachment_via_cost,
                                      ml_attach, (return_path_by_net or {}).get(core["net"]),
+                                     bool(ctx.get("goal_field_heuristic", False)),
                                      _settings=ctx.get("gpu_settings"))
             if free_path is not None:
                 via_nodes = _path_via_nodes(free_path)
