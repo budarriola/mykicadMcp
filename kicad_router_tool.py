@@ -4245,6 +4245,11 @@ class _FineWindow:
 # so accumulating a few relaxation sweeps onto it can never overflow or wrap).
 _FINE_INF = 1 << 60
 
+# Phase 7.18.3: hard floor (integer milli) on a return-path-DISCOUNTED via, so
+# an aggressively-tuned `plane.return_path_bonus` can never make a layer change
+# free or negative. Only ever consulted on the discounted branch of `via`.
+_MIN_VIA_MILLI = 1
+
 
 def _build_fine_cost(
     win: "_FineWindow", net_kind: str, weights: _Weights,
@@ -4255,6 +4260,8 @@ def _build_fine_cost(
     goal_planes: dict[str, list[dict[str, Any]]] | None,
     plane_step: float, attachment_via_cost: float,
     goal_cell: tuple[int, int], goal_layers: set[str],
+    multilayer_attachment: bool = False,
+    return_path: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The ONE integer-milli cost model for the fine detailed search.
 
@@ -4264,7 +4271,37 @@ def _build_fine_cost(
     (`kicad_router_accel.fine_wavefront`) ALL cost moves through this single
     source of truth, so their integer cost fields are bit-identical - which is
     what makes the deterministic reconstruction pick the same path on every
-    backend (7.8 parity)."""
+    backend (7.8 parity).
+
+    PHASE 7.18.1 (`multilayer_attachment`, from `plane.multilayer_attachment_
+    choice`, default False) changes TWO things at the plane-attachment decision
+    point, and nothing else:
+      * `plane_factor` returns the BEST (minimum) island factor among ALL of
+        this net's own fill components covering the cell on that layer, instead
+        of the FIRST one found in `_plane_components_for`'s (-attachments,
+        -area) order. On a board where a net owns several overlapping zones on
+        one layer (kiln's GND_Main/GND_Safty each own three), the first-found
+        component is not necessarily the cheapest one.
+      * the attachment surcharge a via pays to land on the plane is SCALED by
+        that component's island factor (`attachment_via_cost x factor`) rather
+        than being the same flat 8.0 whether it lands on the mainland or on a
+        one-attachment island. This is what makes the A*'s existing per-layer
+        expansion an actual RANKING across every layer the net owns fill on:
+        dropping onto In1.Cu's mainland now genuinely out-prices dropping onto
+        F.Cu's weakly-attached island at the same (x, y).
+    Mainland factor is 1.0, so a net owning exactly one healthy pour per layer
+    prices identically either way; the flag still defaults False because
+    islands/overlaps do move geometry.
+
+    PHASE 7.18.3 (`return_path`, non-None only when `plane.return_path_bonus`
+    > 0 AND the net being routed is a signal net) DISCOUNTS a via's cost by
+    `bonus` when the via lands on a layer that is STACK-ADJACENT to a layer
+    carrying this net's own reference-plane copper within `near_mm` of the via
+    position. It is a via-placement preference ONLY: no planar move, no
+    obstacle, no goal test consults it, and the signal net is never routed
+    through the reference plane's fill (the 2026-07-24 REQUIRED CONSTRAINT gate
+    in `_plane_components_for` is untouched - `plane_layers` is still None for
+    every signal net, so every plane-traversal branch above stays False)."""
     g = win.grid
     lp_kind = layer_purpose.get(net_kind, {})
     layers = win.layers
@@ -4290,10 +4327,42 @@ def _build_fine_cost(
             nx, ny = win.node_xy(ix, iy)
             for c in comps:
                 if c["raster"].covers(nx, ny, 0.0):
-                    val = c["factor"]
-                    break
+                    if not multilayer_attachment:
+                        val = c["factor"]
+                        break
+                    # 7.18.1: keep scanning - a later component (a same-net
+                    # zone overlapping this one) can be the cheaper attachment.
+                    f = c["factor"]
+                    if val is None or f < val:
+                        val = f
         _pf_cache[key] = val
         return val
+
+    # 7.18.3 return-path proximity, precomputed per (cell, layer). None when
+    # the feature is off (`return_path is None`), which is the default and
+    # keeps `via` byte-identical to pre-7.18.
+    _rp_cache: dict[tuple[int, int, str], bool] = {}
+    rp_bonus = float((return_path or {}).get("bonus", 0.0))
+    rp_near_mm = float((return_path or {}).get("near_mm", 0.0))
+    rp_by_layer: dict[str, list[Any]] = (return_path or {}).get("adjacent_rasters", {})
+
+    def return_path_near(ix: int, iy: int, layer: str) -> bool:
+        """True when this net's own reference-plane copper sits within
+        `near_mm` of (ix, iy) on a layer STACK-ADJACENT to `layer` - i.e. a via
+        landing here has a short, low-inductance return path available. Purely
+        a via-cost preference (see the class docstring); never a permission."""
+        if not rp_by_layer:
+            return False
+        rasters = rp_by_layer.get(layer)
+        if not rasters:
+            return False
+        key = (ix, iy, layer)
+        hit = _rp_cache.get(key)
+        if hit is None:
+            nx, ny = win.node_xy(ix, iy)
+            hit = any(r.covers(nx, ny, rp_near_mm) for r in rasters)
+            _rp_cache[key] = hit
+        return hit
 
     def heuristic(cx: int, cy: int) -> int:
         ax, ay = abs(cx - gx), abs(cy - gy)
@@ -4333,9 +4402,19 @@ def _build_fine_cost(
         if (ix, iy) in win.blocked_via:
             return None
         via_base = weights.via * weights.through_via
-        if plane_factor(ix, iy, to_layer) is not None:
-            via_base += attachment_via_cost
-        move_milli = weights.q(via_base)
+        pf = plane_factor(ix, iy, to_layer)
+        if pf is not None:
+            # 7.18.1: price the attachment by the component actually landed on
+            # (mainland factor 1.0 == the historical flat surcharge).
+            via_base += attachment_via_cost * pf if multilayer_attachment else attachment_via_cost
+        if rp_bonus and return_path_near(ix, iy, to_layer):
+            # 7.18.3: discount, floored so a via never becomes free/negative
+            # (a zero-cost via would let the search thrash layers for nothing).
+            # The floor is applied ONLY on the discounted branch, so an untuned
+            # project's via cost is untouched even if it configured via=0.
+            move_milli = max(weights.q(via_base - rp_bonus), _MIN_VIA_MILLI)
+        else:
+            move_milli = weights.q(via_base)
         if cong is not None:
             move_milli += cong.get((ix, iy, to_layer), 0)
         return move_milli
@@ -4357,6 +4436,11 @@ def _build_fine_cost(
         "plane_factor": plane_factor, "li": li,
         "step_milli_per_unit": step_milli_per_unit, "goal_cell": goal_cell,
         "goal_layers": goal_layers,
+        # 7.18: exposed so the numpy backend builds bit-identical cost arrays.
+        "return_path_near": return_path_near,
+        "return_path_bonus": rp_bonus,
+        "multilayer_attachment": multilayer_attachment,
+        "min_via_milli": _MIN_VIA_MILLI,
     }
 
 
@@ -4451,6 +4535,8 @@ def _fine_astar(
     goal_planes: dict[str, list[dict[str, Any]]] | None = None,
     plane_step: float = 0.0,
     attachment_via_cost: float = 0.0,
+    multilayer_attachment: bool = False,
+    return_path: dict[str, Any] | None = None,
 ) -> list[tuple[int, int, str]] | None:
     """Integer-milli-cost A* over fine (cx, cy, layer) nodes with an octile
     heuristic, mirroring the 7.3a coarse A* cost model (step x layer-purpose x
@@ -4490,7 +4576,8 @@ def _fine_astar(
     model = _build_fine_cost(
         win, net_kind, weights, layer_purpose, directions, home_layer,
         corridor_cells, congestion, plane_layers, goal_planes, plane_step,
-        attachment_via_cost, goal_cell, goal_layers)
+        attachment_via_cost, goal_cell, goal_layers,
+        multilayer_attachment, return_path)
     planar = model["planar"]
     via = model["via"]
     heuristic = model["heuristic"]
@@ -4975,6 +5062,92 @@ def _compute_plane_components_for(
     return result
 
 
+def _reference_plane_rasters(
+    signal_nets: list[str], plane_fill_index: dict[str, list[dict[str, Any]]],
+    pads_by_net: dict[str, list[dict[str, Any]]], power_patterns: list[str],
+    gnd_tokens: list[str], all_cu: list[str], routable_set: set[str],
+    near_mm: float,
+) -> dict[str, dict[str, Any]]:
+    """Phase 7.18.3 - resolve each signal net's OWN reference plane and pre-slice
+    that plane's fill rasters by STACK-ADJACENT layer.
+
+    HOW "the net's own reference plane" is decided (documented choice; this is
+    the part 7.18.3 left open):
+
+    1. Candidate planes are the nets that OWN FILL and are power-kind by the
+       existing `_net_kind`/`power_net_patterns` machinery - no second notion of
+       "is this a power net" is introduced. Among those, GROUND nets (name
+       contains one of `schematic_checks.cap_voltage.gnd_tokens`: GND, AGND,
+       DGND, PGND, VSS) are preferred, because a return path is a ground return;
+       only if the board has no ground pour at all do the remaining power pours
+       become candidates.
+    2. The winner is chosen by PAD VOTE: for each of the signal net's own pads,
+       whichever candidate's fill actually covers that pad's location (any
+       layer, within the pad's own contact reach) gets a vote. The candidate
+       with the most votes wins; ties break on net name, so the result is
+       deterministic and independent of dict/file order.
+    3. A net whose pads sit over no pour at all gets NO reference plane and no
+       bonus - guessing a plane it is nowhere near would be worse than
+       abstaining.
+
+    Rule 2 is what makes this correct on a board with SEVERAL isolated ground
+    domains (kiln has GND_Main and GND_Safty, each pouring on F.Cu/B.Cu/In1.Cu):
+    a safety-domain signal's pads sit inside the GND_Safty pour, so GND_Safty -
+    not the larger GND_Main - becomes its reference, and its vias are pulled
+    toward the plane that is genuinely its return path.
+
+    Returns `{signal_net: {"net", "bonus"(filled by caller), "near_mm",
+    "adjacent_rasters": {layer: [raster, ...]}}}`, where `adjacent_rasters[L]`
+    holds the reference plane's fill rasters on the layers immediately above/
+    below L in the board's copper stack - so a via landing on L is asked only
+    about the layers it is actually referenced against."""
+    cands = [n for n in sorted(plane_fill_index)
+             if _pcb._net_kind(n, None, power_patterns) == "power"]
+    tokens = [t.upper() for t in (gnd_tokens or [])]
+    gnds = [n for n in cands if any(t in n.upper() for t in tokens)]
+    if gnds:
+        cands = gnds
+    if not cands:
+        return {}
+
+    # net -> layer -> [raster], for the candidate planes only.
+    by_net_layer: dict[str, dict[str, list[Any]]] = {}
+    for n in cands:
+        per_layer: dict[str, list[Any]] = {}
+        for e in plane_fill_index[n]:
+            per_layer.setdefault(e["layer"], []).append(e["raster"])
+        by_net_layer[n] = per_layer
+
+    stack = {name: i for i, name in enumerate(all_cu)}
+    adjacent_of = {
+        L: [o for o in all_cu if abs(stack.get(o, -99) - stack.get(L, 99)) == 1]
+        for L in routable_set
+    }
+
+    out: dict[str, dict[str, Any]] = {}
+    for net in signal_nets:
+        votes: dict[str, int] = {}
+        for pad in pads_by_net.get(net, []):
+            pos = pad["position"]
+            reach = _pad_reach(pad)
+            for n in cands:
+                if any(r.covers(pos["x"], pos["y"], reach)
+                       for rasters in by_net_layer[n].values() for r in rasters):
+                    votes[n] = votes.get(n, 0) + 1
+        if not votes:
+            continue
+        ref = min(sorted(votes), key=lambda n: (-votes[n], n))
+        adj: dict[str, list[Any]] = {}
+        for L, others in adjacent_of.items():
+            rasters = [r for o in others for r in by_net_layer[ref].get(o, [])]
+            if rasters:
+                adj[L] = rasters
+        if not adj:
+            continue
+        out[net] = {"net": ref, "near_mm": near_mm, "adjacent_rasters": adj}
+    return out
+
+
 class _LazyPlaneByNet:
     """Worker-side stand-in for the parent's `plane_by_net` dict: same `.get(net)`
     interface `_route_one` uses, but computes (and memoizes) each net's plane
@@ -5419,6 +5592,12 @@ def _route_one(
     coarse_min = ctx["coarse_min"]
     plane_step = ctx["plane_step"]
     attachment_via_cost = ctx["attachment_via_cost"]
+    # Phase 7.18: both default-off. `ml_attach` re-ranks the plane attachment
+    # (7.18.1); `return_path` is non-None ONLY for a signal net when
+    # `plane.return_path_bonus` > 0 (7.18.3) - `plane_layers` is None for every
+    # signal net (the 2026-07-24 power-net gate), so the two never overlap.
+    ml_attach = bool(ctx.get("multilayer_attachment", False))
+    return_path = (ctx.get("return_path_by_net") or {}).get(net)
 
     # Ordered (margin, grid) attempts: attempt 1 is the legacy (base_margin,
     # adaptive-grid) pair (so any connection that already routes on it is
@@ -5476,7 +5655,8 @@ def _route_one(
         path = _fine_search(backend, win, net_kind, weights, layer_purpose, directions,
                             s_cell, start_layers, g_cell, goal_layers,
                             home_layer, corridor, win_cong,
-                            plane_layers, goal_planes, plane_step, attachment_via_cost)
+                            plane_layers, goal_planes, plane_step, attachment_via_cost,
+                            ml_attach, return_path)
         if path is None:
             continue  # unreachable at this (margin, grid) - try the next ladder rung
 
@@ -5696,6 +5876,10 @@ def _route_hierarchical(
     # Phase 7.3d: per-leg "other endpoint" bias (settings default False) -
     # see `nearest_free`'s docstring and `_route_one`'s identical read.
     pad_escape_aware = bool(ctx.get("pad_escape_direction_aware", False))
+    # Phase 7.18: identical reads to `_route_one`, so this last-resort tier
+    # costs a leg exactly the way the ordinary tier costs a window.
+    ml_attach = bool(ctx.get("multilayer_attachment", False))
+    return_path = (ctx.get("return_path_by_net") or {}).get(net)
 
     all_segments: list[dict[str, Any]] = []
     all_vias: list[dict[str, Any]] = []
@@ -5744,7 +5928,7 @@ def _route_hierarchical(
         path = _fine_search(backend, win, net_kind, weights, layer_purpose, directions,
                             s_cell, cur_layers, g_cell, leg_goal_layers,
                             home_layer, None, None, plane_layers, leg_goal_planes,
-                            plane_step, attachment_via_cost)
+                            plane_step, attachment_via_cost, ml_attach, return_path)
         if path is None and not is_last and leg_goal_layers != set(routable_layers):
             # Intermediate waypoint only: the coarse stage's layer preference
             # there isn't binding, only its (x, y) location is - retry with any
@@ -5755,7 +5939,7 @@ def _route_hierarchical(
             path = _fine_search(backend, win, net_kind, weights, layer_purpose, directions,
                                 s_cell, cur_layers, g_cell, leg_goal_layers,
                                 home_layer, None, None, plane_layers, leg_goal_planes,
-                                plane_step, attachment_via_cost)
+                                plane_step, attachment_via_cost, ml_attach, return_path)
         if path is None:
             return None  # this leg is unreachable even at the finest grid - terminal
 
@@ -6403,6 +6587,9 @@ def route_nets(
     attachment_via_cost = float(plane_cfg.get("attachment_via", 8.0))
     island_base = float(plane_cfg.get("island_base", 40.0))
     orphan_island_cost = float(plane_cfg.get("orphan_island", 1000.0))
+    # Phase 7.18.1 / 7.18.3 - both OFF by default (see DEFAULT_PCB_SETTINGS).
+    ml_attach = bool(plane_cfg.get("multilayer_attachment_choice", False))
+    return_path_bonus = float(plane_cfg.get("return_path_bonus", 0.0) or 0.0)
     plane_grid_mm = float(autor.get("grid_mm", 0.2)) or 0.2
     plane_clearance_mm = float(autor.get("clearance_fallback_mm", 0.2))
     plane_fill_index = _plane_fill_index_with_estimated(board_path, plane_grid_mm, plane_clearance_mm)
@@ -6520,6 +6707,20 @@ def route_nets(
     #    context so ONE stateless search function serves both the serial worklist
     #    and the spawned workers (see module-level `_route_one`). --------------- #
     plane_by_net = {c["net"]: _plane_components_for(c["net"]) for c in conns}
+    # Phase 7.18.3: reference-plane slices, built ONLY when the bonus is tuned
+    # on (default 0.0 -> `{}`, nothing computed, nothing pickled to workers,
+    # and `_build_fine_cost`'s `via` takes its untouched pre-7.18 branch).
+    return_path_by_net: dict[str, dict[str, Any]] = {}
+    if return_path_bonus > 0.0:
+        rp_near_mm = float((settings.get("stitching", {}) or {}).get("near_high_speed_mm", 1.0))
+        gnd_tokens = ((settings.get("schematic_checks", {}) or {})
+                      .get("cap_voltage", {}) or {}).get("gnd_tokens", []) or []
+        signal_nets = sorted({c["net"] for c in conns if plane_by_net.get(c["net"]) is None})
+        return_path_by_net = _reference_plane_rasters(
+            signal_nets, plane_fill_index, _plane_pads_by_net, power_patterns,
+            gnd_tokens, all_cu, routable_set, rp_near_mm)
+        for rec in return_path_by_net.values():
+            rec["bonus"] = return_path_bonus
     ctx: dict[str, Any] = {
         "power_patterns": power_patterns, "routable_layers": routable_layers,
         "routable_set": routable_set, "layer_types": layer_types, "grid": grid,
@@ -6532,6 +6733,8 @@ def route_nets(
         "track_half": track_half, "via_radius": via_radius, "rules": rules,
         "global_by_key": global_by_key, "tw": tw, "plane_by_net": plane_by_net,
         "base_obstacles": obstacles,
+        "multilayer_attachment": ml_attach,
+        "return_path_by_net": return_path_by_net,
         # Phase 7.12 neck-down: config + per-(ref, pad) copper size + the
         # board's min_track_width DRC floor. Small, picklable primitives -
         # shipped to workers with the rest of `ctx` unchanged.
@@ -6832,7 +7035,8 @@ def route_nets(
                                      core["s_cell"], core["start_layers"], core["g_cell"],
                                      core["goal_layers"], core["home_layer"], core["corridor"], win_cong,
                                      core["plane_layers"], core["goal_planes"],
-                                     plane_step, attachment_via_cost)
+                                     plane_step, attachment_via_cost,
+                                     ml_attach, (return_path_by_net or {}).get(core["net"]))
             if free_path is not None:
                 via_nodes = _path_via_nodes(free_path)
                 blockers: set[int] = set()
