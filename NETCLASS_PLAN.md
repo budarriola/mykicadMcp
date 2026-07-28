@@ -165,14 +165,14 @@ For whoever (human or AI) picks this up next:
   The 35 failures are now `unreachable_in_window` (genuine dense-board
   pathfinding), not budget — closing that gap is Opus-class whole-board
   optimization (7.6), not a bounded Sonnet patch. See ⭐ findings.
-- **Next work when resumed (updated 2026-07-27 — 7.15 landed too, see its
-  anchor):** (1) 7.14's optimizer pin-swap move + pause-the-user protocol —
-  was waiting on 7.6/7.7, both landed, so this is UNBLOCKED; per the plan's
-  own delegation strategy this one is Opus-class ("rides the router core").
-  (2) 7.3b's one remaining bit: lifting the 60mm/400k-node window cap toward
-  whole-board (numpy/accel, M5) — a heavier M5/accel undertaking, not a
-  bounded Sonnet patch. Still open: M6 item 17 (c) Flow B stack-up-gate
-  question.
+- **Next work when resumed (updated 2026-07-27 — 7.14 landed too, see its
+  anchor):** (1) 7.3b's one remaining bit: lifting the 60mm/400k-node window
+  cap toward whole-board (numpy/accel, M5) — a heavier M5/accel undertaking,
+  not a bounded Sonnet patch, and the only clearly-open item left in the
+  entire Phase 7 tree at this point. (2) 7.13 impedance-matched traces &
+  matched sets — spec'd (see its section), Opus-class per the plan's own
+  delegation strategy, not yet started. Still open: M6 item 17 (c) Flow B
+  stack-up-gate question.
 - **Nothing has been committed** in either repo as of this snapshot — review the
   working tree before assuming git history matches this file.
 - Verify claims against the code (`kicad_pcb_tool.py`, `kicad_mcp_server.py`,
@@ -674,6 +674,22 @@ router work):
   failures. **This closes out build-order item 14 (7.6/7.7/7.15) entirely** —
   only the viewer's cancel/decision UI and portfolio replicas remain as
   low-priority residuals there.
+  (21) ✅ **Phase 7.14 connector pin-swap advisor — LANDED 2026-07-27** (Opus
+  subagent, worktree-isolated, coordinator did a full independent code
+  read-through given the safety-criticality of "never edit the schematic/
+  netlist" — not just a report review). See its anchor for the full
+  write-up: a seventh optimizer "move" that is never applied by this tool,
+  priced as a controlled A/B via trial-only pad-net swaps on scratch board+
+  netlist copies, escalated as a MANDATORY (not `ai_decisions`-gated) pause
+  when it clears `pin_swap.min_gain`, with a re-sync path that adopts (never
+  decides) the real board's post-edit pad assignment, and a defense-in-depth
+  safety gate refusing any `write=True` whose scratch/real pad-net maps
+  disagree for any reason. 92 tools (unchanged), 303→317 passed, same 7
+  pre-existing failures. **This closes out essentially all of Phase 7's
+  originally-scoped feature list** — the only clearly-open items remaining
+  anywhere in the plan are M5 whole-board windowing (7.3b's last bit) and
+  7.13 impedance-matched traces (spec'd, not started), plus assorted
+  low-priority residuals (viewer polish, portfolio replicas, GPU tier).
 
 ## How to work this plan (living document — keep it current)
 
@@ -2145,41 +2161,93 @@ buses tagged impedance-critical (Phase 9), and explicit user sets.
   the same "wait until impedance control / stack-up is set up?" question as
   Phase 9's critical-length gate — one code path, one recorded answer.
 
-### 7.14 Connector detection & pin-swap advisor
+### 7.14 — LANDED 2026-07-27 (reference anchor; no work remains here)
 
 **Detection LANDED 2026-07-23** (anchor): `detect_connectors(project_path,
-ref_prefixes=None)` → tool `detect_kicad_connectors` (read-only, 79 tools) in
-`kicad_pcb_tool.py`, plus the `pin_swap` block in `DEFAULT_PCB_SETTINGS`
-(`{enabled:false, min_gain:25.0, ref_prefixes:["J","P","CN","X"]}`). Candidates
-match by EITHER ref prefix OR footprint/library connector token (`conn`,
-`header`, `connector`, `socket`, `terminal`), reported per-candidate via
-`matched_by`; returns `ref`, `footprint`, `pin_count`, `pins` (pad+net from the
-board's own pad nets). Never guesses swappability, never writes. The
-exclusion-validation helper also landed: `validate_connector_exclusions(...)`
-raises `ValueError` listing unresolved names AND the full detected-ref list
-(case-insensitive resolve) — the loud-abort contract below, callable from the
-session layer. 14 tests in `tests/test_connectors.py`. Measured on kiln: 24
-J-prefixed connectors (J1–J25, J22 absent); J2 the only one matched by both
-signals (`Connector_JST:JST_XH_B10B-XH-AM_1x10`); no P/CN/X or non-J
-connector-token footprints present.
+ref_prefixes=None)` → tool `detect_kicad_connectors` (read-only) in
+`kicad_pcb_tool.py`, plus `validate_connector_exclusions(...)` (loud-abort on
+an unresolved exclusion name). 14 tests in `tests/test_connectors.py`.
+Measured on kiln: 24 J-prefixed connectors (J1–J25, J22 absent); J2 the only
+one matched by both signals.
 
-**Interaction contract (before optimization) — STILL TO BUILD (needs 7.6):**
-present detected connectors and
-ask (a) whether the optimizer may consider pin swaps at all, (b) which
-connectors are off-limits, (c) optional per-connector swappable pin groups
-(default: signal pins swappable within one connector; power/ground pins —
-Phase 9/`_net_kind` classification — excluded). Exclusion validation is done
-(the landed helper above); the session-layer prompt that calls it is not.
+**The pin-swap advisor itself LANDED 2026-07-27** (Opus subagent — standing
+authorization per the 2026-07-24 user decision and the plan's own
+delegation-strategy note that this rides the router core; worktree-isolated;
+coordinator did a full independent code read-through plus its own
+from-scratch test runs given the safety-criticality of this feature).
+Implemented in `kicad_optimizer_tool.py` as a **seventh "move" this tool can
+never apply** — categorically different from the other six, which are all
+copper moves promotable by `_commit_choice`. A pin swap changes which NET
+OWNS WHICH PAD, whose source of truth is the schematic; this tool never
+writes the schematic or the real `.net` file, full stop.
 
-**Optimizer move (7.6 family):** a swap = re-terminating two nets' ratsnest
-endpoints on that connector; scored like any move. **The tool never edits the
-schematic.** If the best swap gains ≥ `pin_swap.min_gain` board-score points,
-the session pauses (`awaiting_decision`, decision type `pin_swap`) and asks the
-**user** — not the 7.7 AI — to make the change in the schematic and re-export
-the netlist; the session re-syncs (netlist-staleness check) and continues.
-Sub-threshold swaps are reported, not proposed. Knobs `pin_swap`:
-`{enabled: false, min_gain: 25.0, ref_prefixes: ["J","P","CN","X"]}` (off by
-default — consent-gated anyway).
+**How a swap is priced without touching the real netlist:** on a disposable
+trial copy (the same scratch pattern every other move uses), the swap is made
+REAL rather than simulated — the two pads' own `(net ...)` s-expressions in
+the trial board, and the matching `(node ...)` blocks in the trial `.net`
+copy, are swapped verbatim (format-preserving text-span exchange, not a
+rewrite) via new trial-only helpers (`_trial_swap_pad_nets` and its s-expr
+span-finding support). This keeps `route_nets`'s `_self_check` clearance
+model, `get_ratsnest`, and `get_trace_cost` all operating on genuinely
+coherent data — a deliberate rejection of the alternative (synthetic
+`route_nets(connections=...)` endpoints impersonating a pad that net doesn't
+actually own), which would have broken self-check's trust that routed copper
+belongs to the net whose pad it touches.
+
+**Controlled A/B, not "current score vs swapped score":** each candidate pair
+is priced on two sibling trials that differ in exactly one respect — both
+strip the two nets' copper (even hand-routed copper, safe only because
+neither trial is ever promoted — see below) and reroute them as-is
+(`baseline`) or with the two pads' nets traded (`swap`); `gain = baseline -
+swap` is therefore attributable to the swap alone, not to rerouting noise. A
+cheap airline-distance estimate (`_pin_swap_pairs`) ranks all candidate pairs
+first so only the most promising few (`_MAX_PIN_SWAP_TRIALS`, default 2) ever
+reach a full two-trial reroute — a real connector's full pair count would
+make pricing everything impractical.
+
+**The pause is MANDATORY, not `ai_decisions`-gated:** `_pin_swap_gate` runs
+once per iteration, before any copper candidate is generated, and — unlike
+every other decision type — is not filtered by `min_score_spread`,
+`max_pauses_per_run`, or the `decision_types` allowlist (`"pin_swap"` is
+deliberately absent from that allowlist for this reason). A swap clearing
+`pin_swap.min_gain` always escalates, because "clear winner" and "cannot be
+applied by this tool" are simultaneously true. Sub-threshold swaps are
+recorded in `pin_swap_reports` (visible) but never proposed as a decision.
+`pin_swap.enabled` (default `false`) gates the whole feature and is checked
+before a single unit of RNG is consumed, so a session that never touches this
+knob is provably byte-identical to a pre-7.14 session.
+
+**Re-sync after the human answers** (`_resync_pad_nets`): answering `opt2`
+("I made the change") diffs the REAL board's current pad-net map against the
+scratch's and adopts (never decides) the real board's assignment onto the
+scratch, pad by pad, for ANY divergence found — not just the one pair
+proposed, so a second manual edit the user made isn't silently ignored. Only
+autorouter-owned copper on affected nets is rerouted (through `unroute_nets`,
+whose ownership guard is never bypassed); hand copper on an affected net is
+left alone and reported in `hand_copper_nets` for the user to redo. Answering
+`opt2` without actually having made the change is harmless — the diff finds
+nothing and says so. A pad-level staleness check (`_netlist_pad_mismatches`)
+is used here rather than the existing name-set staleness guards in
+`detect_buses`/`classify_critical_nets`, because a pin swap changes no net
+NAME at all — only which pad a name sits on — which a name-set comparison is
+structurally blind to.
+
+**Defense in depth:** `_apply_session` gained a hard safety gate — before ANY
+`write=True`, the scratch board's pad-net map is compared against the real
+board's, and the write is refused outright on any divergence at all, for any
+reason, not just one this feature could plausibly cause. This asserts the
+"never silently change which net a pad belongs to" property directly rather
+than trusting that no code path ever promotes a swap trial into the scratch.
+
+92 tools (unchanged — no new MCP tool; `optimize_kicad_board` gained a
+`pin_swap_exclusions` parameter; `decide_kicad_route` gained a dedicated
+answer path for `decision_type: "pin_swap"` that commits nothing). 14 new
+tests in `tests/test_pin_swap.py`. Full suite 303→317 passed, same 7
+pre-existing board-drift failures, 7 skipped.
+
+Knobs `pin_swap`: `{enabled: false, min_gain: 25.0, ref_prefixes:
+["J","P","CN","X"]}` — unchanged from the already-landed detection schema, no
+new keys needed.
 
 ### 7.15 — LANDED 2026-07-27 (reference anchor; no work remains here)
 
