@@ -975,6 +975,11 @@ def _zone_island_model(board_path: Path, settings: dict[str, Any]) -> dict[str, 
 
     zone_reports: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
+    # Phase 7.18.2: every fill component this pass builds, keyed (net, layer),
+    # so the cross-layer continuity view below can ask "does this via/pad land
+    # in real copper on BOTH layers?" against the same components the
+    # same-layer island model just costed - one fill decomposition, two views.
+    comps_by_net_layer: dict[tuple[str, str], list[dict[str, Any]]] = {}
     total_islands = 0
     total_orphans = 0
     total_cost = 0.0
@@ -1016,6 +1021,8 @@ def _zone_island_model(board_path: Path, settings: dict[str, Any]) -> dict[str, 
                     "component_count": 0, "components": [],
                 })
                 continue
+
+            comps_by_net_layer.setdefault((net, layer), []).extend(comps)
 
             comp_records = []
             for comp in comps:
@@ -1116,6 +1123,9 @@ def _zone_island_model(board_path: Path, settings: dict[str, Any]) -> dict[str, 
             "layers": layer_reports,
         })
 
+    cross_layer, weak_pairs = _cross_layer_continuity(
+        comps_by_net_layer, pads_by_net, tracks, stack_order, all_cu, warn_below)
+
     return {
         "board_path": str(board_path),
         "plane_settings": {
@@ -1125,13 +1135,112 @@ def _zone_island_model(board_path: Path, settings: dict[str, Any]) -> dict[str, 
             "island_min_attachments_warn": warn_below,
         },
         "zones": zone_reports,
+        "cross_layer": cross_layer,
         "summary": {
             "island_count": total_islands,
             "orphan_island_count": total_orphans,
             "total_island_cost": round(total_cost, 4),
             "warnings": warnings,
+            "weakly_coupled_layer_pairs": weak_pairs,
         },
     }
+
+
+def _cross_layer_continuity(
+    comps_by_net_layer: dict[tuple[str, str], list[dict[str, Any]]],
+    pads_by_net: dict[str, list[dict[str, Any]]],
+    tracks: dict[str, list[dict[str, Any]]],
+    stack_order: dict[str, int], all_cu: list[str], warn_below: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Phase 7.18.2 - the CROSS-layer view of plane continuity.
+
+    7.5.3's island model answers "is this island connected to the rest of its
+    OWN layer's pour". It says nothing about the other axis: two pours of the
+    same net on two different layers are nominally the same node in the
+    netlist, but if only one via bonds them, everything referencing one of them
+    reaches the other through that single via's inductance/resistance - a real
+    electrical weakness the schematic cannot show. This makes it visible.
+
+    For each net owning fill on more than one copper layer, every unordered
+    LAYER PAIR gets a count of BONDING VIAS: same-net vias whose electrical
+    span (`_via_layer_set` - a through via bonds every layer between its named
+    ends, not just the two named) covers both layers AND which physically land
+    inside real fill copper on BOTH layers. Same-net through-hole PADS that do
+    the same are counted separately (`bonding_pad_count`): they genuinely bond
+    the layers too, so hiding them would over-warn, but they are not something
+    a stitching pass places, so they do not clear the flag.
+
+    A pair with fewer than `plane.island_min_attachments_warn` bonding VIAS is
+    flagged `weakly_coupled` - the same knob and the same "how many attachment
+    points are enough" convention the same-layer model already uses.
+
+    READ-ONLY, and no new tool: `run_kicad_stitching_pass` (7.5.6) is already
+    the writer that fixes exactly this, so this closes the loop by making the
+    gap visible rather than adding a second way to place copper."""
+
+    def _lands_in_fill(net: str, layer: str, x: float, y: float, reach: float) -> bool:
+        for comp in comps_by_net_layer.get((net, layer), []):
+            if comp["raster"].covers(x, y, reach):
+                return True
+        return False
+
+    nets_layers: dict[str, set[str]] = {}
+    for (net, layer) in comps_by_net_layer:
+        nets_layers.setdefault(net, set()).add(layer)
+
+    reports: list[dict[str, Any]] = []
+    weak: list[dict[str, Any]] = []
+    for net in sorted(nets_layers):
+        layers = sorted(nets_layers[net], key=lambda l: stack_order.get(l, 0))
+        if len(layers) < 2:
+            continue
+        pairs: list[dict[str, Any]] = []
+        for i, la in enumerate(layers):
+            for lb in layers[i + 1:]:
+                vias = []
+                for via in tracks.get("vias", []):
+                    if via.get("net") != net:
+                        continue
+                    span = _via_layer_set(via, stack_order, all_cu)
+                    if la not in span or lb not in span:
+                        continue
+                    at = via["at"]
+                    reach = float(via.get("size", 0.6)) / 2.0
+                    if (_lands_in_fill(net, la, at["x"], at["y"], reach)
+                            and _lands_in_fill(net, lb, at["x"], at["y"], reach)):
+                        vias.append({
+                            "uuid": via.get("uuid", ""),
+                            "position": {"x": round(at["x"], 4), "y": round(at["y"], 4)},
+                        })
+                pad_count = 0
+                for pad in pads_by_net.get(net, []):
+                    span = _pad_layer_set(pad, all_cu)
+                    if la not in span or lb not in span:
+                        continue
+                    pos = pad["position"]
+                    reach = _pad_reach(pad)
+                    if (_lands_in_fill(net, la, pos["x"], pos["y"], reach)
+                            and _lands_in_fill(net, lb, pos["x"], pos["y"], reach)):
+                        pad_count += 1
+                weakly = len(vias) < warn_below
+                rec = {
+                    "layers": [la, lb],
+                    "stack_adjacent": abs(stack_order.get(la, 0) - stack_order.get(lb, 0)) == 1,
+                    "bonding_via_count": len(vias),
+                    "bonding_vias": vias[:8],
+                    "bonding_pad_count": pad_count,
+                    "weakly_coupled": weakly,
+                }
+                pairs.append(rec)
+                if weakly:
+                    weak.append({"net": net, "layers": [la, lb],
+                                 "bonding_via_count": len(vias),
+                                 "bonding_pad_count": pad_count})
+        reports.append({
+            "net": net, "layers": layers, "layer_pairs": pairs,
+            "weakly_coupled_pair_count": sum(1 for p in pairs if p["weakly_coupled"]),
+        })
+    return reports, weak
 
 
 def audit_plane_islands(project_path: str | Path) -> dict[str, Any]:
@@ -1150,6 +1259,18 @@ def audit_plane_islands(project_path: str | Path) -> dict[str, Any]:
     they don't survive a KiCad refill, so they are never costed or offered a
     stitching suggestion (per the NETCLASS_PLAN edge-case note). Keepout /
     no-net zones carry no attachments and are excluded.
+
+    PHASE 7.18.2 adds the CROSS-layer view alongside the per-zone one, under
+    the top-level `cross_layer` key (plus `summary.weakly_coupled_layer_pairs`):
+    for every net owning fill on more than one copper layer, each unordered
+    layer pair reports how many same-net vias actually BOND those two pours
+    (span both layers AND land in real fill copper on both), how many same-net
+    through-hole pads do (context - they bond too, but a stitching pass does
+    not place them), whether the two layers are stack-adjacent, and a
+    `weakly_coupled` flag when the bonding-VIA count is below `plane.island_
+    min_attachments_warn`. Two pours that are one netlist node but are joined
+    by a single via are electrically thin between them; `run_kicad_stitching_
+    pass` (7.5.6) is the existing writer that fixes what this flags.
     """
     board_path, _, _ = _pcb._resolve_project_path(project_path)
     settings = _pcb.load_pcb_settings(project_path)["config"]

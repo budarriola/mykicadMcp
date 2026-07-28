@@ -1011,7 +1011,17 @@ class KiCadMcpServer:
                     "warn flag below island_min_attachments_warn, and for costed islands the cheapest "
                     "stitching-via position found (nearest point to the mainland component) with its "
                     "projected new attachment count and cost. Keepout/no-net zones are excluded. "
-                    "Read-only; does not place anything (that's Phase 7.5.6)."
+                    "Phase 7.18.2 adds a CROSS-layer view under the top-level cross_layer key (and "
+                    "summary.weakly_coupled_layer_pairs): for every net owning fill on more than one "
+                    "copper layer, each unordered layer pair reports bonding_via_count (same-net vias "
+                    "that span BOTH layers and land inside real fill copper on both - a through via "
+                    "bonds every layer between its named ends), bonding_pad_count (same-net through-"
+                    "hole pads doing the same; context only, a stitching pass does not place pads), "
+                    "stack_adjacent, and weakly_coupled when the bonding-VIA count is below "
+                    "island_min_attachments_warn - two pours that are one netlist node but are "
+                    "electrically thin between them. Read-only; does not place anything - "
+                    "run_kicad_stitching_pass (Phase 7.5.6) is the writer that fixes both the "
+                    "same-layer islands and the cross-layer gaps this reports."
                 ),
                 "inputSchema": {
                     "type": "object",
