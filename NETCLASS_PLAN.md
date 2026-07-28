@@ -2005,6 +2005,17 @@ parse/replay, graceful tkinter-unavailable degradation) — 208→226 passed, sa
   `ProgressState` (no 7.6/7.7 optimizer/decision protocol exists yet to feed
   it).
 
+**Auto-close added 2026-07-28 (coordinator-implemented, user request):** a
+viewer window auto-LAUNCHED by `autorouter.progress.open_viewer` (the
+unattended/config-driven case — a session isn't necessarily sitting there
+watching) now closes itself ~4s after `run_complete`, via a `--auto-close` CLI
+flag `open_route_viewer(..., auto_close=True)` passes only from its internal
+`route_nets` call site. The explicit `open_kicad_route_viewer` MCP tool call
+(a human/session deliberately asking to watch) always passes `auto_close=
+False` and is unaffected — that window stays up for review. 5 new tests in
+`tests/test_route_progress.py` (flag plumbing both directions, the internal
+call site, CLI parsing); full suite still green.
+
 ### 7.10 Warm start — an existing board as the starting point
 
 Out of the box the router only *adds* copper: existing routing is fixed obstacle
@@ -2400,6 +2411,138 @@ behind one entry point, not a sequence the caller has to orchestrate by hand.
 - Documented on `docs/mcp-tools/11-autorouter.md` (the route→review→write
   workflow) **and** in README/CLAUDE.md's "Common Tasks" as the headline
   "route the board" command.
+
+---
+
+## Phase 7.18 — Multi-layer plane fill & via-mediated connectivity (added 2026-07-28 at user request)
+
+User priority: "advanced use of fill areas on different layers, and effective
+use of vias to both connect fill layers and signals." Extends the landed 7.5
+plane engine (via-drops through pours, plane costing, stitching) rather than
+replacing any of it — the "signal nets never treated as a plane" gate
+(2026-07-24 REQUIRED CONSTRAINT, see its anchor) is untouched by everything
+below.
+
+- **7.18.1 Multi-layer attachment choice.** Today `_plane_components_for`
+  attaches a power/gnd net's via to whichever owning zone component it finds
+  first. When the SAME net owns zones on more than one layer (kiln's
+  `GND_Main`/`GND_Safty` do — F.Cu/B.Cu/In1.Cu per the M0 inventory), evaluate
+  every owning layer's component at the candidate cell and pick by the same
+  cost model everything else uses (attachment-via cost + island cost +
+  `layer_purpose` multiplier + congestion), not "first found." Read-only
+  ranking change to an existing decision point — no new obstacle model, no new
+  knob required (reuses `plane.*` weights already in `pcb_settings.json`).
+- **7.18.2 Cross-layer fill continuity audit.** Extends `audit_kicad_plane_
+  islands` (7.5.3 today only reasons about SAME-layer island isolation) with a
+  cross-layer view: for a net owning same-net zones on multiple layers, report
+  how many stitching vias actually bond them together and flag layer pairs
+  with zero or few (below `island_min_attachments_warn`) bonding vias as
+  weakly-coupled — two same-net pours that are nominally "the same net" but
+  electrically thin between them (added inductance/resistance the schematic
+  doesn't show). Read-only audit; the existing `run_kicad_stitching_pass`
+  (7.5.6) is the tool that already fixes what this flags, so no new writer is
+  needed — this closes the loop by making the gap visible.
+- **7.18.3 Return-path-aware via placement for signal nets.** Today, a signal
+  net's layer-change via cost is layer-purpose/congestion only; it has no
+  preference for landing near existing REFERENCE-plane copper (GND/power) on
+  the layer(s) it's transiting, even though 7.5.6's stitching pass already
+  values this after the fact (`near_high_speed_mm`/`near_high_speed_pitch_mm`).
+  Add a routing-TIME cost term (new `plane.return_path_bonus` weight, default
+  0 so a project that never tunes it is byte-identical to today) that
+  discounts a via's cost when it lands within `near_high_speed_mm` of the
+  net's own reference-plane zone on an ADJACENT layer — pulling signal vias
+  toward locations a stitching via can cheaply reference, without ever
+  routing the signal net itself through the plane (the 7.5.4 gate still
+  applies). Must not regress the existing plane-parity/signal-fill-is-not-a-
+  plane tests.
+- Gate: real-kiln measurement before/after on `get_kicad_trace_cost` +
+  `audit_kicad_plane_islands`, and the existing plane/parity test suite must
+  stay green plus new tests for each of 7.18.1–7.18.3. Delegate: Opus
+  (algorithm/cost-model work riding the router core, same class as 7.5/7.6).
+
+## Phase 7.19 — Lightweight route cost estimation (added 2026-07-28 at user request)
+
+User priority: faster discovery of the best route without paying full
+windowed-A* cost on every candidate. Today 7.3a's global stage already scores
+candidate coarse paths, and 7.3b's fine A* uses a plain octile-distance
+heuristic — admissible but not informed by the board's actual obstacle/
+congestion structure, so it explores more cells than a tighter heuristic would.
+
+- **7.19.1 Coarse-field heuristic for the fine A\*.** Precompute, once per
+  connection (reusing 7.3a's own coarse grid — no new grid resolution to
+  maintain), a backward cost-distance field from the goal via a coarse
+  Dijkstra/BFS wavefront over the SAME capacity/cost map 7.3a already builds.
+  Use this field (bilinearly resolved to the fine grid, or nearest-coarse-cell
+  as a first cut) as the fine A*'s heuristic in place of plain octile
+  distance. Must stay admissible (prove: coarse field values never overstate
+  the true fine-grid cost — same-direction argument as an admissible coarse-
+  to-fine heuristic in any hierarchical pathfinder) so the byte-identical-
+  result guarantee holds: a tighter heuristic changes exploration order and
+  count, never the returned path, when both heuristics are admissible and the
+  tie-break rule (already deterministic) is unchanged. This is the "find the
+  best route faster" lever — fewer cells expanded for the identical answer.
+- **7.19.2 Cheap pre-ranking of global-stage candidates.** 7.3a already
+  produces 1–3 ranked coarse candidates per connection/bundle; before handing
+  ALL of them to detailed routing, use a cheap estimate (candidate coarse cost
+  + a fixed per-via/per-layer-change constant, no fine A* run) to decide
+  whether the 2nd/3rd candidate is worth ever detail-routing at all, vs. only
+  falling back to it when the top candidate's detailed route fails/self-check-
+  fails. Must not change which candidate ultimately gets emitted when the top
+  candidate succeeds (identical to today); only changes whether a doomed
+  lower-ranked candidate's detailed A* is skipped.
+- Gate: measured wall-clock reduction on the real kiln board (this is one of
+  the few places in the plan where a timing measurement is actually the
+  point, unlike the "don't measure speedups" directive elsewhere — reducing
+  search time IS the deliverable here) with byte-identical routed geometry
+  before/after (a parity suite proving the tighter heuristic changes nothing
+  but exploration count), plus new tests for admissibility and pre-ranking
+  skip behavior. Delegate: Opus (touches the same A* core as 7.3b/M5).
+
+## Phase 7.20 — Adjacent-layer parallel-trace (crosstalk) avoidance (added 2026-07-28 at user request)
+
+User priority: avoid routing a trace parallel and closely spaced to another
+net's trace on a directly adjacent copper layer, unless the two nets are part
+of the same confirmed bus (where running parallel is expected/desired — see
+Phase 3/Flow A's `confirmed_buses`).
+
+- **New `pcb_settings.json` block** `crosstalk`: `{enabled: true,
+  adjacent_layer_penalty_per_mm: <cost/mm>, min_parallel_run_mm: <threshold
+  before the penalty engages — a short incidental overlap is not crosstalk>,
+  min_spacing_mm: <XY offset within which two layers' traces count as
+  "aligned">, same_bus_exempt: true}`. `enabled: false`-equivalent default
+  (penalty 0) so an untuned project is byte-identical to today.
+- **Cost term.** During detailed A*, when a candidate cell/segment on layer L
+  has existing copper (this run's own placements + already-routed board
+  copper) directly on the STACK-ADJACENT layer (ordinal-adjacent per
+  `get_kicad_board_layers`, not just "any other layer" — a non-adjacent layer
+  pair has a reference plane or enough dielectric between them that this
+  doesn't apply) within `min_spacing_mm` in XY, and that copper's net is
+  DIFFERENT from the net being routed AND the two nets are not members of the
+  same `confirmed_buses` entry (board-local JSON) or the same `detect_buses`
+  candidate, accrue `adjacent_layer_penalty_per_mm` for the overlapping run
+  length once it exceeds `min_parallel_run_mm`. Same-bus members must incur
+  NO penalty against each other (that's the exemption) but still incur it
+  against a third-party net's copper on the adjacent layer.
+- **Exemption correctness is the hard part**: a false exemption silently
+  disables the feature for real risk, and a false penalty makes normal bus
+  routing artificially expensive. Test both directions explicitly — two
+  confirmed SPI members routing directly above/below each other must be
+  penalty-free; an SPI net and an unrelated GPIO net doing the same must not
+  be.
+- Gate: real-kiln measurement (which existing adjacent-layer parallel runs
+  get penalized, board score before/after with the term at a nonzero weight),
+  parity at the default (penalty 0, byte-identical to pre-7.20 routing), and
+  new tests for the adjacency-detection, spacing threshold, run-length
+  threshold, and same-bus exemption (both directions) individually. Delegate:
+  Opus (new cost term in the same router core).
+
+**Sequencing note (coordinator, 2026-07-28):** all three of 7.18/7.19/7.20
+touch `kicad_router_tool.py`'s cost model and/or `_FineWindow`/`_fine_search`
+call sites — the same surface M5 just changed. Land them ONE AT A TIME
+(worktree branched from the post-M5 `main`, reviewed and merged before the
+next starts), not as three parallel delegations, to avoid three-way conflicts
+in the hottest file in the codebase. Order per the user's stated priority:
+7.18 first, then 7.19, then 7.20.
 
 ---
 
@@ -2850,6 +2993,19 @@ touched by this work, no write occurred).
 21. Optional Phase 5 refinements recorded in its anchor: per-station polyline
     centerline (S-shaped bundles read slightly high today) and
     equidistant-trunk splitting.
+
+**M7 — Fill/via engineering, route-search speed, crosstalk avoidance (added
+2026-07-28 at user request):**
+22. Phase 7.18 multi-layer plane fill & via-mediated connectivity (7.18.1
+    attachment-choice ranking, 7.18.2 cross-layer continuity audit, 7.18.3
+    return-path-aware via placement) — see its section; Opus; land FIRST of
+    this milestone's three items per the user's stated priority.
+23. Phase 7.19 lightweight route cost estimation (coarse-field A* heuristic,
+    cheap global-candidate pre-ranking) — see its section; Opus; land second,
+    after 7.18 merges.
+24. Phase 7.20 adjacent-layer parallel-trace (crosstalk) avoidance — see its
+    section; Opus; land third, after 7.19 merges (all three touch the same
+    router-core surface — see the sequencing note in Phase 7.20's section).
 
 **Every milestone:** docs for its tools (`docs/mcp-tools/10-…`/`11-…`), README +
 CLAUDE.md tool count/group sync, `.gitignore`/requirements entries when that

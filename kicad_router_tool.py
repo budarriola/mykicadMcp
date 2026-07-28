@@ -6581,13 +6581,25 @@ def _route_cancel_requested(project_path: str | Path) -> bool:
         return False
 
 
-def open_route_viewer(project_path: str | Path, board: str | None = None) -> dict[str, Any]:
+def open_route_viewer(
+    project_path: str | Path, board: str | None = None, auto_close: bool = False,
+) -> dict[str, Any]:
     """Phase 7.9 - spawn the detached `kicad_route_viewer.py <board_path>`
     process that tails `<board>.route_progress.jsonl`. Decoupled by
     construction: the router only ever appends to that file, so the viewer
     can be opened, closed, or crash without touching (or blocking) routing.
     Also called internally by `route_nets`/`route_board` when
-    `autorouter.progress.open_viewer` is true.
+    `autorouter.progress.open_viewer` is true (with `auto_close=True` - see
+    below).
+
+    `auto_close`: when True, the spawned viewer closes itself a few seconds
+    after it sees `run_complete` in the event stream. This is for the
+    UNATTENDED case - a session/pipeline auto-launched the viewer via the
+    settings knob, nobody necessarily asked to sit and watch it, so it should
+    not linger after the route is done. The explicit `open_kicad_route_viewer`
+    MCP tool call (a human/session deliberately asking to watch) always
+    passes `auto_close=False` (the default) so that window stays up for
+    review at the viewer's own pace, same as before this existed.
 
     Observational-only failure honesty: if tkinter is unavailable (headless
     CI/container), this returns `{"launched": False, "reason": ...}` instead
@@ -6617,14 +6629,16 @@ def open_route_viewer(project_path: str | Path, board: str | None = None) -> dic
             subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     else:
         popen_kwargs["start_new_session"] = True
+    argv = [sys.executable or "python", str(viewer_script), str(board_path)]
+    if auto_close:
+        argv.append("--auto-close")
     try:
-        proc = subprocess.Popen(
-            [sys.executable or "python", str(viewer_script), str(board_path)], **popen_kwargs)
+        proc = subprocess.Popen(argv, **popen_kwargs)
     except OSError as exc:
         return {"launched": False, "reason": f"failed to launch viewer subprocess: {exc}"}
     return {
         "launched": True, "pid": proc.pid, "board_path": str(board_path),
-        "viewer_script": str(viewer_script),
+        "viewer_script": str(viewer_script), "auto_close": auto_close,
     }
 
 
@@ -7018,7 +7032,11 @@ def route_nets(
             project_path, board_path, settings, _progress_session))
         if bool(progress_cfg.get("open_viewer", False)):
             try:
-                open_route_viewer(project_path)
+                # auto_close=True: this launch is config-driven, not a user
+                # explicitly asking to watch (that's the separate
+                # `open_kicad_route_viewer` MCP tool, which never auto-closes)
+                # - see `open_route_viewer`'s docstring.
+                open_route_viewer(project_path, auto_close=True)
             except Exception:
                 pass
     placements: dict[int, dict[str, Any]] = {}      # owner -> {segments, vias, rec, net, obstacles}
