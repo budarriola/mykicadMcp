@@ -185,8 +185,41 @@ def _build_cost_arrays(
     # -- via cost per (iy, ix, l) landing on layer l ------------------------- #
     via_base = np.full((R, C, L), weights.via * weights.through_via, dtype=np.float64)
     if plane_layers:
-        via_base = np.where(has_pf, via_base + attachment_via_cost, via_base)
-    vq = np.rint(via_base * 1000.0).astype(np.int64)
+        if model.get("multilayer_attachment"):
+            # 7.18.1: attachment surcharge scaled by the landed component's
+            # island factor - same expression/order as the scalar `via`.
+            via_base = np.where(
+                has_pf, via_base + attachment_via_cost * np.nan_to_num(pf, nan=0.0), via_base)
+        else:
+            via_base = np.where(has_pf, via_base + attachment_via_cost, via_base)
+    rp_bonus = float(model.get("return_path_bonus", 0.0) or 0.0)
+    if rp_bonus:
+        # 7.18.3: same per-(cell, layer) predicate the scalar model uses, then
+        # the same discount + floor, so both backends stay bit-identical.
+        #
+        # M5 HOST/DEVICE DISCIPLINE: this whole function is HOST-side numpy by
+        # design (see `fine_wavefront` - only the finished q0/q1/vq integer
+        # fields cross to the device via `xp.asarray`). `rp_near` is a Python
+        # closure over `_FillRaster.covers`, so it could not run on a device
+        # anyway; building `near` here with plain `np` is therefore the
+        # correct placement, not an oversight - the discount is baked into
+        # `vq` before anything is transferred, and the gpu tier sees an
+        # already-discounted integer field identical to the numpy tier's.
+        near = np.zeros((R, C, L), dtype=bool)
+        rp_near = model["return_path_near"]
+        for li_, layer in enumerate(layers):
+            for iy in range(R):
+                for ix in range(C):
+                    if rp_near(ix, iy, layer):
+                        near[iy, ix, li_] = True
+        floor = int(model.get("min_via_milli", 1))
+        vq = np.where(
+            near,
+            np.maximum(np.rint((via_base - rp_bonus) * 1000.0).astype(np.int64), floor),
+            np.rint(via_base * 1000.0).astype(np.int64),
+        )
+    else:
+        vq = np.rint(via_base * 1000.0).astype(np.int64)
     if congestion:
         vq = vq + cong
     via_blocked = np.zeros((R, C), dtype=bool)
@@ -208,6 +241,12 @@ def fine_wavefront(
     plane_layers: "dict[str, list[dict[str, Any]]] | None" = None,
     goal_planes: "dict[str, list[dict[str, Any]]] | None" = None,
     plane_step: float = 0.0, attachment_via_cost: float = 0.0,
+    # Phase 7.18 cost-model options, kept in the SAME positional slots
+    # `_fine_astar` uses so `_fine_search`'s positional passthrough hands both
+    # backends identical arguments. They must stay ahead of `xp`, which callers
+    # only ever pass by keyword (see `_fine_search`'s gpu branch).
+    multilayer_attachment: bool = False,
+    return_path: "dict[str, Any] | None" = None,
     xp: Any = None,
 ) -> "list[tuple[int, int, str]] | None":
     """numpy/GPU detailed search — drop-in for `kicad_router_tool._fine_astar`.
@@ -237,7 +276,8 @@ def fine_wavefront(
     model = rt._build_fine_cost(
         win, net_kind, weights, layer_purpose, directions, home_layer,
         corridor_cells, congestion, plane_layers, goal_planes, plane_step,
-        attachment_via_cost, goal_cell, goal_layers)
+        attachment_via_cost, goal_cell, goal_layers,
+        multilayer_attachment, return_path)
     li = model["li"]
     heuristic = model["heuristic"]
     layers = win.layers

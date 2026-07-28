@@ -4886,6 +4886,18 @@ DEFAULT_PCB_SETTINGS: dict[str, Any] = {
         "island_min_attachments_warn": 2,
         "create_plane": 15.0,
         "modify_plane": 5.0,
+        # Phase 7.18.1 - rank a plane attachment by the SAME cost model the rest
+        # of the plane engine uses (best covering component / island-quality-
+        # scaled attachment via) instead of "first component found". OFF by
+        # default: it changes emitted geometry on any multi-layer/multi-zone
+        # plane net, and this codebase's parity gate requires an untuned
+        # project to route byte-identically to before the feature landed.
+        "multilayer_attachment_choice": False,
+        # Phase 7.18.3 - cost DISCOUNT applied to a SIGNAL net's via when it
+        # lands within `stitching.near_high_speed_mm` of that net's own
+        # reference-plane copper on a stack-adjacent layer. 0.0 = disabled
+        # (byte-identical to pre-7.18 routing).
+        "return_path_bonus": 0.0,
     },
     "neck_down": {
         "enabled": True,
