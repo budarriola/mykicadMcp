@@ -137,6 +137,16 @@ def test_lazy_iteration_materializes_the_same_set():
     assert set(lazy.blocked_via) == eager.blocked_via
 
 
+def test_lazy_set_compares_equal_to_the_eager_set_directly():
+    """A lazy view must not silently compare unequal to a plain `set` (identity
+    comparison would be a subtle trap for any future set-comparing caller)."""
+    eager, lazy, _ = _both_windows()
+    for layer in _ROUTABLE_LAYERS:
+        assert lazy.blocked_track[layer] == eager.blocked_track[layer]
+    assert lazy.blocked_via == eager.blocked_via
+    assert not (lazy.blocked_via == set())
+
+
 def test_lazy_and_eager_astar_find_the_same_path():
     """(2) Identical blocked sets => identical geometry, not merely equal cost."""
     eager, lazy, _ = _both_windows()

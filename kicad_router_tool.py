@@ -4155,6 +4155,20 @@ class _LazyBlockedSet:
     def __len__(self) -> int:
         return sum(1 for _ in self)
 
+    def __eq__(self, other: object) -> bool:
+        """Compare EQUAL to the plain `set` an eager window would have built.
+
+        Without this, `lazy_window.blocked_via == set()` would silently be False
+        by object identity - a subtle trap for any future caller that reaches for
+        a set comparison. Materializes, like iteration does."""
+        if isinstance(other, (set, frozenset)):
+            return set(self) == set(other)
+        if isinstance(other, _LazyBlockedSet):
+            return set(self) == set(other)
+        return NotImplemented
+
+    __hash__ = None  # type: ignore[assignment]  # mutable view, like `set`
+
     def invalidate(self) -> None:
         self._cache.clear()
 
