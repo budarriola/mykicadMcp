@@ -165,16 +165,12 @@ For whoever (human or AI) picks this up next:
   The 35 failures are now `unreachable_in_window` (genuine dense-board
   pathfinding), not budget — closing that gap is Opus-class whole-board
   optimization (7.6), not a bounded Sonnet patch. See ⭐ findings.
-- **Next work when resumed (updated 2026-07-27 — 7.14 landed too, see its
-  anchor):** (1) 7.3b's one remaining bit: lifting the 60mm/400k-node window
-  cap toward whole-board (numpy/accel, M5) — a heavier M5/accel undertaking,
-  not a bounded Sonnet patch, and the only clearly-open item left in the
-  entire Phase 7 tree at this point. (2) 7.13 impedance-matched traces &
-  matched sets — spec'd (see its section), Opus-class per the plan's own
-  delegation strategy, not yet started. Still open: M6 item 17 (c) Flow B
-  stack-up-gate question.
-- **Nothing has been committed** in either repo as of this snapshot — review the
-  working tree before assuming git history matches this file.
+- **Next work when resumed (updated 2026-07-28 — M5 windowing/GPU tier landed
+  too, see its anchor):** (1) 7.13 impedance-matched traces & matched sets —
+  spec'd (see its section), Opus-class per the plan's own delegation
+  strategy, not yet started; this is now the only substantial open item in
+  the entire Phase 7 tree. Still open: M6 item 17 (c) Flow B stack-up-gate
+  question, and the small 7.3b "any same-net copper" termination bit.
 - Verify claims against the code (`kicad_pcb_tool.py`, `kicad_mcp_server.py`,
   `tests/`) rather than trusting this snapshot if they disagree — and then fix
   this file.
@@ -686,10 +682,17 @@ router work):
   safety gate refusing any `write=True` whose scratch/real pad-net maps
   disagree for any reason. 92 tools (unchanged), 303→317 passed, same 7
   pre-existing failures. **This closes out essentially all of Phase 7's
-  originally-scoped feature list** — the only clearly-open items remaining
-  anywhere in the plan are M5 whole-board windowing (7.3b's last bit) and
-  7.13 impedance-matched traces (spec'd, not started), plus assorted
-  low-priority residuals (viewer polish, portfolio replicas, GPU tier).
+  originally-scoped feature list.**
+  (22) ✅ **M5 whole-board windowing + GPU tier — LANDED 2026-07-28** (Opus
+  subagent, worktree-isolated, coordinator-reviewed: full diff read plus an
+  independent full-suite run against the merged tree — see the M5 anchor).
+  93 tools (was 92), 317→361 passed, same 7 pre-existing failures. **The only
+  clearly-open items remaining anywhere in the plan are 7.13 impedance-matched
+  traces** (spec'd, not started) **and assorted low-priority residuals**
+  (viewer polish, portfolio replicas, hybrid GPU/CPU scheduling, driving
+  `torch` as a second GPU array module, the small 7.3b "any same-net copper"
+  termination bit, and real-hardware GPU verification — no cupy/torch
+  installed in this environment).
 
 ## How to work this plan (living document — keep it current)
 
@@ -2002,6 +2005,17 @@ parse/replay, graceful tkinter-unavailable degradation) — 208→226 passed, sa
   `ProgressState` (no 7.6/7.7 optimizer/decision protocol exists yet to feed
   it).
 
+**Auto-close added 2026-07-28 (coordinator-implemented, user request):** a
+viewer window auto-LAUNCHED by `autorouter.progress.open_viewer` (the
+unattended/config-driven case — a session isn't necessarily sitting there
+watching) now closes itself ~4s after `run_complete`, via a `--auto-close` CLI
+flag `open_route_viewer(..., auto_close=True)` passes only from its internal
+`route_nets` call site. The explicit `open_kicad_route_viewer` MCP tool call
+(a human/session deliberately asking to watch) always passes `auto_close=
+False` and is unaffected — that window stays up for review. 5 new tests in
+`tests/test_route_progress.py` (flag plumbing both directions, the internal
+call site, CLI parsing); full suite still green.
+
 ### 7.10 Warm start — an existing board as the starting point
 
 Out of the box the router only *adds* copper: existing routing is fixed obstacle
@@ -2400,6 +2414,138 @@ behind one entry point, not a sequence the caller has to orchestrate by hand.
 
 ---
 
+## Phase 7.18 — Multi-layer plane fill & via-mediated connectivity (added 2026-07-28 at user request)
+
+User priority: "advanced use of fill areas on different layers, and effective
+use of vias to both connect fill layers and signals." Extends the landed 7.5
+plane engine (via-drops through pours, plane costing, stitching) rather than
+replacing any of it — the "signal nets never treated as a plane" gate
+(2026-07-24 REQUIRED CONSTRAINT, see its anchor) is untouched by everything
+below.
+
+- **7.18.1 Multi-layer attachment choice.** Today `_plane_components_for`
+  attaches a power/gnd net's via to whichever owning zone component it finds
+  first. When the SAME net owns zones on more than one layer (kiln's
+  `GND_Main`/`GND_Safty` do — F.Cu/B.Cu/In1.Cu per the M0 inventory), evaluate
+  every owning layer's component at the candidate cell and pick by the same
+  cost model everything else uses (attachment-via cost + island cost +
+  `layer_purpose` multiplier + congestion), not "first found." Read-only
+  ranking change to an existing decision point — no new obstacle model, no new
+  knob required (reuses `plane.*` weights already in `pcb_settings.json`).
+- **7.18.2 Cross-layer fill continuity audit.** Extends `audit_kicad_plane_
+  islands` (7.5.3 today only reasons about SAME-layer island isolation) with a
+  cross-layer view: for a net owning same-net zones on multiple layers, report
+  how many stitching vias actually bond them together and flag layer pairs
+  with zero or few (below `island_min_attachments_warn`) bonding vias as
+  weakly-coupled — two same-net pours that are nominally "the same net" but
+  electrically thin between them (added inductance/resistance the schematic
+  doesn't show). Read-only audit; the existing `run_kicad_stitching_pass`
+  (7.5.6) is the tool that already fixes what this flags, so no new writer is
+  needed — this closes the loop by making the gap visible.
+- **7.18.3 Return-path-aware via placement for signal nets.** Today, a signal
+  net's layer-change via cost is layer-purpose/congestion only; it has no
+  preference for landing near existing REFERENCE-plane copper (GND/power) on
+  the layer(s) it's transiting, even though 7.5.6's stitching pass already
+  values this after the fact (`near_high_speed_mm`/`near_high_speed_pitch_mm`).
+  Add a routing-TIME cost term (new `plane.return_path_bonus` weight, default
+  0 so a project that never tunes it is byte-identical to today) that
+  discounts a via's cost when it lands within `near_high_speed_mm` of the
+  net's own reference-plane zone on an ADJACENT layer — pulling signal vias
+  toward locations a stitching via can cheaply reference, without ever
+  routing the signal net itself through the plane (the 7.5.4 gate still
+  applies). Must not regress the existing plane-parity/signal-fill-is-not-a-
+  plane tests.
+- Gate: real-kiln measurement before/after on `get_kicad_trace_cost` +
+  `audit_kicad_plane_islands`, and the existing plane/parity test suite must
+  stay green plus new tests for each of 7.18.1–7.18.3. Delegate: Opus
+  (algorithm/cost-model work riding the router core, same class as 7.5/7.6).
+
+## Phase 7.19 — Lightweight route cost estimation (added 2026-07-28 at user request)
+
+User priority: faster discovery of the best route without paying full
+windowed-A* cost on every candidate. Today 7.3a's global stage already scores
+candidate coarse paths, and 7.3b's fine A* uses a plain octile-distance
+heuristic — admissible but not informed by the board's actual obstacle/
+congestion structure, so it explores more cells than a tighter heuristic would.
+
+- **7.19.1 Coarse-field heuristic for the fine A\*.** Precompute, once per
+  connection (reusing 7.3a's own coarse grid — no new grid resolution to
+  maintain), a backward cost-distance field from the goal via a coarse
+  Dijkstra/BFS wavefront over the SAME capacity/cost map 7.3a already builds.
+  Use this field (bilinearly resolved to the fine grid, or nearest-coarse-cell
+  as a first cut) as the fine A*'s heuristic in place of plain octile
+  distance. Must stay admissible (prove: coarse field values never overstate
+  the true fine-grid cost — same-direction argument as an admissible coarse-
+  to-fine heuristic in any hierarchical pathfinder) so the byte-identical-
+  result guarantee holds: a tighter heuristic changes exploration order and
+  count, never the returned path, when both heuristics are admissible and the
+  tie-break rule (already deterministic) is unchanged. This is the "find the
+  best route faster" lever — fewer cells expanded for the identical answer.
+- **7.19.2 Cheap pre-ranking of global-stage candidates.** 7.3a already
+  produces 1–3 ranked coarse candidates per connection/bundle; before handing
+  ALL of them to detailed routing, use a cheap estimate (candidate coarse cost
+  + a fixed per-via/per-layer-change constant, no fine A* run) to decide
+  whether the 2nd/3rd candidate is worth ever detail-routing at all, vs. only
+  falling back to it when the top candidate's detailed route fails/self-check-
+  fails. Must not change which candidate ultimately gets emitted when the top
+  candidate succeeds (identical to today); only changes whether a doomed
+  lower-ranked candidate's detailed A* is skipped.
+- Gate: measured wall-clock reduction on the real kiln board (this is one of
+  the few places in the plan where a timing measurement is actually the
+  point, unlike the "don't measure speedups" directive elsewhere — reducing
+  search time IS the deliverable here) with byte-identical routed geometry
+  before/after (a parity suite proving the tighter heuristic changes nothing
+  but exploration count), plus new tests for admissibility and pre-ranking
+  skip behavior. Delegate: Opus (touches the same A* core as 7.3b/M5).
+
+## Phase 7.20 — Adjacent-layer parallel-trace (crosstalk) avoidance (added 2026-07-28 at user request)
+
+User priority: avoid routing a trace parallel and closely spaced to another
+net's trace on a directly adjacent copper layer, unless the two nets are part
+of the same confirmed bus (where running parallel is expected/desired — see
+Phase 3/Flow A's `confirmed_buses`).
+
+- **New `pcb_settings.json` block** `crosstalk`: `{enabled: true,
+  adjacent_layer_penalty_per_mm: <cost/mm>, min_parallel_run_mm: <threshold
+  before the penalty engages — a short incidental overlap is not crosstalk>,
+  min_spacing_mm: <XY offset within which two layers' traces count as
+  "aligned">, same_bus_exempt: true}`. `enabled: false`-equivalent default
+  (penalty 0) so an untuned project is byte-identical to today.
+- **Cost term.** During detailed A*, when a candidate cell/segment on layer L
+  has existing copper (this run's own placements + already-routed board
+  copper) directly on the STACK-ADJACENT layer (ordinal-adjacent per
+  `get_kicad_board_layers`, not just "any other layer" — a non-adjacent layer
+  pair has a reference plane or enough dielectric between them that this
+  doesn't apply) within `min_spacing_mm` in XY, and that copper's net is
+  DIFFERENT from the net being routed AND the two nets are not members of the
+  same `confirmed_buses` entry (board-local JSON) or the same `detect_buses`
+  candidate, accrue `adjacent_layer_penalty_per_mm` for the overlapping run
+  length once it exceeds `min_parallel_run_mm`. Same-bus members must incur
+  NO penalty against each other (that's the exemption) but still incur it
+  against a third-party net's copper on the adjacent layer.
+- **Exemption correctness is the hard part**: a false exemption silently
+  disables the feature for real risk, and a false penalty makes normal bus
+  routing artificially expensive. Test both directions explicitly — two
+  confirmed SPI members routing directly above/below each other must be
+  penalty-free; an SPI net and an unrelated GPIO net doing the same must not
+  be.
+- Gate: real-kiln measurement (which existing adjacent-layer parallel runs
+  get penalized, board score before/after with the term at a nonzero weight),
+  parity at the default (penalty 0, byte-identical to pre-7.20 routing), and
+  new tests for the adjacency-detection, spacing threshold, run-length
+  threshold, and same-bus exemption (both directions) individually. Delegate:
+  Opus (new cost term in the same router core).
+
+**Sequencing note (coordinator, 2026-07-28):** all three of 7.18/7.19/7.20
+touch `kicad_router_tool.py`'s cost model and/or `_FineWindow`/`_fine_search`
+call sites — the same surface M5 just changed. Land them ONE AT A TIME
+(worktree branched from the post-M5 `main`, reviewed and merged before the
+next starts), not as three parallel delegations, to avoid three-way conflicts
+in the hottest file in the codebase. Order per the user's stated priority:
+7.18 first, then 7.19, then 7.20.
+
+---
+
 ## Phase 8 — LANDED 2026-07-21 (reference anchor; only its M2 docs item remains, in the build order)
 
 `_infer_net_voltage(net_name, net_voltages, gnd_tokens)` (standalone helper
@@ -2703,10 +2849,10 @@ landed 2026-07-21 — see their anchors; remaining:):
     the stage-2 anchor). 7.12 neck-down and 7.3d direction-aware pad escape
     both landed 2026-07-27 (see their anchors; 7.3d's default stays `false`
     pending a real-board benchmark comparison + sign-off before ever flipping
-    it). **Remaining to close 7.3b:** "any same-net copper" termination, and
-    lifting the 60 mm / 400k-node window cap toward whole-board (needs the
-    memory planner + numpy/multi-core waves — those slip to M5's accel work;
-    the cpu tier remains the reference everything else must match).
+    it). Whole-board windowing (the 60 mm/400k-node cap) **LANDED 2026-07-28**
+    — see the M5 anchor. **Remaining to close 7.3b:** "any same-net copper"
+    termination (small, bounded, not yet scheduled — unrelated to the M5
+    windowing work, which did not touch this).
     Plane-aware via-drops through pours landed as 7.5.4 (see its anchor).
 11h. **[HEADLINE] Phase 7.17 minimal `route_board` — LANDED 2026-07-23** (see
     the 7.17 anchor): the one-command router (MCP tool `route_kicad_board` +
@@ -2741,12 +2887,83 @@ landed 2026-07-21 — see their anchors; remaining:):
 16. Phase 7.8 numpy tier + multi-core — **LANDED 2026-07-24** (see its anchor;
     premise-corrected: multi-core across independent connections is the
     delivered win, numpy is the parity oracle, not the fine-grid lever).
-    **Remaining:** the GPU tier — gated on parity + the M0 synthetic big-board
-    benchmarks (runtime *and* memory budgets); OOM-fallback acceptance = a
-    forced-tiny-VRAM run completes via demotion, not crash. Hybrid scheduling
-    last, once both executors exist (hybrid vs cpu-only parity proves executor
-    assignment can't change results). Whole-board windowing (lifting the 60mm/
-    400k-node cap) also still open — see 7.3b's cross-reference.
+    **Whole-board windowing + GPU tier LANDED 2026-07-28** (Opus subagent,
+    worktree-isolated, coordinator-reviewed: full diff read plus an
+    independent from-scratch full-suite run, not just a report review — see
+    the M5 anchor below). **Remaining:** hybrid scheduling (once both
+    executors exist, hybrid vs cpu-only parity proves executor assignment
+    can't change results) and driving `torch` as a second GPU array module
+    (currently detected/named only, not driven — see the M5 anchor for why)
+    — both low priority, no user-facing gap.
+
+### M5 — Whole-board windowing + GPU tier — LANDED 2026-07-28 (anchor)
+
+**Whole-board lazy window tier** (closes the 7.3b/M5 windowing residual):
+the 60 mm/400k-node cap was never a memory limit — `_FineWindow.build`
+rasterizes obstacle→cells at cost O(total inflated obstacle area / grid²)
+regardless of what the search then explores, so a board-spanning plane fill
+at a fine grid over a wide window dominated before A* took its first step
+(naively raising the constants "blows pure-Python runtime", per the
+2026-07-24 finding). Fix: `_ObstacleIndex` (uniform-grid spatial index over
+obstacles, each inserted into every bucket its bbox padded by its own reach
+overlaps — same one-bucket-complete argument `_ZoneEdgeGrid` already uses,
+generalized to per-obstacle reach) + `_LazyBlockedSet` (memoized per-cell
+membership, drop-in for the eager blocked-cell sets) + `_FineWindow(...,
+lazy=True)`. Build cost becomes O(obstacles); search cost is output-sensitive
+A* again. `_route_wide_lazy` is a new last-resort tier reached from both
+`unreachable_in_window` and `window_too_large`, deliberately ordered AFTER
+the existing hierarchical tier (a connection either tier already routes
+stays byte-identical) and going through the same `_finalize_core` self-check/
+emit path as every other tier — no parallel code path. `_MAX_LAZY_WINDOW_NODES
+= 4_000_000` (an order of magnitude above the eager cap, since nothing is
+rasterized up front; still coarsens via `_choose_grid` on a genuinely huge
+board). Verified byte-for-byte parity between lazy and eager blocked sets
+(`tests/test_lazy_window.py`, 14 tests). **Measured on the real kiln board:**
+0 connections changed (15/16 before and after) — the one remaining failure
+(`Net-(U6-BIAS)`) is confirmed a genuine `GND_Safty` zone-fill enclosure
+(0.0 mm clearance to a zone, not a window-size effect), matching item 10's
+flood-fill re-diagnosis; the new tier honestly reports this rather than
+forcing a route. The actual windowing failure mode (a legal path existing
+only via a long off-corridor detour no capped window or hierarchical chunk-
+chain can see) is proven instead on a dedicated synthetic case
+(`test_wide_lazy_tier_rescues_window_too_large`) where every `_route_attempts`
+ladder rung is proved (in-test) to miss the only legal 95mm-offset detour,
+and the new tier finds it.
+
+**GPU tier** (closes 7.8's deferred piece): `fine_wavefront` now takes an
+`xp` array-module parameter so numpy and CUDA (`cupy`) drive the identical
+kernel — parity is structural (integer milli-cost arithmetic throughout, no
+float divergence possible), not a second implementation to keep in sync.
+New in `kicad_router_accel.py`: `probe_gpu()` (fresh every call, never
+cached/written to JSON; `nvidia-smi` fallback for reporting when no array
+module is importable), `estimate_window_device_bytes`, `gpu_memory_budget_
+bytes` (0 = auto-probe free VRAM, reserving 25%/min 128MB headroom),
+`plan_batches`/`resolve_batch_limit` (memory-planned streaming batches, not
+a fused multi-window kernel — batching is a correctness/memory-discipline
+concern here, not a speed one), and `run_windows` (the demotion-ladder
+executor: no device → demote all; oversized item → demote that item; runtime
+OOM → retry at half batch size, then demote the individual item; every
+demotion counted in the report). New MCP tool `get_kicad_system_resources`
+(92→93 tools) reports live hardware (never cached) so a slow/CPU-only run is
+explainable. **Scope-down, stated plainly in-code:** `cupy` is driven;
+`torch` is detected and named but not driven (not a numpy drop-in for this
+kernel's `rint`/one-arg `where`/`minimum(out=)` — a real semantic risk with
+no acceptance gate needing it, recorded as a residual). **No GPU hardware
+(cupy/torch) is installed in this environment** — the box has a CUDA GPU
+(confirmed via `nvidia-smi`) but the tier itself has never executed on real
+device memory; parity and OOM-demotion are verified via a simulated device
+in `tests/test_gpu_tier.py` (22 tests) instead, including one test running
+the real wavefront through a mid-search OOM and confirming the demoted
+result matches the cpu A* exactly. `tests/test_bigboard_scale.py` (7 tests)
+proves the planner declares 10x/100x-kiln-scale windows oversized and
+demotes rather than crashing (memory-only gates, no timing, per the standing
+"don't measure speedups" directive).
+
+Full suite: 317→361 passed, same 7 pre-existing board-drift failures
+unaffected (coordinator ran the suite independently against the merged tree,
+not just trusting the subagent's numbers). Board state at merge time: kiln
+score 11765.700 (drifted from the plan's earlier-quoted 8552.276 — not
+touched by this work, no write occurred).
 
 **M6 — Routing intelligence (added 2026-07-21 at user request):**
 17. Phase 9 residuals — (a) and (b) LANDED 2026-07-23 (see the Phase 9 anchor):
@@ -2765,11 +2982,9 @@ landed 2026-07-21 — see their anchors; remaining:):
     stack-up-gate question (the tool already reports `stack_up_gate` per net).
 18. Phase 7.13 impedance-matched sets (coupled pair routing + length-matching
     meanders + profiles/assignments) — after 7.3b; Opus.
-19. Phase 7.14 connector pin-swap advisor — **detection LANDED 2026-07-23**
-    (`detect_kicad_connectors` + `validate_connector_exclusions`, 14 tests; see
-    the 7.14 anchor). Remaining: the optimizer swap move + pause-and-ask-the-user
-    protocol (after 7.6) and the session-layer exclusion prompt that calls the
-    landed validator.
+19. Phase 7.14 connector pin-swap advisor — **FULLY LANDED 2026-07-27** (see
+    the 7.14 anchor: detection, the optimizer swap move, and the
+    pause-and-ask-the-user protocol are all in). Nothing remains in this item.
 20. Phase 7.16 benchmark harness (`benchmark_kicad_autoroute`) — **LANDED
     2026-07-24** (see anchor; kiln complete_only: human 8552.276 vs auto
     8568.267, 3/39, `matched_or_beat_human:false` — the acceptance gate). The
@@ -2778,6 +2993,19 @@ landed 2026-07-21 — see their anchors; remaining:):
 21. Optional Phase 5 refinements recorded in its anchor: per-station polyline
     centerline (S-shaped bundles read slightly high today) and
     equidistant-trunk splitting.
+
+**M7 — Fill/via engineering, route-search speed, crosstalk avoidance (added
+2026-07-28 at user request):**
+22. Phase 7.18 multi-layer plane fill & via-mediated connectivity (7.18.1
+    attachment-choice ranking, 7.18.2 cross-layer continuity audit, 7.18.3
+    return-path-aware via placement) — see its section; Opus; land FIRST of
+    this milestone's three items per the user's stated priority.
+23. Phase 7.19 lightweight route cost estimation (coarse-field A* heuristic,
+    cheap global-candidate pre-ranking) — see its section; Opus; land second,
+    after 7.18 merges.
+24. Phase 7.20 adjacent-layer parallel-trace (crosstalk) avoidance — see its
+    section; Opus; land third, after 7.19 merges (all three touch the same
+    router-core surface — see the sequencing note in Phase 7.20's section).
 
 **Every milestone:** docs for its tools (`docs/mcp-tools/10-…`/`11-…`), README +
 CLAUDE.md tool count/group sync, `.gitignore`/requirements entries when that

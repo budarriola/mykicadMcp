@@ -159,15 +159,19 @@ def test_bonus_pulls_the_layer_change_toward_the_reference_plane() -> None:
     assert biased[-1][2] == "In2.Cu"   # the reference-backed layer wins
 
 
-def test_both_backends_agree_with_the_bonus_on() -> None:
+def test_all_backends_agree_with_the_bonus_on() -> None:
+    """cpu / numpy / gpu must reconstruct the identical discounted path. The
+    discount is baked into the host-side integer via-cost array before anything
+    crosses to a device (see `_build_cost_arrays`), so device parity is
+    structural rather than a second implementation to keep in sync."""
     args = ("signal", router._Weights({}, 1.0), {}, {}, (0, 3), ["F.Cu"],
             (6, 3), {"In1.Cu", "In2.Cu"}, None, None, None)
     paths = [
         router._fine_search(backend, _window(), *args, None, None, 0.05, 8.0,
-                            False, _return_path(["In2.Cu"]))
-        for backend in ("cpu", "numpy")
+                            False, _return_path(["In2.Cu"]), _settings={})
+        for backend in ("cpu", "numpy", "gpu")
     ]
-    assert paths[0] == paths[1]
+    assert paths[0] == paths[1] == paths[2]
 
 
 # --------------------------------------------------------------------------- #

@@ -380,6 +380,7 @@ def request_cancel(project_path: str | Path) -> str:
 # =========================================================================== #
 
 _POLL_MS = 250
+_AUTO_CLOSE_DELAY_MS = 4000
 
 
 class RouteViewerApp:
@@ -392,7 +393,7 @@ class RouteViewerApp:
     only deletes/creates the canvas items it changed.
     """
 
-    def __init__(self, board_path: str) -> None:
+    def __init__(self, board_path: str, auto_close: bool = False) -> None:
         self.board_path = Path(board_path)
         self.project_path = self.board_path
         self.progress_path = self.board_path.with_name(f"{self.board_path.stem}.route_progress.jsonl")
@@ -400,6 +401,13 @@ class RouteViewerApp:
         self._last_size = 0
         self._item_ids: dict[str, int] = {}          # geometry uuid -> canvas item id
         self._layer_visible: dict[str, "tk.BooleanVar"] = {}
+        # Only ever True for a viewer THIS run auto-launched via
+        # `autorouter.progress.open_viewer` (route_nets/route_board pass
+        # `--auto-close`) - not the user explicitly asking to watch via the
+        # `open_kicad_route_viewer` MCP tool, which always leaves the window up
+        # so the user can review the final board at their own pace.
+        self.auto_close = bool(auto_close)
+        self._close_scheduled = False
 
         self.root = tk.Tk()
         self.root.title(f"Route progress - {self.board_path.name}")
@@ -522,6 +530,15 @@ class RouteViewerApp:
         )
         self._draw_score_sparkline()
 
+        if self.state.done and self.auto_close and not self._close_scheduled:
+            # A short grace period so an auto-launched window doesn't just
+            # flash and vanish if the user happens to be glancing at it - but
+            # this run wasn't started by the user watching, so it closes
+            # itself rather than sitting there unattended after completion.
+            self._close_scheduled = True
+            self.status_var.set(self.status_var.get() + " - closing")
+            self.root.after(_AUTO_CLOSE_DELAY_MS, self.root.destroy)
+
     def _draw_score_sparkline(self) -> None:
         self.score_canvas.delete("all")
         history = self.state.score_history[-200:]
@@ -568,10 +585,12 @@ class RouteViewerApp:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    if not argv:
-        print("usage: kicad_route_viewer.py <board_path>", file=sys.stderr)
+    auto_close = "--auto-close" in argv
+    positional = [a for a in argv if a != "--auto-close"]
+    if not positional:
+        print("usage: kicad_route_viewer.py <board_path> [--auto-close]", file=sys.stderr)
         return 2
-    board_path = argv[0]
+    board_path = positional[0]
     if not TK_AVAILABLE:
         print(
             "tkinter is not available in this Python environment; cannot open "
@@ -580,7 +599,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    app = RouteViewerApp(board_path)
+    app = RouteViewerApp(board_path, auto_close=auto_close)
     app.run()
     return 0
 

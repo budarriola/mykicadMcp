@@ -358,3 +358,86 @@ def test_open_kicad_route_viewer_handler_graceful_without_tk(scratch_board, monk
     result = srv.tools["open_kicad_route_viewer"]["handler"]({"project_path": str(scratch_board)})
     assert result["launched"] is False
     assert "reason" in result
+
+
+# --------------------------------------------------------------------------- #
+# 5. Auto-close: a config-driven (unattended) viewer launch closes itself
+# after run_complete; an explicitly user-requested one never does.
+# --------------------------------------------------------------------------- #
+
+def test_open_route_viewer_passes_auto_close_flag(scratch_board, monkeypatch):
+    captured: dict[str, Any] = {}
+
+    class _FakeProc:
+        pid = 4242
+
+    def _fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+        return _FakeProc()
+
+    monkeypatch.setattr(router, "_tk_available", lambda: True)
+    monkeypatch.setattr(router.subprocess, "Popen", _fake_popen)
+    result = router.open_route_viewer(scratch_board, auto_close=True)
+    assert result["launched"] is True
+    assert result["auto_close"] is True
+    assert "--auto-close" in captured["argv"]
+
+
+def test_open_route_viewer_default_no_auto_close(scratch_board, monkeypatch):
+    captured: dict[str, Any] = {}
+
+    class _FakeProc:
+        pid = 4242
+
+    def _fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+        return _FakeProc()
+
+    monkeypatch.setattr(router, "_tk_available", lambda: True)
+    monkeypatch.setattr(router.subprocess, "Popen", _fake_popen)
+    result = router.open_route_viewer(scratch_board)
+    assert result["auto_close"] is False
+    assert "--auto-close" not in captured["argv"]
+
+
+def test_route_nets_auto_launches_viewer_with_auto_close(scratch_board, monkeypatch):
+    """route_nets's own config-driven launch (`autorouter.progress.open_viewer`)
+    must request auto_close - it is the unattended case, unlike the explicit
+    `open_kicad_route_viewer` MCP tool."""
+    captured: dict[str, Any] = {}
+
+    def _fake_open(project_path, board=None, auto_close=False):
+        captured["auto_close"] = auto_close
+        return {"launched": False, "reason": "stubbed for this test"}
+
+    monkeypatch.setattr(router, "open_route_viewer", _fake_open)
+    settings_path = scratch_board / "pcb_settings.json"
+    settings_path.write_text(
+        json.dumps({"autorouter": {"progress": {"events": True, "open_viewer": True}}}),
+        encoding="utf-8",
+    )
+    conn = _pick_connection(scratch_board)
+    router.route_nets(scratch_board, connections=[conn], write=False)
+    assert captured.get("auto_close") is True
+
+
+def test_viewer_main_parses_auto_close_flag(tmp_path):
+    import kicad_route_viewer as viewer
+
+    board = tmp_path / "b.kicad_pcb"
+    board.write_text("", encoding="utf-8")
+    captured: dict[str, Any] = {}
+
+    class _FakeApp:
+        def __init__(self, board_path, auto_close=False):
+            captured["board_path"] = board_path
+            captured["auto_close"] = auto_close
+
+        def run(self):
+            pass
+
+    import unittest.mock as mock
+    with mock.patch.object(viewer, "RouteViewerApp", _FakeApp):
+        rc = viewer.main([str(board), "--auto-close"])
+    assert rc == 0
+    assert captured["auto_close"] is True

@@ -1056,6 +1056,23 @@ class KiCadMcpServer:
                 },
                 "handler": self._tool_get_drc_constraints,
             },
+            "get_kicad_system_resources": {
+                "description": (
+                    "Phase 7.8 memory planner probe - the hardware this box actually has RIGHT NOW: "
+                    "core count, FREE (not installed) system RAM, and GPU/VRAM. Probed fresh on every "
+                    "call and never cached or written to any JSON, so a run on a different machine (or "
+                    "the same machine under different load - a desktop compositor holds VRAM) plans "
+                    "itself from scratch; the JSONs carry only budget OVERRIDES a user chose. The GPU "
+                    "block reports availability, the CUDA array module in use (cupy; torch is detected "
+                    "and named but not driven), free/total VRAM, the probe source (cupy | nvidia-smi | "
+                    "none), and - when unavailable - the REASON, so 'a GPU is present but no array "
+                    "module is installed' is distinguishable from 'no GPU'. Use it to explain a slow "
+                    "or CPU-only routing run ('batches were tiny because only 1.1 GB VRAM was free'). "
+                    "Read-only; takes no arguments and touches no project files."
+                ),
+                "inputSchema": {"type": "object", "properties": {}},
+                "handler": self._tool_get_system_resources,
+            },
             "route_kicad_board": {
                 "description": (
                     "Phase 7.17 - the ONE command to route the board (also a CLI: "
@@ -2395,6 +2412,10 @@ class KiCadMcpServer:
 
     def _tool_get_drc_constraints(self, args: dict[str, Any]) -> dict[str, Any]:
         return get_drc_constraints(args["project_path"])
+
+    def _tool_get_system_resources(self, args: dict[str, Any]) -> dict[str, Any]:
+        import kicad_router_accel as _accel
+        return _accel.probe_system_resources()
 
     def _tool_route_board(self, args: dict[str, Any]) -> dict[str, Any]:
         nets = args.get("nets")

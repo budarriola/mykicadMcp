@@ -3591,17 +3591,65 @@ def _resolve_backend(settings: dict[str, Any]) -> str:
     expands toward the goal. The detailed router runs many small windows, where
     A* is decisively faster, so "auto" resolves to "cpu". Choose "numpy"
     explicitly for the vectorized field backend (parity oracle / large-window
-    experiments)."""
+    experiments).
+
+    `"gpu"` selects the CUDA tier (same wavefront kernel, device arrays). It is
+    only ever chosen EXPLICITLY: a missing GPU is expected on most machines and
+    must degrade silently to the numpy/cpu tiers rather than error, which the
+    dispatch below does per call - so asking for `"gpu"` on a box without one
+    still routes, just on the CPU."""
     accel = str(settings.get("autorouter", {}).get("acceleration", "auto")).lower()
-    if accel in ("cpu", "numpy"):
+    if accel in ("cpu", "numpy", "gpu"):
         return accel
     return "cpu"  # "auto"/"hybrid"/anything else -> output-sensitive A*
 
 
+# Counters for GPU-tier demotions over the current process's routing work, so a
+# run report can say how much of the board the GPU actually carried (7.8: "every
+# demotion is counted, so 'the GPU helped 90% of this board' is visible rather
+# than silent"). Reset by `gpu_tier_report()`.
+_GPU_TIER_STATS: dict[str, Any] = {"on_gpu": 0, "demoted_no_device": 0,
+                                   "demoted_oversized": 0, "demoted_oom": 0,
+                                   "reason": None, "device": None}
+
+
+def gpu_tier_report(reset: bool = False) -> dict[str, Any]:
+    """Snapshot (optionally reset) the GPU tier's per-item demotion counters."""
+    snap = dict(_GPU_TIER_STATS)
+    if reset:
+        _GPU_TIER_STATS.update({"on_gpu": 0, "demoted_no_device": 0,
+                                "demoted_oversized": 0, "demoted_oom": 0,
+                                "reason": None, "device": None})
+    return snap
+
+
 def _fine_search(backend: str, win: "_FineWindow", *args: Any, **kwargs: Any):
-    """Dispatch one windowed detailed search to the selected backend. Both
+    """Dispatch one windowed detailed search to the selected backend. All three
     backends return byte-identical geometry (7.8 parity); `cpu` is the reference
-    pure-Python A*, `numpy` the vectorized integer-field wavefront."""
+    pure-Python A*, `numpy` the vectorized integer-field wavefront, `gpu` that
+    same wavefront with device arrays.
+
+    The GPU path is memory-planned and demotes rather than fails: if there is no
+    usable CUDA array module, or this window's estimated device footprint exceeds
+    `autorouter.gpu.memory_budget_mb` (0 = auto-probe free VRAM), or the allocator
+    OOMs mid-search, the window falls back to the numpy tier and the demotion is
+    counted in `_GPU_TIER_STATS`. Since every tier is bit-identical, a demotion
+    changes only WHERE the work ran, never the answer."""
+    # Popped unconditionally: it is dispatch metadata for the gpu tier, never an
+    # argument of the search itself, so cpu/numpy must not see it.
+    settings = kwargs.pop("_settings", None) or {}
+    if backend == "gpu":
+        import kicad_router_accel as _accel
+        item = {"rows": win.rows, "cols": win.cols, "layers": len(win.layers)}
+        results, report = _accel.run_windows(
+            [item], settings,
+            gpu_call=lambda _it, xp: _accel.fine_wavefront(win, *args, xp=xp, **kwargs),
+            fallback_call=lambda _it: _accel.fine_wavefront(win, *args, **kwargs))
+        for k in ("on_gpu", "demoted_no_device", "demoted_oversized", "demoted_oom"):
+            _GPU_TIER_STATS[k] += report.get(k, 0)
+        _GPU_TIER_STATS["reason"] = report.get("reason") or _GPU_TIER_STATS["reason"]
+        _GPU_TIER_STATS["device"] = report.get("device") or _GPU_TIER_STATS["device"]
+        return results[0]
     if backend == "numpy":
         import kicad_router_accel as _accel
         return _accel.fine_wavefront(win, *args, **kwargs)
@@ -4117,6 +4165,135 @@ class _ZoneEdgeGrid:
         return best
 
 
+class _ObstacleIndex:
+    """Uniform-grid spatial index over `_Obst`s — the cell->obstacle direction.
+
+    The eager `_FineWindow.build` walks obstacle->cells (rasterizing every
+    obstacle's inflated bbox into the window), which costs O(total inflated
+    obstacle area / grid^2) REGARDLESS of what the search then looks at. A
+    board-spanning plane fill at a fine grid over a wide window therefore
+    dominates, which is exactly what `_MAX_WINDOW_NODES` was capping. This index
+    inverts the loop so a LAZY window can answer "is this one cell blocked?"
+    without ever materializing the rest — making window build cost independent
+    of window size and search cost output-sensitive again (see `_LazyBlockedSet`).
+
+    Correctness (the same argument `_ZoneEdgeGrid` documents, restated for
+    obstacles): each obstacle is inserted into every bucket its bounding box
+    PADDED BY ITS OWN `reach` overlaps. If a query point P is within `reach` of
+    obstacle O, then P lies inside O's padded bbox; P's own bucket cell contains
+    P, so that cell overlaps the padded bbox and O was necessarily inserted
+    there. One bucket lookup is therefore complete — no neighbour scan. Note the
+    argument never constrains the BUCKET SIZE (it is a pure performance knob) and
+    allows a DIFFERENT `reach` per obstacle, unlike `_ZoneEdgeGrid`'s single
+    window-wide reach.
+
+    Obstacles farther than `reach` may also appear in a bucket (a harmless
+    over-approximation); every candidate is still tested exactly by the caller.
+    Query order is insertion order, so results are deterministic."""
+
+    __slots__ = ("cell", "inv", "minx", "miny", "buckets", "reach_by_id", "removed")
+
+    def __init__(self, entries: "list[tuple[_Obst, float]]", cell: float,
+                 origin: tuple[float, float]) -> None:
+        self.cell = max(cell, 1e-6)
+        self.inv = 1.0 / self.cell
+        self.minx, self.miny = origin
+        self.buckets: dict[tuple[int, int], list[_Obst]] = {}
+        self.reach_by_id: dict[int, float] = {}
+        # ids of obstacles removed after construction (step-4 rip-up). Filtered
+        # at query time so a removal never has to rebuild the buckets.
+        self.removed: set[int] = set()
+        for ob, reach in entries:
+            self.add(ob, reach)
+
+    def add(self, ob: "_Obst", reach: float) -> None:
+        self.removed.discard(id(ob))
+        if id(ob) in self.reach_by_id:
+            return  # already indexed at its (identical) reach
+        self.reach_by_id[id(ob)] = reach
+        inv, minx, miny = self.inv, self.minx, self.miny
+        bx0 = int(math.floor((ob.minx - reach - minx) * inv))
+        bx1 = int(math.floor((ob.maxx + reach - minx) * inv))
+        by0 = int(math.floor((ob.miny - reach - miny) * inv))
+        by1 = int(math.floor((ob.maxy + reach - miny) * inv))
+        buckets = self.buckets
+        for by in range(by0, by1 + 1):
+            for bx in range(bx0, bx1 + 1):
+                buckets.setdefault((bx, by), []).append(ob)
+
+    def remove(self, ob: "_Obst") -> None:
+        self.removed.add(id(ob))
+
+    def query(self, px: float, py: float) -> "list[_Obst]":
+        bx = int(math.floor((px - self.minx) * self.inv))
+        by = int(math.floor((py - self.miny) * self.inv))
+        obs = self.buckets.get((bx, by))
+        if not obs:
+            return []
+        if not self.removed:
+            return obs
+        rm = self.removed
+        return [ob for ob in obs if id(ob) not in rm]
+
+
+class _LazyBlockedSet:
+    """Set-like view of ONE `_FineWindow` blocked layer (or its via layer) whose
+    membership is computed per cell on demand and memoized.
+
+    Implements exactly the read surface the searches use — `cell in s` (both A*
+    backends, `nearest_free`) and iteration (`kicad_router_accel` materializing
+    numpy arrays) — so a lazy window is a drop-in for an eagerly-rasterized one.
+    Membership is decided by the SAME predicate `_FineWindow.obstacle_cells`
+    applies, just evaluated cell-first, which is what makes a lazy window's
+    blocked sets EQUAL an eager window's cell for cell (proven directly in
+    `tests/test_lazy_window.py`) — the parity guarantee this tier rests on.
+
+    Iterating forces a full cols x rows evaluation (i.e. forfeits the laziness);
+    that is deliberate and only happens on the numpy backend, which needs dense
+    arrays anyway. The cpu A* never iterates."""
+
+    __slots__ = ("_win", "_layer", "_cache")
+
+    def __init__(self, win: "_FineWindow", layer: str | None) -> None:
+        self._win = win
+        self._layer = layer  # None => the via set
+        self._cache: dict[tuple[int, int], bool] = {}
+
+    def __contains__(self, cell: object) -> bool:
+        c = self._cache.get(cell)  # type: ignore[arg-type]
+        if c is None:
+            c = self._win._lazy_cell_blocked(cell, self._layer)  # type: ignore[arg-type]
+            self._cache[cell] = c  # type: ignore[index]
+        return c
+
+    def __iter__(self):
+        win = self._win
+        for iy in range(win.rows):
+            for ix in range(win.cols):
+                if (ix, iy) in self:
+                    yield (ix, iy)
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
+
+    def __eq__(self, other: object) -> bool:
+        """Compare EQUAL to the plain `set` an eager window would have built.
+
+        Without this, `lazy_window.blocked_via == set()` would silently be False
+        by object identity - a subtle trap for any future caller that reaches for
+        a set comparison. Materializes, like iteration does."""
+        if isinstance(other, (set, frozenset)):
+            return set(self) == set(other)
+        if isinstance(other, _LazyBlockedSet):
+            return set(self) == set(other)
+        return NotImplemented
+
+    __hash__ = None  # type: ignore[assignment]  # mutable view, like `set`
+
+    def invalidate(self) -> None:
+        self._cache.clear()
+
+
 # --------------------------------------------------------------------------- #
 # Windowed obstacle raster + fine grid model
 # --------------------------------------------------------------------------- #
@@ -4132,10 +4309,12 @@ class _FineWindow:
     __slots__ = ("grid", "minx", "miny", "cols", "rows", "layers", "layer_types",
                  "blocked_track", "blocked_via", "net",
                  "_track_cnt", "_via_cnt", "_track_half", "_via_radius",
-                 "_clearance", "_edge_clearance", "_zone_cache")
+                 "_clearance", "_edge_clearance", "_zone_cache",
+                 "_lazy", "_index", "_zgrids")
 
     def __init__(self, minx: float, miny: float, maxx: float, maxy: float, grid: float,
-                 layers: list[str], layer_types: dict[str, str], net: str) -> None:
+                 layers: list[str], layer_types: dict[str, str], net: str,
+                 lazy: bool = False) -> None:
         self.grid = grid
         self.minx, self.miny = minx, miny
         self.cols = max(2, int(math.ceil((maxx - minx) / grid)) + 1)
@@ -4148,8 +4327,19 @@ class _FineWindow:
         # incrementally (a cell stays blocked while any obstacle still reaches
         # it). This is what makes step-4 rip-up clear ONLY the ripped copper's
         # cells without a full window rebuild.
-        self.blocked_track: dict[str, set[tuple[int, int]]] = {l: set() for l in layers}
-        self.blocked_via: set[tuple[int, int]] = set()
+        # LAZY mode (M5 whole-board windowing): `build` indexes obstacles instead
+        # of rasterizing them and the two blocked views below are replaced by
+        # `_LazyBlockedSet`s that decide membership per cell on demand. This
+        # decouples build cost from window AREA, which is what lets a window span
+        # the whole board at a fine grid (see `_route_wide_lazy`). Default False
+        # so every existing window is byte-identical eager behaviour.
+        self._lazy = bool(lazy)
+        self._index: _ObstacleIndex | None = None
+        self._zgrids: dict[int, _ZoneEdgeGrid] = {}
+        self.blocked_track: dict[str, Any] = (
+            {l: _LazyBlockedSet(self, l) for l in layers} if self._lazy
+            else {l: set() for l in layers})
+        self.blocked_via: Any = _LazyBlockedSet(self, None) if self._lazy else set()
         self._track_cnt: dict[str, dict[tuple[int, int], int]] = {l: {} for l in layers}
         self._via_cnt: dict[tuple[int, int], int] = {}
         self._track_half = 0.0
@@ -4255,7 +4445,111 @@ class _FineWindow:
                         track_cells[l].add((ix, iy))
         return via_cells, track_cells
 
+    # ---------------- lazy (on-demand) obstacle evaluation ------------------ #
+    #
+    # Everything below mirrors `obstacle_cells` EXACTLY, evaluated cell-first
+    # instead of obstacle-first. Any divergence would be a parity bug, so the
+    # branch structure is kept deliberately parallel to that method and
+    # `tests/test_lazy_window.py` asserts set equality cell-for-cell.
+
+    def _ob_reach(self, ob: "_Obst") -> tuple[float, float, float]:
+        """(track_reach, via_reach, big) for one obstacle — the same three
+        quantities `obstacle_cells` computes."""
+        cl = self._edge_clearance if ob.is_edge else self._clearance
+        margin = self.grid * _FINE_CELL_MARGIN_FRAC
+        track_reach = self._track_half + cl + ob.half + margin
+        via_reach = self._via_radius + cl + ob.half + margin
+        return track_reach, via_reach, max(track_reach, via_reach)
+
+    def _window_rejects(self, ob: "_Obst") -> bool:
+        """`obstacle_cells`'s window-level bbox early-out, verbatim."""
+        g = self.grid
+        wminx = self.minx - g
+        wminy = self.miny - g
+        wmaxx = self.minx + (self.cols - 1) * g + g
+        wmaxy = self.miny + (self.rows - 1) * g + g
+        reach = (max(self._track_half, self._via_radius)
+                 + max(self._clearance, self._edge_clearance) + ob.half
+                 + g * _FINE_CELL_MARGIN_FRAC)
+        return (ob.maxx < wminx - reach or ob.minx > wmaxx + reach
+                or ob.maxy < wminy - reach or ob.miny > wmaxy + reach)
+
+    def _zgrid_for(self, ob: "_Obst", big: float) -> "_ZoneEdgeGrid":
+        cached = self._zone_cache.get(id(ob)) if self._zone_cache is not None else None
+        if cached is not None:
+            return cached
+        zg = self._zgrids.get(id(ob))
+        if zg is None:
+            g = self.grid
+            wminx, wminy = self.minx - g, self.miny - g
+            wmaxx = self.minx + (self.cols - 1) * g + g
+            wmaxy = self.miny + (self.rows - 1) * g + g
+            zedges = _clip_polygon_edges(
+                ob.pts, wminx - big, wminy - big, wmaxx + big, wmaxy + big)
+            zg = _ZoneEdgeGrid(zedges, big)
+            self._zgrids[id(ob)] = zg
+        return zg
+
+    def _lazy_build(self, obstacles: list["_Obst"]) -> None:
+        """Index the obstacles this window could possibly be blocked by, instead
+        of rasterizing them. Cost is O(obstacles x buckets-each-spans), which is
+        independent of the fine grid — the whole point of the tier."""
+        entries: list[tuple[_Obst, float]] = []
+        for ob in obstacles:
+            if ob.net == self.net and not ob.is_edge:
+                continue  # same-net copper is free (obstacle_cells' first line)
+            if self._window_rejects(ob):
+                continue
+            entries.append((ob, self._ob_reach(ob)[2]))
+        # Bucket side: a few fine cells wide, floored so a tiny grid does not
+        # explode the bucket count on a board-spanning obstacle. Perf only —
+        # correctness is independent of this value (see `_ObstacleIndex`).
+        cell = max(self.grid * 8.0, 2.0)
+        self._index = _ObstacleIndex(entries, cell, (self.minx, self.miny))
+        for l in self.layers:
+            self.blocked_track[l].invalidate()
+        self.blocked_via.invalidate()
+
+    def _lazy_cell_blocked(self, cell: tuple[int, int], layer: str | None) -> bool:
+        """Is grid node `cell` blocked for a track on `layer` (or for a VIA when
+        `layer is None`)? The cell-first form of `obstacle_cells`' inner loop."""
+        idx = self._index
+        if idx is None:
+            return False
+        ix, iy = cell
+        px, py = self.node_xy(ix, iy)
+        for ob in idx.query(px, py):
+            if layer is None:
+                # `obstacle_cells` adds via cells WITHOUT consulting ob.layers.
+                if ob.via_transparent:
+                    continue
+            elif layer not in ob.layers:
+                continue
+            track_reach, via_reach, big = self._ob_reach(ob)
+            need = via_reach if layer is None else track_reach
+            if ob.kind == "zone" and ob.pts:
+                assert ob.raster is not None
+                dmin = 0.0 if ob.raster.covers(px, py, 0.0) else self._zgrid_for(ob, big).min_dist(px, py)
+                if dmin < need:
+                    return True
+            elif ob.point_within(px, py, need):
+                return True
+        return False
+
+    def _lazy_invalidate(self) -> None:
+        for l in self.layers:
+            self.blocked_track[l].invalidate()
+        self.blocked_via.invalidate()
+
     def add_obstacle(self, ob: "_Obst") -> None:
+        if self._lazy:
+            if not (ob.net == self.net and not ob.is_edge) and not self._window_rejects(ob):
+                if self._index is None:
+                    self._index = _ObstacleIndex([], max(self.grid * 8.0, 2.0),
+                                                 (self.minx, self.miny))
+                self._index.add(ob, self._ob_reach(ob)[2])
+            self._lazy_invalidate()
+            return
         via_cells, track_cells = self.obstacle_cells(ob)
         vc = self._via_cnt
         for cell in via_cells:
@@ -4275,6 +4569,11 @@ class _FineWindow:
     def remove_obstacle(self, ob: "_Obst") -> None:
         """Incrementally clear an obstacle's cells (decrement ref counts; a cell
         leaves the blocked set only when no other obstacle still reaches it)."""
+        if self._lazy:
+            if self._index is not None:
+                self._index.remove(ob)
+            self._lazy_invalidate()
+            return
         via_cells, track_cells = self.obstacle_cells(ob)
         vc = self._via_cnt
         for cell in via_cells:
@@ -4301,6 +4600,9 @@ class _FineWindow:
         self._via_radius = via_radius
         self._clearance = clearance
         self._edge_clearance = edge_clearance
+        if self._lazy:
+            self._lazy_build(obstacles)
+            return
         for ob in obstacles:
             self.add_obstacle(ob)
 
@@ -5777,7 +6079,8 @@ def _route_one(
                             s_cell, start_layers, g_cell, goal_layers,
                             home_layer, corridor, win_cong,
                             plane_layers, goal_planes, plane_step, attachment_via_cost,
-                            ml_attach, return_path)
+                            ml_attach, return_path,
+                            _settings=ctx.get("gpu_settings"))
         if path is None:
             continue  # unreachable at this (margin, grid) - try the next ladder rung
 
@@ -5808,6 +6111,38 @@ def _route_one(
         out.update({"routed": True, "segments": segments, "vias": vias})
         return out
 
+    if any_built:
+        # Every `_route_attempts` rung failed (finest grid included) - LAST RESORT
+        # TIER 1: chain small fine-grid sub-windows along the global stage's own
+        # coarse path (see `_route_hierarchical`'s docstring for why this can
+        # succeed where a single wide-margin window cannot). Strictly gated behind
+        # total ladder exhaustion, so a connection that already routes today never
+        # reaches this call and is byte-identical to before this tier existed.
+        hier = _route_hierarchical(ctx, net, net_kind, from_xy, to_xy, start_layers,
+                                   goal_layers, active_obstacles, gconn, home_layer,
+                                   plane_layers, goal_planes)
+        if hier is not None:
+            rec_updates, segments, vias = hier
+            result_rec.update(rec_updates)
+            out.update({"routed": True, "segments": segments, "vias": vias})
+            return out
+
+    # LAST RESORT TIER 2 (M5 whole-board windowing): ONE lazily-evaluated window
+    # over the WHOLE board. See `_route_wide_lazy`. Deliberately ordered AFTER the
+    # hierarchical tier so every connection either tier already routes keeps its
+    # exact current geometry; this one only ever converts a hard failure into a
+    # route. Reached from BOTH failure paths - `unreachable_in_window` AND
+    # `window_too_large` (a lazy window has no up-front rasterization cost, so the
+    # eager node budget that produced `window_too_large` simply does not apply).
+    wide = _route_wide_lazy(ctx, conn, net, net_kind, from_xy, to_xy, start_layers,
+                            goal_layers, active_obstacles, congestion, home_layer,
+                            plane_layers, goal_planes)
+    if wide is not None:
+        wrec, wsegments, wvias, wwin = wide
+        result_rec.update(wrec)
+        out.update({"routed": True, "segments": wsegments, "vias": wvias, "win": wwin})
+        return out
+
     if not any_built:
         # every attempted window exceeded the node budget - the pathological
         # large window (nothing was ever searched).
@@ -5818,26 +6153,143 @@ def _route_one(
         out["win"] = None
         return out
 
-    # Every `_route_attempts` rung failed (finest grid included) - LAST RESORT:
-    # chain small fine-grid sub-windows along the global stage's own coarse
-    # path (see `_route_hierarchical`'s docstring for why this can succeed
-    # where a single wide-margin window cannot). Strictly gated behind total
-    # ladder exhaustion, so a connection that already routes today never
-    # reaches this call and is byte-identical to before this tier existed.
-    hier = _route_hierarchical(ctx, net, net_kind, from_xy, to_xy, start_layers,
-                               goal_layers, active_obstacles, gconn, home_layer,
-                               plane_layers, goal_planes)
-    if hier is not None:
-        rec_updates, segments, vias = hier
-        result_rec.update(rec_updates)
-        out.update({"routed": True, "segments": segments, "vias": vias})
-        return out
-
     # unreachable within every attempted window/grid (finest grid included).
     blocker = _nearest_blocker(win, active_obstacles, net, to_xy) if win is not None else None
     result_rec["failure"] = {"reason": "unreachable_in_window",
                              "nearest_blocker": blocker, "window_margin_mm": margin}
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Whole-board lazy window tier (M5 - lifting the 60 mm / 400k-node cap).
+#
+# WHY THE OLD CAP EXISTED, AND WHY IT CAN NOW GO: `_FineWindow.build` rasterizes
+# obstacle -> cells, so its cost is O(total inflated obstacle area / grid^2) no
+# matter what the search then looks at. A board-spanning plane fill at 0.2 mm over
+# a 60 mm window is millions of cell tests before A* takes its first step, which
+# is what `_MAX_WINDOW_SPAN_MM` / `_MAX_WINDOW_NODES` were really capping - build
+# cost, not memory (the blocked sets were always sparse). Naively raising the
+# constants therefore "blows pure-Python runtime", exactly as the plan recorded.
+#
+# The fix is to stop building the window at all: `_FineWindow(..., lazy=True)`
+# indexes the obstacles (`_ObstacleIndex`) and decides blocked-ness per cell on
+# demand (`_LazyBlockedSet`), so cost becomes O(cells A* actually expands), i.e.
+# output-sensitive like A* itself. A whole-board window then costs no more to
+# build than a small one, and the search pays only for what it explores.
+#
+# WHAT THIS BUYS (and what it does not): it fixes the failure mode where the only
+# legal path leaves the capped window - a long detour "the wrong way" around an
+# obstruction, which no ladder rung can see (span-capped) and which chunk-chaining
+# along the coarse path cannot find either (the coarse path does not go that way).
+# It does NOT help a pad that is topologically SEALED: if no legal channel exists
+# at any resolution, a bigger window just proves it faster. Kiln's remaining
+# failures are of that second kind (see NETCLASS_PLAN.md item 10's flood-fill
+# re-diagnosis), so this tier is a real, tested capability that does not by itself
+# change kiln's routed count - reported honestly rather than tuned to look good.
+# --------------------------------------------------------------------------- #
+
+# Node budget for the LAZY whole-board window. An order of magnitude above the
+# eager `_MAX_WINDOW_NODES` because nothing is materialized up front: this only
+# picks the grid (via `_choose_grid`) so that a genuinely huge board still
+# coarsens rather than asking A* to expand an absurd state space. Kiln's whole
+# board at the default 0.2 mm on 4 layers sits well inside it, so kiln keeps its
+# full fine resolution over the entire board.
+_MAX_LAZY_WINDOW_NODES = 4_000_000
+
+
+def _route_wide_lazy(
+    ctx: dict[str, Any], conn: dict[str, Any], net: str, net_kind: str,
+    from_xy: tuple[float, float], to_xy: tuple[float, float],
+    start_layers: list[str], goal_layers: set[str],
+    active_obstacles: list["_Obst"], congestion: dict[tuple[int, int, str], int],
+    home_layer: str | None,
+    plane_layers: dict[str, list[dict[str, Any]]] | None,
+    goal_planes: dict[str, list[dict[str, Any]]] | None,
+) -> "tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], _FineWindow] | None":
+    """One WHOLE-BOARD lazily-evaluated `_FineWindow` search — the M5 lift of the
+    60 mm span / 400k-node cap. See the block comment above for the cost argument.
+
+    Unlike the hierarchical tier this one goes through the ordinary
+    `_finalize_core`, so a route it finds gets the same exact-clearance
+    self-check, neck-down (7.12), emit path, and rip-up demotion eligibility as
+    any ladder-routed connection — there is no second code path to keep in sync.
+
+    Returns None (never a partial result) when the whole-board search is still
+    unreachable or its geometry fails the exact self-check; the caller then
+    reports the ordinary failure it would have reported without this tier.
+
+    Determinism: a pure function of its inputs — a fixed window (the board bbox),
+    a grid chosen by the same deterministic `_choose_grid`, and the same
+    deterministic A*/backtrace every other tier uses."""
+    board_bbox = ctx["board_bbox"]
+    board_min = ctx["board_min"]
+    routable_layers = ctx["routable_layers"]
+    layer_types = ctx["layer_types"]
+    grid = ctx["grid"]
+    rules = ctx["rules"]
+    track_half = ctx["track_half"]
+    via_radius = ctx["via_radius"]
+    backend = ctx["backend"]
+    pad_escape_aware = bool(ctx.get("pad_escape_direction_aware", False))
+    # Phase 7.18: identical reads to `_route_one`/`_route_hierarchical`. This
+    # tier goes through the same `_finalize_core`, so it must also cost a move
+    # the same way - a connection rescued here has to be priced by the same
+    # cost model as one the ordinary ladder routes, or the two tiers would
+    # disagree about the same board.
+    ml_attach = bool(ctx.get("multilayer_attachment", False))
+    return_path = (ctx.get("return_path_by_net") or {}).get(net)
+
+    minx = board_bbox[0] - grid
+    miny = board_bbox[1] - grid
+    maxx = board_bbox[2] + grid
+    maxy = board_bbox[3] + grid
+    span_x, span_y = maxx - minx, maxy - miny
+    if span_x <= 0 or span_y <= 0:
+        return None
+    n_layers = max(1, len(routable_layers))
+    win_grid = _choose_grid(span_x, span_y, n_layers, grid, ctx["max_grid_mm"],
+                            _MAX_LAZY_WINDOW_NODES)
+
+    win = _FineWindow(minx, miny, maxx, maxy, win_grid, routable_layers,
+                      layer_types, net, lazy=True)
+    if win.cols * win.rows * n_layers > _MAX_LAZY_WINDOW_NODES:
+        return None  # even `max_grid_mm` cannot fit a board this big - give up
+    # No `_prefilter_window_obstacles` here on purpose: the window IS the board,
+    # so every obstacle is in scope and `_lazy_build` applies the same same-net /
+    # bbox filters itself while indexing.
+    win.build(active_obstacles, track_half, via_radius,
+              rules["clearance"], rules["edge_clearance"])
+
+    s_cell = win.nearest_free(from_xy[0], from_xy[1], start_layers,
+                              toward_xy=to_xy if pad_escape_aware else None) or win.cell_of(*from_xy)
+    g_cell = win.nearest_free(to_xy[0], to_xy[1], list(goal_layers),
+                              toward_xy=from_xy if pad_escape_aware else None) or win.cell_of(*to_xy)
+    win_cong = _project_congestion(win, congestion, board_min[0], board_min[1], grid)
+    # Corridor is deliberately NOT applied: the whole point of this tier is to
+    # find a path the global stage's corridor never contemplated (a long detour
+    # the other way round an obstruction).
+    path = _fine_search(backend, win, net_kind, ctx["weights"], ctx["layer_purpose"],
+                        ctx["directions"], s_cell, start_layers, g_cell, goal_layers,
+                        home_layer, None, win_cong, plane_layers, goal_planes,
+                        ctx["plane_step"], ctx["attachment_via_cost"],
+                        ml_attach, return_path,
+                        _settings=ctx.get("gpu_settings"))
+    if path is None:
+        return None
+
+    rec_updates, segments, vias, _violations = _finalize_core(
+        ctx, net, win, path, from_xy, to_xy, active_obstacles,
+        max(span_x, span_y), plane_layers, conn)
+    if rec_updates is None:
+        # The whole-board path skims real copper. Terminal for this tier (same
+        # convention as `_route_hierarchical`): fall back to the caller's ordinary
+        # failure report rather than emitting geometry the self-check rejected.
+        return None
+    rec_updates = dict(rec_updates)
+    rec_updates["wide_lazy_window"] = {"grid_mm": round(win_grid, 6),
+                                       "cols": win.cols, "rows": win.rows,
+                                       "nodes": win.cols * win.rows * n_layers}
+    return rec_updates, segments, vias, win
 
 
 # --------------------------------------------------------------------------- #
@@ -6049,7 +6501,8 @@ def _route_hierarchical(
         path = _fine_search(backend, win, net_kind, weights, layer_purpose, directions,
                             s_cell, cur_layers, g_cell, leg_goal_layers,
                             home_layer, None, None, plane_layers, leg_goal_planes,
-                            plane_step, attachment_via_cost, ml_attach, return_path)
+                            plane_step, attachment_via_cost, ml_attach, return_path,
+                            _settings=ctx.get("gpu_settings"))
         if path is None and not is_last and leg_goal_layers != set(routable_layers):
             # Intermediate waypoint only: the coarse stage's layer preference
             # there isn't binding, only its (x, y) location is - retry with any
@@ -6060,7 +6513,8 @@ def _route_hierarchical(
             path = _fine_search(backend, win, net_kind, weights, layer_purpose, directions,
                                 s_cell, cur_layers, g_cell, leg_goal_layers,
                                 home_layer, None, None, plane_layers, leg_goal_planes,
-                                plane_step, attachment_via_cost, ml_attach, return_path)
+                                plane_step, attachment_via_cost, ml_attach, return_path,
+                                _settings=ctx.get("gpu_settings"))
         if path is None:
             return None  # this leg is unreachable even at the finest grid - terminal
 
@@ -6440,13 +6894,25 @@ def _route_cancel_requested(project_path: str | Path) -> bool:
         return False
 
 
-def open_route_viewer(project_path: str | Path, board: str | None = None) -> dict[str, Any]:
+def open_route_viewer(
+    project_path: str | Path, board: str | None = None, auto_close: bool = False,
+) -> dict[str, Any]:
     """Phase 7.9 - spawn the detached `kicad_route_viewer.py <board_path>`
     process that tails `<board>.route_progress.jsonl`. Decoupled by
     construction: the router only ever appends to that file, so the viewer
     can be opened, closed, or crash without touching (or blocking) routing.
     Also called internally by `route_nets`/`route_board` when
-    `autorouter.progress.open_viewer` is true.
+    `autorouter.progress.open_viewer` is true (with `auto_close=True` - see
+    below).
+
+    `auto_close`: when True, the spawned viewer closes itself a few seconds
+    after it sees `run_complete` in the event stream. This is for the
+    UNATTENDED case - a session/pipeline auto-launched the viewer via the
+    settings knob, nobody necessarily asked to sit and watch it, so it should
+    not linger after the route is done. The explicit `open_kicad_route_viewer`
+    MCP tool call (a human/session deliberately asking to watch) always
+    passes `auto_close=False` (the default) so that window stays up for
+    review at the viewer's own pace, same as before this existed.
 
     Observational-only failure honesty: if tkinter is unavailable (headless
     CI/container), this returns `{"launched": False, "reason": ...}` instead
@@ -6476,14 +6942,16 @@ def open_route_viewer(project_path: str | Path, board: str | None = None) -> dic
             subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     else:
         popen_kwargs["start_new_session"] = True
+    argv = [sys.executable or "python", str(viewer_script), str(board_path)]
+    if auto_close:
+        argv.append("--auto-close")
     try:
-        proc = subprocess.Popen(
-            [sys.executable or "python", str(viewer_script), str(board_path)], **popen_kwargs)
+        proc = subprocess.Popen(argv, **popen_kwargs)
     except OSError as exc:
         return {"launched": False, "reason": f"failed to launch viewer subprocess: {exc}"}
     return {
         "launched": True, "pid": proc.pid, "board_path": str(board_path),
-        "viewer_script": str(viewer_script),
+        "viewer_script": str(viewer_script), "auto_close": auto_close,
     }
 
 
@@ -6849,6 +7317,10 @@ def route_nets(
         "max_window_nodes": max_window_nodes,
         "base_margin": base_margin, "board_bbox": board_bbox, "board_min": board_min,
         "coarse_grid": coarse_grid, "coarse_min": coarse_min, "backend": backend,
+        # 7.8 GPU tier knobs (`memory_budget_mb` / `batch` / `oom_fallback`),
+        # carried as a small picklable slice of `settings` rather than the whole
+        # thing, so a spawned worker can plan its own VRAM budget identically.
+        "gpu_settings": {"autorouter": {"gpu": dict(autor.get("gpu", {}) or {})}},
         "plane_step": plane_step, "attachment_via_cost": attachment_via_cost,
         "weights": weights, "layer_purpose": layer_purpose, "directions": directions,
         "track_half": track_half, "via_radius": via_radius, "rules": rules,
@@ -6892,7 +7364,11 @@ def route_nets(
             project_path, board_path, settings, _progress_session))
         if bool(progress_cfg.get("open_viewer", False)):
             try:
-                open_route_viewer(project_path)
+                # auto_close=True: this launch is config-driven, not a user
+                # explicitly asking to watch (that's the separate
+                # `open_kicad_route_viewer` MCP tool, which never auto-closes)
+                # - see `open_route_viewer`'s docstring.
+                open_route_viewer(project_path, auto_close=True)
             except Exception:
                 pass
     placements: dict[int, dict[str, Any]] = {}      # owner -> {segments, vias, rec, net, obstacles}
@@ -7157,7 +7633,8 @@ def route_nets(
                                      core["goal_layers"], core["home_layer"], core["corridor"], win_cong,
                                      core["plane_layers"], core["goal_planes"],
                                      plane_step, attachment_via_cost,
-                                     ml_attach, (return_path_by_net or {}).get(core["net"]))
+                                     ml_attach, (return_path_by_net or {}).get(core["net"]),
+                                     _settings=ctx.get("gpu_settings"))
             if free_path is not None:
                 via_nodes = _path_via_nodes(free_path)
                 blockers: set[int] = set()

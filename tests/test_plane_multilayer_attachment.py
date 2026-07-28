@@ -194,10 +194,13 @@ def test_flag_on_astar_attaches_to_the_healthier_layer() -> None:
     assert path != _astar_attachment_choice(multilayer=False)
 
 
-def test_both_backends_agree_with_the_flag_on() -> None:
-    """The 7.8 bit-identical-backends guarantee must survive 7.18.1: the numpy
-    wavefront builds its via-cost array from the same model, so the scaled
-    attachment surcharge has to reproduce the cpu A*'s decision exactly."""
+def test_all_backends_agree_with_the_flag_on() -> None:
+    """The bit-identical-backends guarantee (7.8, extended to the M5 gpu tier)
+    must survive 7.18.1: the numpy/gpu wavefront builds its via-cost array from
+    the same model, so the scaled attachment surcharge has to reproduce the cpu
+    A*'s decision exactly. The gpu tier is included deliberately - with no cupy
+    installed it demotes to numpy, which is itself the M5 contract (a demotion
+    changes where the work ran, never the answer)."""
     win_args = ("power", router._Weights({}, 1.0), {}, {}, (0, 3), ["F.Cu"],
                 (6, 3), set(), None, None, None)
     island = {"raster": _rect(0.0, 0.0, 7.0, 7.0), "factor": 40.0}
@@ -206,10 +209,11 @@ def test_both_backends_agree_with_the_flag_on() -> None:
     for flag in (False, True):
         paths = [
             router._fine_search(backend, _three_layer_window(), *win_args,
-                                planes, planes, _PLANE_STEP, _ATTACH, flag, None)
-            for backend in ("cpu", "numpy")
+                                planes, planes, _PLANE_STEP, _ATTACH, flag, None,
+                                _settings={})
+            for backend in ("cpu", "numpy", "gpu")
         ]
-        assert paths[0] == paths[1], f"backend divergence at flag={flag}"
+        assert paths[0] == paths[1] == paths[2], f"backend divergence at flag={flag}"
 
 
 # --------------------------------------------------------------------------- #

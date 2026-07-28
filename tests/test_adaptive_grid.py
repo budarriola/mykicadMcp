@@ -95,10 +95,19 @@ def test_choose_grid_is_a_pure_function() -> None:
 # Integration: long connection fails at fixed grid, routes with adaptive grid
 # --------------------------------------------------------------------------- #
 
-def test_long_connection_window_too_large_at_fixed_grid(tmp_path: Path) -> None:
+def test_long_connection_window_too_large_at_fixed_grid(tmp_path: Path, monkeypatch) -> None:
     """Sanity-check the FAILURE this fix addresses: forcing `max_grid_mm` down
     to the base grid (i.e. disabling adaptation) reproduces `window_too_large`
-    on a connection whose window is too large at the fine 0.2 mm grid."""
+    on a connection whose window is too large at the fine 0.2 mm grid.
+
+    The M5 whole-board LAZY window tier (`_route_wide_lazy`) now rescues exactly
+    this case - a lazy window has no up-front rasterization cost, so the eager
+    node budget that produced `window_too_large` does not apply to it. That is a
+    deliberate capability, and it is asserted in the companion test below; here
+    the tier is disabled so the ORIGINAL adaptive-grid failure mode is still
+    covered on its own terms."""
+    monkeypatch.setattr(router, "_route_wide_lazy", lambda *a, **k: None)
+    monkeypatch.setattr(router, "_resolve_workers", lambda settings: 1)
     pads = [("L1", 5.0, 5.0, "LONG"), ("L2", 155.0, 155.0, "LONG")]
     proj = _write_project(tmp_path / "nogrid", pads, ["LONG"],
                           settings_overrides={"max_grid_mm": 0.2})
@@ -106,6 +115,21 @@ def test_long_connection_window_too_large_at_fixed_grid(tmp_path: Path) -> None:
     rec = _by_net(res)["LONG"]
     assert rec["routed"] is False
     assert rec["failure"]["reason"] == "window_too_large"
+
+
+def test_wide_lazy_tier_rescues_window_too_large(tmp_path: Path) -> None:
+    """The M5 lift, end to end through `route_nets`: the SAME fixed-grid project
+    that reports `window_too_large` with the tier disabled (above) now routes,
+    and reports the whole-board lazy window it used."""
+    pads = [("L1", 5.0, 5.0, "LONG"), ("L2", 155.0, 155.0, "LONG")]
+    proj = _write_project(tmp_path / "widelazy", pads, ["LONG"],
+                          settings_overrides={"max_grid_mm": 0.2})
+    res = router.route_nets(proj, write=False)
+    rec = _by_net(res)["LONG"]
+    assert rec["routed"] is True, rec.get("failure")
+    assert rec["self_check"]["passed"] is True
+    assert rec["self_check"]["violation_count"] == 0
+    assert rec["wide_lazy_window"]["grid_mm"] == 0.2
 
 
 def test_long_connection_routes_with_adaptive_grid(tmp_path: Path) -> None:
