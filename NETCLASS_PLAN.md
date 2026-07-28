@@ -165,11 +165,14 @@ For whoever (human or AI) picks this up next:
   The 35 failures are now `unreachable_in_window` (genuine dense-board
   pathfinding), not budget — closing that gap is Opus-class whole-board
   optimization (7.6), not a bounded Sonnet patch. See ⭐ findings.
-- **Next work when resumed (updated 2026-07-28 — M5 windowing/GPU tier landed
-  too, see its anchor):** (1) 7.13 impedance-matched traces & matched sets —
-  spec'd (see its section), Opus-class per the plan's own delegation
-  strategy, not yet started; this is now the only substantial open item in
-  the entire Phase 7 tree. Still open: M6 item 17 (c) Flow B stack-up-gate
+- **Next work when resumed (updated 2026-07-28 — M7 opened, Phase 7.18
+  landed, see its anchor):** (1) Phase 7.19 lightweight route cost estimation
+  — branch its worktree fresh from current `main` (do not reuse an older
+  worktree — see the M7 sequencing note on why 7.18's dispatch predated the
+  M5 merge and needed an integration pass as a result). (2) Phase 7.20
+  adjacent-layer crosstalk avoidance, after 7.19 merges. (3) Phase 7.13
+  impedance-matched traces & matched sets — spec'd (see its section),
+  Opus-class, not yet started. Still open: M6 item 17 (c) Flow B stack-up-gate
   question, and the small 7.3b "any same-net copper" termination bit.
 - Verify claims against the code (`kicad_pcb_tool.py`, `kicad_mcp_server.py`,
   `tests/`) rather than trusting this snapshot if they disagree — and then fix
@@ -686,13 +689,24 @@ router work):
   (22) ✅ **M5 whole-board windowing + GPU tier — LANDED 2026-07-28** (Opus
   subagent, worktree-isolated, coordinator-reviewed: full diff read plus an
   independent full-suite run against the merged tree — see the M5 anchor).
-  93 tools (was 92), 317→361 passed, same 7 pre-existing failures. **The only
-  clearly-open items remaining anywhere in the plan are 7.13 impedance-matched
-  traces** (spec'd, not started) **and assorted low-priority residuals**
-  (viewer polish, portfolio replicas, hybrid GPU/CPU scheduling, driving
-  `torch` as a second GPU array module, the small 7.3b "any same-net copper"
-  termination bit, and real-hardware GPU verification — no cupy/torch
-  installed in this environment).
+  93 tools (was 92), 317→361 passed, same 7 pre-existing failures.
+  (23) ✅ **Viewer auto-close — LANDED 2026-07-28** (coordinator-implemented,
+  user request): an unattended/config-driven viewer launch now closes itself
+  after `run_complete`; an explicit `open_kicad_route_viewer` call never does
+  — see the 7.9 anchor. 5 new tests, 361→365 passed.
+  (24) ✅ **M7 opened at user request (three new phases: 7.18 fill/via
+  engineering, 7.19 lightweight route-cost estimation, 7.20 adjacent-layer
+  crosstalk avoidance), and Phase 7.18 LANDED 2026-07-28** (Opus subagent,
+  worktree-isolated, coordinator-reviewed — see its anchor for the full
+  write-up, including a nontrivial integration pass against the just-merged
+  M5 work). 365→398 passed, same 7 pre-existing failures. **The only clearly-
+  open items remaining anywhere in the plan are Phase 7.19, Phase 7.20, Phase
+  7.13 impedance-matched traces** (spec'd, not started) **and assorted
+  low-priority residuals** (viewer cancel-flag/decision banner, portfolio
+  replicas, hybrid GPU/CPU scheduling, driving `torch` as a second GPU array
+  module, the small 7.3b "any same-net copper" termination bit, and
+  real-hardware GPU verification — no cupy/torch installed in this
+  environment).
 
 ## How to work this plan (living document — keep it current)
 
@@ -2414,51 +2428,73 @@ behind one entry point, not a sequence the caller has to orchestrate by hand.
 
 ---
 
-## Phase 7.18 — Multi-layer plane fill & via-mediated connectivity (added 2026-07-28 at user request)
+## Phase 7.18 — Multi-layer plane fill & via-mediated connectivity — LANDED 2026-07-28 (anchor)
 
-User priority: "advanced use of fill areas on different layers, and effective
-use of vias to both connect fill layers and signals." Extends the landed 7.5
-plane engine (via-drops through pours, plane costing, stitching) rather than
-replacing any of it — the "signal nets never treated as a plane" gate
-(2026-07-24 REQUIRED CONSTRAINT, see its anchor) is untouched by everything
-below.
+(Opus subagent, worktree-isolated, coordinator-reviewed: read the merge
+conflict resolution directly and ran the full suite independently on the
+integrated tree — see below for why integration was nontrivial.)
 
-- **7.18.1 Multi-layer attachment choice.** Today `_plane_components_for`
-  attaches a power/gnd net's via to whichever owning zone component it finds
-  first. When the SAME net owns zones on more than one layer (kiln's
-  `GND_Main`/`GND_Safty` do — F.Cu/B.Cu/In1.Cu per the M0 inventory), evaluate
-  every owning layer's component at the candidate cell and pick by the same
-  cost model everything else uses (attachment-via cost + island cost +
-  `layer_purpose` multiplier + congestion), not "first found." Read-only
-  ranking change to an existing decision point — no new obstacle model, no new
-  knob required (reuses `plane.*` weights already in `pcb_settings.json`).
-- **7.18.2 Cross-layer fill continuity audit.** Extends `audit_kicad_plane_
-  islands` (7.5.3 today only reasons about SAME-layer island isolation) with a
-  cross-layer view: for a net owning same-net zones on multiple layers, report
-  how many stitching vias actually bond them together and flag layer pairs
-  with zero or few (below `island_min_attachments_warn`) bonding vias as
-  weakly-coupled — two same-net pours that are nominally "the same net" but
-  electrically thin between them (added inductance/resistance the schematic
-  doesn't show). Read-only audit; the existing `run_kicad_stitching_pass`
-  (7.5.6) is the tool that already fixes what this flags, so no new writer is
-  needed — this closes the loop by making the gap visible.
-- **7.18.3 Return-path-aware via placement for signal nets.** Today, a signal
-  net's layer-change via cost is layer-purpose/congestion only; it has no
-  preference for landing near existing REFERENCE-plane copper (GND/power) on
-  the layer(s) it's transiting, even though 7.5.6's stitching pass already
-  values this after the fact (`near_high_speed_mm`/`near_high_speed_pitch_mm`).
-  Add a routing-TIME cost term (new `plane.return_path_bonus` weight, default
-  0 so a project that never tunes it is byte-identical to today) that
-  discounts a via's cost when it lands within `near_high_speed_mm` of the
-  net's own reference-plane zone on an ADJACENT layer — pulling signal vias
-  toward locations a stitching via can cheaply reference, without ever
-  routing the signal net itself through the plane (the 7.5.4 gate still
-  applies). Must not regress the existing plane-parity/signal-fill-is-not-a-
-  plane tests.
-- Gate: real-kiln measurement before/after on `get_kicad_trace_cost` +
-  `audit_kicad_plane_islands`, and the existing plane/parity test suite must
-  stay green plus new tests for each of 7.18.1–7.18.3. Delegate: Opus
-  (algorithm/cost-model work riding the router core, same class as 7.5/7.6).
+**7.18.1 Multi-layer attachment choice.** `_build_fine_cost`/
+`_build_cost_arrays` now score EVERY covering plane component at a candidate
+cell (not just the first found) and pick by the same cost model everything
+else uses; the attachment-via surcharge is scaled by the landed component's
+island factor (`attachment_via_cost × factor`) instead of a flat charge
+regardless of what it lands on — that scaling is what actually changes
+kiln's decisions (the min-vs-first part alone was nearly a no-op on this
+board). **Deviation from spec, justified:** landed behind a new
+`plane.multilayer_attachment_choice` knob (default `false`), not knob-free as
+originally scoped — the parity requirement ("untuned project byte-identical
+to before") and the fact that this change provably moves geometry can only
+both hold behind a flag, same treatment 7.3d gave `pad_escape_direction_
+aware`. Measured on kiln: real ranking decisions exist (2,984 of 9,964
+multi-layer-covered points on GND_Main have different island factors across
+layers); flag ON changes emitted copper (11 blocks vs 8 on a 4-net probe) and
+trades ~10 points of board score for landing vias on healthier copper — the
+Phase 6 score doesn't price plane health, so this is a real, honest,
+opt-in trade-off, not a strict improvement.
+
+**7.18.2 Cross-layer fill continuity audit.** `audit_kicad_plane_islands`
+gained `cross_layer` + `summary.weakly_coupled_layer_pairs`: per net owning
+fill on multiple copper layers, each stack-adjacent layer pair reports
+`bonding_via_count` (same-net vias whose electrical span covers both layers
+AND lands in real fill on both), `bonding_pad_count`, and a `weakly_coupled`
+flag below `island_min_attachments_warn`. Read-only, additive — no new
+writer (`run_kicad_stitching_pass` already fixes what this flags). Kiln
+reports **zero** weakly-coupled pairs (GND_Main 251 bonding vias/pair,
+GND_Safty 109, 12v_Safty 5) — the gap is now visible, this board just
+doesn't have one.
+
+**7.18.3 Return-path-aware via placement for signal nets.** New
+`plane.return_path_bonus` weight (default `0.0` — byte-identical parity
+proven by digest match against pre-7.18 routing) discounts a signal net's
+via cost when it lands within `stitching.near_high_speed_mm` of its own
+reference plane on a stack-adjacent layer. **"The net's own reference
+plane"** (left open by the original spec) is resolved by pad-vote: candidates
+are power-kind fill-owning nets (preferring `gnd_token` names), winner is
+whichever candidate's fill covers the most of the signal net's own pads —
+deliberately not a "biggest ground pour" heuristic, since that would
+mis-reference every net in kiln's isolated `/SaftyProcessor/` ground domain.
+The 2026-07-24 REQUIRED CONSTRAINT (signal nets never treated as a routable
+plane) is untouched — this only discounts VIA PLACEMENT cost, never routes a
+signal net through fill. Measured: 192/222 signal nets resolve a reference
+(115 MainControler → GND_Main, 77 SaftyProcessor → GND_Safty, exactly along
+the schematic sheets); of the board's 167 existing hand-routed signal vias,
+153 (97%) already land where the term would discount them — validating the
+term encodes real good practice, not an arbitrary preference.
+
+**Integration note (why this merge was nontrivial):** this delegation's
+worktree was created before the M5 windowing/GPU tier (see its anchor) was
+merged into `main`, and both pieces of work modified the exact same hot
+functions (`fine_wavefront`, `_build_cost_arrays`, `_fine_search` and its call
+sites). The subagent rebased/merged `main` in and resolved five conflicts by
+combining both sides (never picking one) — notably, M5's brand-new
+`_route_wide_lazy` tier auto-merged WITHOUT a conflict marker but would have
+silently used the wrong (pre-7.18) cost model; this was caught and fixed
+explicitly so a connection rescued by that tier prices identically to a
+ladder-routed one. Three-backend (cpu/numpy/gpu) parity holds with each new
+flag on and off. Full suite: 365→398 passed (33 new tests), same 7
+pre-existing board-drift failures, confirmed by the coordinator's own
+independent run on the final integrated tree.
 
 ## Phase 7.19 — Lightweight route cost estimation (added 2026-07-28 at user request)
 
@@ -2539,10 +2575,13 @@ Phase 3/Flow A's `confirmed_buses`).
 **Sequencing note (coordinator, 2026-07-28):** all three of 7.18/7.19/7.20
 touch `kicad_router_tool.py`'s cost model and/or `_FineWindow`/`_fine_search`
 call sites — the same surface M5 just changed. Land them ONE AT A TIME
-(worktree branched from the post-M5 `main`, reviewed and merged before the
-next starts), not as three parallel delegations, to avoid three-way conflicts
-in the hottest file in the codebase. Order per the user's stated priority:
-7.18 first, then 7.19, then 7.20.
+(worktree branched from the CURRENT `main` at dispatch time, reviewed and
+merged before the next starts), not as three parallel delegations, to avoid
+three-way conflicts in the hottest file in the codebase. Order per the user's
+stated priority: 7.18 first (**LANDED 2026-07-28, see its anchor** — its
+worktree was dispatched before the M5 merge landed and needed an explicit
+integration pass as a result; branch remaining items from `main` freshly, not
+from an older worktree, to avoid repeating that), then 7.19, then 7.20.
 
 ---
 
@@ -2996,10 +3035,11 @@ touched by this work, no write occurred).
 
 **M7 — Fill/via engineering, route-search speed, crosstalk avoidance (added
 2026-07-28 at user request):**
-22. Phase 7.18 multi-layer plane fill & via-mediated connectivity (7.18.1
-    attachment-choice ranking, 7.18.2 cross-layer continuity audit, 7.18.3
-    return-path-aware via placement) — see its section; Opus; land FIRST of
-    this milestone's three items per the user's stated priority.
+22. Phase 7.18 multi-layer plane fill & via-mediated connectivity — **LANDED
+    2026-07-28** (see its anchor: 7.18.1 attachment-choice ranking behind
+    `plane.multilayer_attachment_choice`, 7.18.2 cross-layer continuity audit,
+    7.18.3 return-path-aware via placement behind `plane.return_path_bonus`).
+    Nothing remains in this item.
 23. Phase 7.19 lightweight route cost estimation (coarse-field A* heuristic,
     cheap global-candidate pre-ranking) — see its section; Opus; land second,
     after 7.18 merges.
