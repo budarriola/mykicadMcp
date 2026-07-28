@@ -1377,7 +1377,25 @@ class KiCadMcpServer:
                     "decide_kicad_route, or simply call this tool again to defer to the best-scored "
                     "option. Clear winners are auto-taken exactly as before, max_pauses_per_run caps the "
                     "escalation budget, and ai_decisions.enabled:false disables pausing entirely. Every "
-                    "committed move - auto or AI-decided - is appended to decision_log for audit/replay."
+                    "committed move - auto or AI-decided - is appended to decision_log for audit/replay. "
+                    "Phase 7.14 (pin-swap advisor, OFF unless pin_swap.enabled is true in "
+                    "pcb_settings.json): a seventh 'move' that this tool can never apply. It looks for "
+                    "two SIGNAL nets on different pins of one detect_kicad_connectors connector "
+                    "(power/ground pins are excluded outright) whose swap would score better, prices "
+                    "each candidate as a controlled A/B on two disposable board copies - both arms "
+                    "strip and reroute the same two nets, the swap arm additionally trades the two "
+                    "pads' nets - and if the gain reaches pin_swap.min_gain returns state "
+                    "'awaiting_decision' with decision_type 'pin_swap'. That pause is MANDATORY: "
+                    "unlike every other decision type it is not gated by ai_decisions (not by "
+                    "min_score_spread, not by max_pauses_per_run, not by the decision_types "
+                    "allowlist), because the tool cannot apply a pin swap even when it is a clear "
+                    "winner - only YOU can, by editing the schematic and re-exporting the netlist. "
+                    "Answer opt1 to decline or opt2 to report you made the change, after which the "
+                    "session re-syncs its board against the real board's new pad-net assignment and "
+                    "continues. Sub-min_gain swaps are recorded in pin_swap_reports and never "
+                    "proposed. The schematic and the real .net file are NEVER written on any path, "
+                    "and write=true additionally refuses outright if the session's board and the "
+                    "real board disagree about any pad's net."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -1411,6 +1429,18 @@ class KiCadMcpServer:
                                 "it): quick=max_iterations 5 + greedy; balanced (default)=today's "
                                 "optimizer.* settings unchanged; best=simulated annealing + an 8h time "
                                 "budget. Defaults to optimizer.effort in pcb_settings.json ('balanced')."
+                            ),
+                        },
+                        "pin_swap_exclusions": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Phase 7.14 - connector refs (e.g. ['J2','J7']) the pin-swap "
+                                "advisor must never propose a swap on. Resolved against "
+                                "detect_kicad_connectors at session creation; an unresolved name "
+                                "RAISES and lists the board's detected refs rather than being "
+                                "silently dropped. New-session only; ignored unless "
+                                "pin_swap.enabled is true in pcb_settings.json."
                             ),
                         },
                         "write": {"type": "boolean", "default": False},
@@ -1460,7 +1490,15 @@ class KiCadMcpServer:
                     "optimize_kicad_board with the same session_id afterwards to continue. Raises if the "
                     "session is not awaiting a decision or the decision_id does not match the pending "
                     "one. Never touches the real board - like the rest of the optimizer it works on the "
-                    "session's private scratch copy until optimize_kicad_board is called with write=true."
+                    "session's private scratch copy until optimize_kicad_board is called with write=true. "
+                    "Phase 7.14: a pending_decision with decision_type 'pin_swap' is answered here too, "
+                    "but it is ADVISORY and commits nothing - opt1 declines the proposed connector pin "
+                    "swap, opt2 reports that the HUMAN made the change in the schematic and re-exported "
+                    "the netlist, whereupon the session re-syncs its board against the real board's "
+                    "current pad-net assignment (adopting it, never deciding it) and reports what "
+                    "changed under `resync`. Answering opt2 without having made the change is harmless: "
+                    "the re-sync finds nothing to adopt and says so. This is a question for the USER, "
+                    "not for you - relay it rather than answering it on their behalf."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -2431,6 +2469,7 @@ class KiCadMcpServer:
             max_iterations=int(max_iterations) if max_iterations is not None else None,
             time_budget_s=float(time_budget_s) if time_budget_s is not None else None,
             effort=args.get("effort"),
+            pin_swap_exclusions=args.get("pin_swap_exclusions"),
             write=bool(args.get("write", False)),
             allow_while_open=bool(args.get("allow_while_open", False)),
         )

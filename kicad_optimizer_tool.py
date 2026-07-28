@@ -94,6 +94,20 @@ auto-accepted or AI-decided - appends one entry to `decision_log` carrying the
 options, their scores, the choice, the rationale and the `auto` flag. That log
 plus `seed` is enough to replay a run (same seed + same answers -> same board);
 a dedicated replay executor is not built here (see the report's TODO).
+
+PHASE 7.14 - THE PIN-SWAP ADVISOR, THE ONE MOVE THIS TOOL CANNOT MAKE
+---------------------------------------------------------------------
+A seventh move type joins the six above with one categorical difference: it is
+never applied. A pin swap changes which NET OWNS WHICH PAD, and that lives in
+the schematic - which this tool never edits, by design and by plan. So the
+advisor prices a swap on disposable copies, and when one is worth
+`pin_swap.min_gain` board-score points it PAUSES and asks the human to make the
+change, rather than making it. That pause is mandatory rather than
+spread-gated: a clear winner is exactly the case that must be escalated, since
+"clear winner" and "cannot be applied by this tool" are both true at once. Off
+by default (`pin_swap.enabled: false`), and provably inert when off - the gate
+returns before consuming a single unit of RNG. See the Phase 7.14 section
+further down for the full design argument.
 """
 
 from __future__ import annotations
@@ -385,6 +399,13 @@ def _session_report(session: dict[str, Any]) -> dict[str, Any]:
         "decision_log": list(session.get("decision_log", [])),
         "pauses_used": session.get("pauses_used", 0),
         "ai_decisions": dict(session.get("ai_decisions", {})),
+        # 7.14. `pin_swap_reports` carries EVERY pair the advisor priced,
+        # including the sub-`min_gain` ones that were never proposed - "reported,
+        # not proposed" is only true if the report is somewhere a caller can
+        # read it, and this is that place.
+        "pin_swap": dict(session.get("pin_swap", {})),
+        "pin_swap_exclusions": list(session.get("pin_swap_exclusions", [])),
+        "pin_swap_reports": list(session.get("pin_swap_reports", [])),
     }
 
 
@@ -416,6 +437,15 @@ def _migrate_session(session: dict[str, Any], config: dict[str, Any]) -> dict[st
     session.setdefault("productive_improvements", [])
     session.setdefault("plateau_reference_rate", None)
     session.setdefault("plateau_trailing_rate", None)
+    # Phase 7.14: a pre-7.14 session never had a pin-swap policy, and resolving
+    # one from the CURRENT settings is the only honest option (same reasoning as
+    # `ai_decisions` above). A resumed session whose settings still say
+    # `enabled: false` - the default - therefore behaves exactly as it did.
+    if not session.get("pin_swap"):
+        session["pin_swap"] = _pin_swap_config(config)
+    session.setdefault("pin_swap_exclusions", [])
+    session.setdefault("pin_swap_examined", [])
+    session.setdefault("pin_swap_reports", [])
     return session
 
 
@@ -700,6 +730,850 @@ _MOVE_APPLIERS = {
     "create_plane": _apply_create_plane,
     "modify_plane": _apply_modify_plane,
 }
+
+
+# =========================================================================== #
+# Phase 7.14 - the pin-swap ADVISOR: the seventh move, and the only one this
+# module can never apply
+#
+# WHY IT IS NOT IN `_MOVE_APPLIERS`
+# ---------------------------------
+# The six moves above are all COPPER moves: they change where copper runs, and
+# `_commit_choice` promotes a winning trial directory over the scratch because
+# the scratch board is, by construction, a thing this tool is allowed to write.
+# A pin swap is not a copper change at all - it changes WHICH NET OWNS WHICH
+# PHYSICAL PAD, and the source of truth for that is the schematic (plus the
+# `.net` export KiCad derives from it). The plan is categorical that this tool
+# NEVER edits the schematic and never edits the real netlist, so a pin swap is
+# something only a human can realize. Wiring it into `_MOVE_APPLIERS` would
+# make it promotable by `_commit_choice`, and a promoted swap would ride the
+# scratch board straight into the real board on `write=True` - silently
+# reassigning a real pad's net, the one outcome this whole feature must make
+# impossible. So the pin swap lives entirely OUTSIDE the candidate/commit
+# machinery: it is generated, priced, and ESCALATED, never committed.
+#
+# That is also why its pause is mandatory rather than spread-gated (see
+# `_pin_swap_gate`): every other decision type is "which of these applied moves
+# do I keep", and a clear winner needs no human. A pin swap has no applied move
+# to keep - the ONLY way it can ever happen is a human editing the schematic -
+# so a clear winner is precisely the case that MUST be escalated. It follows
+# that the `ai_decisions` policy does not gate it either: `min_score_spread`,
+# `max_pauses_per_run` and the `decision_types` allowlist all describe when to
+# ask the AI to arbitrate between the optimizer's own options, and this is not
+# that question. (`"pin_swap"` is deliberately absent from
+# `DEFAULT_PCB_SETTINGS["optimizer"]["ai_decisions"]["decision_types"]` for the
+# same reason - it is not an AI decision type. `pin_swap.enabled`, off by
+# default, is its consent gate, exactly as the plan specifies.)
+#
+# HOW A HYPOTHETICAL SWAP IS PRICED WITHOUT TOUCHING THE NETLIST
+# --------------------------------------------------------------
+# On a DISPOSABLE trial copy (the `_scratch_snapshot` pattern every other
+# candidate already uses), the swap is made REAL rather than simulated: the two
+# pads' own `(net ...)` s-expressions in the trial's `.kicad_pcb` are swapped
+# verbatim, and the matching two `(node ...)` blocks in the trial's `.net` copy
+# are swapped with them. The trial is then a perfectly coherent board - pad
+# nets, netlist and copper all agree - so `route_nets`, its `_self_check`
+# clearance proof, `get_ratsnest` and `get_trace_cost` all run on genuine data
+# with their normal trust model intact. Nothing here fakes pad identity, which
+# is what would have broken self-check's clearance model had the swap been
+# expressed as synthetic `route_nets(connections=...)` endpoints instead: a net
+# routed to a pad it does not own is, to self-check, copper shorting a foreign
+# pad, and the trial would fail for a reason that has nothing to do with the
+# swap's merit.
+#
+# The real project is never opened for writing on any path here, and the trial
+# is thrown away whatever the answer - the swap's ONLY output is a number and a
+# question.
+#
+# WHY THE MEASUREMENT IS AN A/B, NOT "CURRENT SCORE VS SWAPPED SCORE"
+# -------------------------------------------------------------------
+# Scoring the swap trial against the session's current score would measure two
+# things at once: the swap, and the fact that the two nets got rerouted by the
+# autorouter (on a hand-routed board, usually a large loss that has nothing to
+# do with pin assignment). So each pair is priced as a controlled A/B on two
+# sibling trials that differ in exactly one respect: `baseline` strips both
+# nets' copper and reroutes them as they are; `swap` strips the same copper,
+# swaps the two pads, and reroutes. `gain = baseline_total - swap_total` is
+# therefore attributable to the swap alone, and is what `pin_swap.min_gain`
+# is compared against.
+# =========================================================================== #
+
+# Cost bounds, not design policy (same reasoning as
+# `_MAX_CANDIDATES_PER_ITERATION`): a connector with N swappable signal pins
+# offers N*(N-1)/2 pairs, and every pair that reaches a trial costs two full
+# reroute+rescore passes. The cheap airline estimate below ranks them all;
+# only the top few are ever routed.
+_MAX_PIN_SWAP_PAIRS_ESTIMATED = 60
+_MAX_PIN_SWAP_TRIALS = 2
+
+
+def _pin_swap_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the `pin_swap` block against the 7.14 schema defaults, and
+    snapshot it into the session at creation for the same reason
+    `_ai_decision_config` is snapshotted: a run's consent gate and threshold
+    must not change under it half way through."""
+    defaults = _pcb.DEFAULT_PCB_SETTINGS["pin_swap"]
+    block = config.get("pin_swap", {}) or {}
+    return {
+        "enabled": bool(block.get("enabled", defaults["enabled"])),
+        "min_gain": float(block.get("min_gain", defaults["min_gain"])),
+        "ref_prefixes": list(block.get("ref_prefixes", defaults["ref_prefixes"])),
+    }
+
+
+# --- pad/netlist identity: the two maps every safety check here compares ---- #
+
+def _board_pad_net_map(project_path: str | Path) -> dict[str, str]:
+    """`"<REF>.<PAD>" -> net name`, straight from the BOARD's own pad `(net
+    ...)` entries - the same ground truth `build_connectivity` and
+    `detect_connectors` already trust over the `.net` export.
+
+    This map is the object the whole feature's safety rule is stated in: "never
+    silently change which net a real pad belongs to" is exactly "this map, for
+    the real board, is not changed by anything this tool writes", which
+    `_apply_session` now asserts before every write.
+    """
+    board_path, _, _ = _pcb._resolve_project_path(project_path)
+    pads = _pcb._parse_footprint_pads_cached(board_path)
+    out: dict[str, str] = {}
+    for fp in pads.values():
+        ref = fp.get("reference", "")
+        if not ref:
+            continue
+        for pad in fp.get("pads", []):
+            number = pad.get("number", "")
+            if number:
+                out[f"{ref}.{number}"] = pad.get("net", "")
+    return out
+
+
+def _netlist_pad_net_map(project_path: str | Path) -> dict[str, str]:
+    """The same `"<REF>.<PIN>" -> net name` map as `_board_pad_net_map`, but
+    from the `.net` schematic export. Empty when the project has no `.net`
+    file, which is a legitimate state (several synthetic fixtures) rather than
+    an error - callers treat "no netlist" as "nothing to compare against"."""
+    _, _, netlist_path = _pcb._resolve_project_path(project_path)
+    out: dict[str, str] = {}
+    for net in _pcb._parse_nets_cached(netlist_path):
+        name = net.get("name", "")
+        for node in net.get("nodes", []):
+            ref, pin = node.get("ref", ""), node.get("pin", "")
+            if ref and pin:
+                out[f"{ref}.{pin}"] = name
+    return out
+
+
+def _netlist_pad_mismatches(project_path: str | Path) -> list[dict[str, Any]]:
+    """PAD-LEVEL netlist staleness, sorted for reproducibility.
+
+    `detect_buses`/`classify_critical_nets` already carry a staleness guard,
+    but theirs compares net NAME SETS - and a pin swap changes no net name at
+    all, only which pad each name sits on, so a name-set comparison is blind to
+    exactly the edit this phase asks the user to make. This is the same guard
+    one level finer: for every `(ref, pad)` present in BOTH the board and the
+    `.net` export, report the ones whose net disagrees. Pads present in only
+    one of the two are not reported here - that is the name/DNP-level drift the
+    existing guards already cover, and flagging it again would bury the two
+    rows a pin swap actually produces.
+    """
+    board_map = _board_pad_net_map(project_path)
+    netlist_map = _netlist_pad_net_map(project_path)
+    return [
+        {"pad": key, "board_net": board_map[key], "netlist_net": netlist_map[key]}
+        for key in sorted(set(board_map) & set(netlist_map))
+        if board_map[key] != netlist_map[key]
+    ]
+
+
+# --- trial-only s-expression surgery ---------------------------------------- #
+#
+# Everything below writes a board/netlist file. Every caller passes a private
+# trial directory produced by `_scratch_snapshot`; nothing here is ever called
+# with the real project path, and `_apply_session`'s pad-map assertion is the
+# backstop that makes that a checked property rather than a promise.
+
+def _block_end(text: str, open_idx: int) -> int:
+    """Index just past the `)` matching the `(` at `open_idx`, ignoring parens
+    inside quoted strings (a footprint `descr`/`datasheet` string routinely
+    contains one, and a naive depth count desyncs on it - the same hazard
+    `_pcb._footprint_block_span` documents)."""
+    depth = 0
+    i = open_idx
+    in_str = False
+    while i < len(text):
+        c = text[i]
+        if in_str:
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    raise ValueError(f"unbalanced parentheses from offset {open_idx}")
+
+
+def _child_spans(text: str, start: int, end: int) -> list[tuple[int, int]]:
+    """Spans of the DIRECT children of the block spanning `[start, end)`. Used
+    instead of a substring search so that, say, a `(net ...)` belonging to a
+    nested block can never be mistaken for the pad's own."""
+    spans: list[tuple[int, int]] = []
+    i = start + 1
+    in_str = False
+    while i < end - 1:
+        c = text[i]
+        if in_str:
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            i += 1
+            continue
+        if c == "(":
+            child_end = _block_end(text, i)
+            spans.append((i, child_end))
+            i = child_end
+            continue
+        i += 1
+    return spans
+
+
+def _footprint_span_by_ref(text: str, reference: str) -> tuple[int, int]:
+    """Span of the `(footprint ...)` block whose Reference property is
+    `reference`. Deliberately indentation-agnostic (unlike
+    `_pcb._footprint_block_span`, which anchors on a literal tab): the
+    synthetic fixtures this feature is tested on indent with spaces, and a
+    swap that silently found nothing on a space-indented board would make the
+    tests pass for the wrong reason."""
+    search = 0
+    while True:
+        idx = text.find("(footprint ", search)
+        if idx == -1:
+            raise KeyError(f"no (footprint ...) block with Reference {reference!r}")
+        end = _block_end(text, idx)
+        match = re.search(r'\(property\s+"Reference"\s+"([^"]*)"', text[idx:end])
+        if match and match.group(1) == reference:
+            return idx, end
+        search = end
+
+
+def _pad_net_span(text: str, fp_start: int, fp_end: int, pad_number: str) -> tuple[int, int]:
+    """Span of the `(net ...)` child of pad `pad_number` inside the footprint
+    block `[fp_start, fp_end)`. Raises when the pad has no `(net ...)` at all -
+    an unconnected pad is not swappable and must not be silently skipped, since
+    a swap that quietly moved only one of the two nets would corrupt the trial.
+    """
+    for pad_start, pad_end in _child_spans(text, fp_start, fp_end):
+        head = text[pad_start:pad_start + 40]
+        match = re.match(r'\(pad\s+"([^"]*)"', head)
+        if not match or match.group(1) != pad_number:
+            continue
+        for child_start, child_end in _child_spans(text, pad_start, pad_end):
+            if re.match(r"\(net[\s)]", text[child_start:child_start + 5]):
+                return child_start, child_end
+        raise KeyError(f"pad {pad_number!r} has no (net ...) entry - not swappable")
+    raise KeyError(f"no pad {pad_number!r} in this footprint")
+
+
+def _swap_spans(text: str, a: tuple[int, int], b: tuple[int, int]) -> str:
+    """Exchange two non-overlapping substrings VERBATIM.
+
+    Swapping the text rather than rewriting it is what makes this format-proof:
+    a pad's net entry is `(net "NAME")` on some boards and `(net 7 "NAME")` on
+    others (KiCad emits both shapes, and `_parse_footprint_pads` reads the last
+    token either way). Exchanging the two entries preserves whichever shape the
+    file uses, and carries each net's board-level index along with its name -
+    no index table lookup, no format assumption, nothing to get wrong.
+    """
+    first, second = sorted([a, b])
+    if first[1] > second[0]:
+        raise ValueError("cannot swap overlapping spans")
+    return (text[:first[0]] + text[second[0]:second[1]] + text[first[1]:second[0]]
+            + text[first[0]:first[1]] + text[second[1]:])
+
+
+def _netlist_node_span(text: str, reference: str, pin: str) -> tuple[int, int] | None:
+    """Span of the `(node (ref "<reference>") (pin "<pin>") ...)` block in a
+    `.net` export, or None when the export does not mention that pin (a
+    perfectly ordinary state for a fixture with no netlist, and for a board
+    pad the schematic does not drive)."""
+    search = 0
+    while True:
+        idx = text.find("(node", search)
+        if idx == -1:
+            return None
+        end = _block_end(text, idx)
+        block = text[idx:end]
+        ref_m = re.search(r'\(ref\s+"([^"]*)"\)', block)
+        pin_m = re.search(r'\(pin\s+"([^"]*)"\)', block)
+        if ref_m and pin_m and ref_m.group(1) == reference and pin_m.group(1) == pin:
+            return idx, end
+        search = end
+
+
+def _trial_swap_pad_nets(trial: Path, reference: str, pad_a: str, pad_b: str) -> dict[str, Any]:
+    """TRIAL-ONLY: exchange the nets of two pads on one connector, in both the
+    trial board and (when present) the trial `.net` copy.
+
+    The board side swaps the pads' own `(net ...)` entries; the netlist side
+    swaps the two `(node ...)` blocks, which moves each pin - together with any
+    `pinfunction`/`pintype` that belongs to it - under the other net's name.
+    The result is exactly the project the user would have after making the
+    change in the schematic and re-exporting, which is the point: the trial has
+    to be the thing being proposed, not an approximation of it.
+
+    NEVER call this on a real project directory. Its only callers snapshot the
+    scratch first, and the snapshot is deleted whatever the user answers.
+    """
+    board_path, _, netlist_path = _pcb._resolve_project_path(trial)
+    text = _pcb._read_text(board_path)
+    fp_start, fp_end = _footprint_span_by_ref(text, reference)
+    span_a = _pad_net_span(text, fp_start, fp_end, pad_a)
+    span_b = _pad_net_span(text, fp_start, fp_end, pad_b)
+    with board_path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(_swap_spans(text, span_a, span_b))
+    _pcb._invalidate_board_cache(board_path)
+
+    netlist_swapped = False
+    if netlist_path.exists():
+        net_text = _pcb._read_text(netlist_path)
+        node_a = _netlist_node_span(net_text, reference, pad_a)
+        node_b = _netlist_node_span(net_text, reference, pad_b)
+        if node_a and node_b:
+            with netlist_path.open("w", encoding="utf-8", newline="") as handle:
+                handle.write(_swap_spans(net_text, node_a, node_b))
+            # The netlist parse cache is mtime+size keyed and a swap preserves
+            # size exactly (the same two blocks, exchanged), so the cache MUST
+            # be dropped by hand - a same-size same-second rewrite is precisely
+            # the case that validation cannot see.
+            _pcb._net_cache.pop(str(netlist_path), None)
+            netlist_swapped = True
+    return {"reference": reference, "pads": [pad_a, pad_b], "netlist_swapped": netlist_swapped}
+
+
+def _trial_strip_net_copper(trial: Path, nets: list[str]) -> int:
+    """TRIAL-ONLY: delete ALL copper on `nets`, hand-routed or not, and forget
+    any ownership records for it.
+
+    `unroute_nets` deliberately cannot do this - it only ever removes
+    autorouter-owned uuids, which is exactly the guard that keeps human copper
+    safe everywhere else in this module, and nothing here weakens it. But the
+    A/B measurement needs both sides to start from "these two nets have no
+    copper": on a hand-routed board the baseline arm would otherwise keep the
+    human's copper while the swap arm could not (the human's copper runs to the
+    pads the swap just reassigned, so it is not merely suboptimal, it is
+    wrong), and the resulting "gain" would be measuring the human, not the
+    swap.
+
+    Ripping hand copper is safe here for one structural reason only: a pin-swap
+    trial is NEVER promoted over the scratch. The directory this writes to is
+    deleted whatever the user answers, so no copper it removes can reach the
+    session's board, let alone the real one.
+    """
+    board_path, _, _ = _pcb._resolve_project_path(trial)
+    tracks = _pcb._parse_tracks_cached(board_path)
+    wanted = set(nets)
+    uuids = {
+        item["uuid"]
+        for group in ("segments", "arcs", "vias")
+        for item in tracks[group]
+        if item.get("net") in wanted and item.get("uuid")
+    }
+    if not uuids:
+        return 0
+    text, removed = _r._delete_blocks_by_uuid(_pcb._read_text(board_path), uuids)
+    with board_path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
+    _pcb._invalidate_board_cache(board_path)
+
+    data = _pcb.load_board_local(trial)["data"]
+    owned = data.get("autorouter_owned", {}) or {}
+    for key in ("segments", "vias", "arcs"):
+        if owned.get(key):
+            owned[key] = [u for u in owned[key] if u not in uuids]
+    if owned.get("records"):
+        owned["records"] = [rec for rec in owned["records"] if rec.get("uuid") not in uuids]
+    _pcb.save_board_local(trial, data)
+    return removed
+
+
+# --- candidate pairs -------------------------------------------------------- #
+
+def _swappable_connector_pins(project: Path, cfg: dict[str, Any],
+                              exclusions: list[str]) -> list[dict[str, Any]]:
+    """Every connector pin this session may consider trading, in
+    `detect_connectors`'s own sorted order (ranking is the caller's job).
+
+    Three filters, all from the plan's own interaction contract:
+      - the connector must be one `detect_connectors` found under
+        `pin_swap.ref_prefixes` (or by footprint token - detection's own
+        either-signal rule, reused rather than re-derived);
+      - the connector must not be in `exclusions` (validated loudly at session
+        creation via `validate_connector_exclusions`, so an unresolved name
+        cannot silently leave a connector the user meant to protect eligible);
+      - the pin's net must be a SIGNAL net. Power/ground pins are excluded
+        outright via `_net_kind` - the same Phase 9 classification the rest of
+        this codebase uses - because a connector's supply pins are fixed by the
+        mating part's pinout, not by what routes prettily, and "the optimizer
+        suggested moving your ground pin" is advice no one should be given.
+    """
+    settings = _pcb.load_pcb_settings(project)["config"]
+    power_patterns = settings.get("layer_purpose", {}).get("power_net_patterns", [])
+    excluded = {str(name).strip().upper() for name in exclusions}
+
+    detected = _pcb.detect_connectors(project, ref_prefixes=cfg["ref_prefixes"])
+    pins: list[dict[str, Any]] = []
+    board_path, _, _ = _pcb._resolve_project_path(project)
+    positions = {
+        f"{fp.get('reference', '')}.{pad.get('number', '')}": pad.get("position", {"x": 0.0, "y": 0.0})
+        for fp in _pcb._parse_footprint_pads_cached(board_path).values()
+        for pad in fp.get("pads", [])
+    }
+    for candidate in detected["candidates"]:
+        ref = candidate["ref"]
+        if ref.upper() in excluded:
+            continue
+        for pin in candidate["pins"]:
+            net = pin.get("net", "")
+            if not net:
+                continue
+            if _pcb._net_kind(net, power_net_patterns=power_patterns) != "signal":
+                continue
+            pins.append({
+                "ref": ref, "pad": pin["pad"], "net": net,
+                "position": positions.get(f"{ref}.{pin['pad']}", {"x": 0.0, "y": 0.0}),
+            })
+    return pins
+
+
+def _net_anchor_points(project: Path) -> dict[str, list[dict[str, Any]]]:
+    """Every net's pad positions (with the owning ref, so the estimate can
+    exclude the connector's own pads), for the cheap airline estimate below."""
+    board_path, _, _ = _pcb._resolve_project_path(project)
+    anchors: dict[str, list[dict[str, Any]]] = {}
+    for fp in _pcb._parse_footprint_pads_cached(board_path).values():
+        ref = fp.get("reference", "")
+        for pad in fp.get("pads", []):
+            net = pad.get("net", "")
+            if net:
+                anchors.setdefault(net, []).append({
+                    "x": float(pad.get("position", {}).get("x", 0.0)),
+                    "y": float(pad.get("position", {}).get("y", 0.0)),
+                    "ref": ref, "pad": pad.get("number", ""),
+                })
+    return anchors
+
+
+def _pin_swap_pairs(project: Path, cfg: dict[str, Any],
+                    exclusions: list[str]) -> list[dict[str, Any]]:
+    """Rank candidate pin pairs by a cheap airline ESTIMATE, best-first.
+
+    The estimate is deliberately crude and is never reported as the gain: for
+    each pin, the distance from its pad to the centroid of the REST of its net
+    (its pads elsewhere on the board). A pair is promising when the two nets
+    would each end up closer to their own destinations after trading pins.
+    Its only job is to decide which handful of pairs is worth the two full
+    reroute trials that produce the real, routed number - a real board's
+    10-pin connector offers 45 pairs and routing all of them per iteration is
+    not a budget anyone has.
+
+    Consumes no RNG and iterates only sorted lists: with `pin_swap.enabled`
+    false this function is never called at all, and when it is called it cannot
+    perturb the seed-replayability of the six copper moves.
+    """
+    pins = _swappable_connector_pins(project, cfg, exclusions)
+    anchors = _net_anchor_points(project)
+
+    def remote_centroid(net: str, ref: str) -> tuple[float, float] | None:
+        # "The rest of the net" excludes every pad on the connector itself:
+        # measuring to a point that moves with the swap would make the estimate
+        # compare the pair against itself.
+        remote = [p for p in anchors.get(net, []) if p["ref"] != ref]
+        if not remote:
+            return None
+        return (sum(p["x"] for p in remote) / len(remote),
+                sum(p["y"] for p in remote) / len(remote))
+
+    by_ref: dict[str, list[dict[str, Any]]] = {}
+    for pin in pins:
+        by_ref.setdefault(pin["ref"], []).append(pin)
+
+    pairs: list[dict[str, Any]] = []
+    for ref in sorted(by_ref):
+        group = sorted(by_ref[ref], key=lambda p: (p["net"], _pcb._pad_sort_key(p["pad"])))
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                a, b = group[i], group[j]
+                if a["net"] == b["net"]:
+                    continue   # trading two pins of the SAME net changes nothing
+                ca, cb = remote_centroid(a["net"], ref), remote_centroid(b["net"], ref)
+                if ca is None or cb is None:
+                    continue   # a net that only touches this connector has no
+                               # destination to be closer to - nothing to estimate
+                ax, ay = a["position"]["x"], a["position"]["y"]
+                bx, by = b["position"]["x"], b["position"]["y"]
+                own = math.hypot(ax - ca[0], ay - ca[1]) + math.hypot(bx - cb[0], by - cb[1])
+                swapped = math.hypot(ax - cb[0], ay - cb[1]) + math.hypot(bx - ca[0], by - ca[1])
+                pairs.append({
+                    "key": f"{ref}:{a['pad']}<->{b['pad']}",
+                    "ref": ref,
+                    "pad_a": a["pad"], "net_a": a["net"],
+                    "pad_b": b["pad"], "net_b": b["net"],
+                    "estimated_gain_mm": round(own - swapped, 4),
+                })
+    # Deterministic: estimate desc, then the pair key, which is unique per pair.
+    pairs.sort(key=lambda p: (-p["estimated_gain_mm"], p["key"]))
+    return pairs[:_MAX_PIN_SWAP_PAIRS_ESTIMATED]
+
+
+# --- pricing ---------------------------------------------------------------- #
+
+def _score_pin_swap(scratch: Path, trial_root: Path, pair: dict[str, Any],
+                    iteration: int, index: int) -> dict[str, Any]:
+    """Price ONE candidate pair as the controlled A/B described in this
+    section's header, then delete both arms.
+
+    Returns the pair enriched with `baseline_score`/`swap_score`/`gain`, or
+    with `priced: False` plus the error when either arm cannot be built (a
+    board the swap surgery cannot express, a route that raises). An unpriceable
+    pair is reported, never guessed at.
+    """
+    record: dict[str, Any] = {**pair, "priced": False}
+    nets = [pair["net_a"], pair["net_b"]]
+    baseline_dir = trial_root / f"i{iteration}_pinswap{index}_base"
+    swap_dir = trial_root / f"i{iteration}_pinswap{index}_swap"
+    try:
+        baseline = _scratch_snapshot(scratch, baseline_dir)
+        _trial_strip_net_copper(baseline, nets)
+        base_stats = _reroute_nets_in_order(baseline, nets, max_ripup=4)
+        record["baseline_score"] = score_board(baseline)
+
+        swap = _scratch_snapshot(scratch, swap_dir)
+        _trial_strip_net_copper(swap, nets)
+        record["swap_detail"] = _trial_swap_pad_nets(swap, pair["ref"], pair["pad_a"], pair["pad_b"])
+        swap_stats = _reroute_nets_in_order(swap, nets, max_ripup=4)
+        record["swap_score"] = score_board(swap)
+
+        record["gain"] = round(record["baseline_score"]["total"] - record["swap_score"]["total"], 6)
+        record["baseline_routing"] = base_stats
+        record["swap_routing"] = swap_stats
+        record["priced"] = True
+    except Exception as exc:
+        record["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        # Both arms go, always. A pin-swap trial is the one trial in this
+        # module that must never survive its own evaluation - see the section
+        # header on why it can never be promoted.
+        shutil.rmtree(baseline_dir, ignore_errors=True)
+        shutil.rmtree(swap_dir, ignore_errors=True)
+    return record
+
+
+def _pin_swap_gate(session: dict[str, Any], scratch: Path, trial_root: Path,
+                   iteration: int) -> dict[str, Any] | None:
+    """The mandatory-escalation gate, run once per iteration BEFORE any copper
+    candidate is generated.
+
+    Returns a `pending_decision` when some unexamined pair clears
+    `pin_swap.min_gain`, else None (with every pair it priced recorded on the
+    session's `pin_swap_reports`, so a sub-threshold swap is VISIBLE - the
+    plan's "sub-threshold swaps are reported, not proposed" - without ever
+    becoming an actionable decision).
+
+    Runs before candidate generation and consumes no RNG, so an
+    `enabled: false` session (the default) reaches `_generate_candidates` with
+    the RNG in exactly the state the pre-7.14 code left it in. That is the
+    whole parity argument, and it is why the `enabled` test is the very first
+    line here.
+    """
+    cfg = session["pin_swap"]
+    if not cfg["enabled"]:
+        return None
+
+    already = set(session.get("pin_swap_examined", []))
+    pairs = [p for p in _pin_swap_pairs(scratch, cfg, session.get("pin_swap_exclusions", []))
+             if p["key"] not in already]
+    # Only pairs the estimate likes are worth routing; a pair whose airline
+    # estimate is non-positive cannot plausibly clear a positive `min_gain`,
+    # and pricing it would spend two reroutes to say so.
+    promising = [p for p in pairs if p["estimated_gain_mm"] > 0][:_MAX_PIN_SWAP_TRIALS]
+    if not promising:
+        return None
+
+    priced = [_score_pin_swap(scratch, trial_root, pair, iteration, index)
+              for index, pair in enumerate(promising)]
+    for record in priced:
+        session["pin_swap_examined"].append(record["key"])
+        session["pin_swap_reports"].append({
+            "iteration": iteration,
+            "key": record["key"],
+            "ref": record["ref"],
+            "pads": [record["pad_a"], record["pad_b"]],
+            "nets": [record["net_a"], record["net_b"]],
+            "estimated_gain_mm": record["estimated_gain_mm"],
+            "priced": record["priced"],
+            "gain": record.get("gain"),
+            "min_gain": cfg["min_gain"],
+            "proposed": bool(record["priced"] and record.get("gain", 0.0) >= cfg["min_gain"]),
+            "error": record.get("error"),
+        })
+
+    winners = [r for r in priced if r["priced"] and r["gain"] >= cfg["min_gain"]]
+    if not winners:
+        return None
+    best = max(winners, key=lambda r: (r["gain"], r["key"]))
+
+    # The option list is NOT a menu of applied moves (there are none - see the
+    # section header). It is the two things a human can actually answer.
+    # "Decline" is first, and therefore the default, because both `defer` and a
+    # resume without an answer resolve to the default: neither may ever assume
+    # a schematic edit happened on the user's behalf.
+    options = [
+        {
+            "id": "opt1",
+            "type": "pin_swap_decline",
+            "summary": (f"Leave {best['ref']} pins {best['pad_a']}/{best['pad_b']} as they are "
+                        f"({best['net_a']} / {best['net_b']}) and keep optimizing."),
+            "is_default": True,
+            "score": best["baseline_score"],
+            "score_total": best["baseline_score"]["total"],
+            "score_delta": 0.0,
+            "trial_dir": None,
+            "detail": None,
+            "svg": None,
+        },
+        {
+            "id": "opt2",
+            "type": "pin_swap_applied",
+            "summary": (f"I swapped {best['ref']} pins {best['pad_a']} and {best['pad_b']} "
+                        f"({best['net_a']} <-> {best['net_b']}) in the schematic and re-exported "
+                        "the netlist - re-sync and continue."),
+            "is_default": False,
+            "score": best["swap_score"],
+            "score_total": best["swap_score"]["total"],
+            "score_delta": round(-best["gain"], 6),
+            "trial_dir": None,
+            "detail": best.get("swap_detail"),
+            "svg": None,
+        },
+    ]
+    return {
+        "decision_id": f"{session['session_id'][:8]}-i{iteration}-pinswap",
+        "iteration": iteration,
+        "decision_type": "pin_swap",
+        "default_choice": "opt1",
+        "options": options,
+        # No `pending_dir`: there is nothing to park. The other decision types
+        # carry applied trial directories that must survive an MCP restart;
+        # this one carries a question and two numbers, both already in the
+        # checkpoint.
+        "pending_dir": None,
+        "candidates_evaluated": len(priced),
+        "current_score": session["current_score"]["total"],
+        "score_spread": round(best["gain"], 6),
+        "min_score_spread": None,
+        "pin_swap": {
+            "key": best["key"],
+            "ref": best["ref"],
+            "pad_a": best["pad_a"], "net_a": best["net_a"],
+            "pad_b": best["pad_b"], "net_b": best["net_b"],
+            "gain": round(best["gain"], 6),
+            "min_gain": cfg["min_gain"],
+            "baseline_score": best["baseline_score"],
+            "swap_score": best["swap_score"],
+            "estimated_gain_mm": best["estimated_gain_mm"],
+            "measurement": (
+                "Controlled A/B on two disposable copies of the session's scratch board: both "
+                "arms strip these two nets' copper and reroute them with the same router; the "
+                "swap arm additionally trades the two pads' nets. `gain` is therefore "
+                "attributable to the swap alone. NOTHING was applied - this tool never edits a "
+                "schematic or a netlist, so only you can realize this change."
+            ),
+            "instructions": (
+                f"To take it: in the schematic, swap which net lands on {best['ref']} pin "
+                f"{best['pad_a']} and pin {best['pad_b']}, re-export the netlist, update the PCB "
+                "from the schematic in KiCad, then answer this decision with opt2 to re-sync "
+                "the session against the new pad assignment. Answer opt1 to decline."
+            ),
+        },
+    }
+
+
+def _resolve_pin_swap_pending(session: dict[str, Any], choice: str, rationale: str | None,
+                              auto: bool, auto_reason: str | None) -> dict[str, Any]:
+    """Answer a `pin_swap` pause. Commits NO move - there is none to commit -
+    so the iteration counter, RNG, SA temperature and score curve are all left
+    exactly as the pause found them, and the very next chunk runs the copper
+    iteration that the gate interrupted, bit for bit as it would have.
+
+    The pair is recorded in `pin_swap_examined` by the gate itself, so neither
+    answer can loop: a declined swap is not re-proposed, and an applied one is
+    already reality by the time the session sees it again.
+    """
+    pending = session["pending_decision"]
+    options = {o["id"]: o for o in pending["options"]}
+    resolved = pending["default_choice"] if choice == "defer" else choice
+    if resolved not in options:
+        raise ValueError(
+            f"choice {choice!r} is not one of this decision's options "
+            f"({', '.join(sorted(options))}) or the literal 'defer'")
+
+    resync: dict[str, Any] | None = None
+    if options[resolved]["type"] == "pin_swap_applied":
+        resync = _resync_pad_nets(session, pending["pin_swap"])
+
+    entry = {
+        **_log_entry(pending["decision_id"], pending["iteration"], "pin_swap",
+                     pending["options"], choice, resolved, rationale, auto, auto_reason),
+        # A pin-swap decision is advisory: `accepted` is False on BOTH answers
+        # because this tool applied nothing either way, and a log that claimed
+        # otherwise would misreport the one thing this feature promises.
+        "accepted": False,
+        "accept_reason": "pin_swap_advisory_never_applied_by_this_tool",
+        "score_before": session["current_score"]["total"],
+        "score_after": session["current_score"]["total"],
+        "delta": 0.0,
+        "pin_swap": pending["pin_swap"],
+        "resync": resync,
+    }
+    session["decision_log"].append(entry)
+    session["pending_decision"] = None
+    session["state"] = "running"
+    session["stop_reason"] = None
+    return {"resolved_choice": resolved, "improvement": 0.0, "entry": entry, "resync": resync}
+
+
+def _resync_pad_nets(session: dict[str, Any], swap: dict[str, Any]) -> dict[str, Any]:
+    """Re-sync the session's scratch board against the REAL project's current
+    pad-net assignment, after the user reports making the schematic change.
+
+    This is the plan's "the session re-syncs (netlist-staleness check) and
+    continues", done at pad level because that is the only level a pin swap is
+    visible at - it changes no net NAME, so the existing name-set staleness
+    guards in `detect_buses`/`classify_critical_nets` cannot see it (see
+    `_netlist_pad_mismatches`).
+
+    Three things happen, in order:
+      1. The real board's pad-net map is diffed against the scratch's. Every
+         pad that now disagrees is copied FROM THE REAL BOARD onto the scratch.
+         The direction matters: the new assignment is the user's, imported into
+         KiCad from their own schematic - this function never decides what a
+         pad's net should be, it only adopts what the real board already says.
+      2. Any net touched by that diff is rerouted on the scratch, because
+         copper that ran to a pad which has changed nets is no longer valid
+         connectivity and the session's score has to describe a board that is
+         actually connected. Only AUTOROUTER-OWNED copper is replaced (the
+         reroute goes through `unroute_nets`, whose ownership guard is never
+         bypassed here either); hand copper on an affected net is reported in
+         `hand_copper_nets` for the user to redo in KiCad, not deleted.
+      3. The real project's own board-vs-`.net` pad mismatches are reported.
+         A user who edited the schematic but forgot to re-export (or to update
+         the PCB from it) gets told so here rather than optimizing a board that
+         disagrees with its own netlist.
+
+    When nothing changed, this reports `resynced: False` with the reason and
+    changes nothing at all - "the user answered 'applied' before actually
+    applying it" must not silently corrupt the session.
+    """
+    project_path = session["project_path"]
+    scratch = Path(session["scratch_dir"])
+    real_map = _board_pad_net_map(project_path)
+    scratch_map = _board_pad_net_map(scratch)
+
+    changed = sorted(
+        (
+            {"pad": key, "from_net": scratch_map[key], "to_net": real_map[key]}
+            for key in set(real_map) & set(scratch_map)
+            if real_map[key] != scratch_map[key]
+        ),
+        key=lambda c: c["pad"],
+    )
+    netlist_mismatches = _netlist_pad_mismatches(project_path)
+    expected = f"{swap['ref']}.{swap['pad_a']}"
+
+    result: dict[str, Any] = {
+        "expected_swap": swap["key"],
+        "changed_pads": changed,
+        "real_netlist_pad_mismatches": netlist_mismatches,
+        "rerouted_nets": [],
+        "resynced": False,
+    }
+    if not changed:
+        result["reason"] = (
+            f"The real board's pad-net assignment is unchanged (pad {expected} still reads "
+            f"{real_map.get(expected, '<absent>')!r}), so there is nothing to re-sync. If you made "
+            "the schematic edit, run 'Update PCB from Schematic' in KiCad so the board's pads "
+            "carry the new nets, then start a new session against that board."
+        )
+        return result
+
+    # Adopt the real board's assignment pad by pad. Two pads whose nets simply
+    # traded places are the expected shape, but this deliberately handles ANY
+    # difference the same way: the real board is the authority, and a session
+    # that only understood the one edit it proposed would silently ignore a
+    # second change the user made while they were in there.
+    board_path, _, _ = _pcb._resolve_project_path(scratch)
+    text = _pcb._read_text(board_path)
+    for change in changed:
+        ref, _, pad = change["pad"].rpartition(".")
+        fp_start, fp_end = _footprint_span_by_ref(text, ref)
+        net_start, net_end = _pad_net_span(text, fp_start, fp_end, pad)
+        entry = text[net_start:net_end]
+        # Reuse the existing entry's own shape, replacing only the trailing
+        # name token, so a `(net 7 "OLD")` board keeps its index form. The index
+        # is now wrong for this pad, but nothing in the routing/scoring path
+        # reads it (every reader takes the last token as the name) and inventing
+        # an index here would mean maintaining the board's net table - real
+        # surgery this scratch-side adoption does not need.
+        text = text[:net_start] + re.sub(r'"[^"]*"\s*\)$', f'"{change["to_net"]}")', entry) + text[net_end:]
+    with board_path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
+    _pcb._invalidate_board_cache(board_path)
+
+    affected = sorted({c["from_net"] for c in changed if c["from_net"]}
+                      | {c["to_net"] for c in changed if c["to_net"]})
+    # `_reroute_nets_in_order` goes through `unroute_nets`, so ONLY
+    # autorouter-owned copper on those nets is replaced. Human copper on an
+    # affected net is left exactly where it is and REPORTED instead: it is now
+    # wired to a pad that belongs to a different net, but deleting a human's
+    # copper is not this module's call to make anywhere else and a pin swap is
+    # not the place to start. The user has to redo it in KiCad, which is the
+    # same place they made the swap.
+    _reroute_nets_in_order(scratch, affected, max_ripup=4)
+    owned = _pcb.load_board_local(scratch)["data"].get("autorouter_owned", {}) or {}
+    owned_uuids = set(owned.get("segments", []) or []) | set(owned.get("vias", []) or [])
+    affected_set = set(affected)
+    tracks = _pcb._parse_tracks_cached(board_path)
+    result["hand_copper_nets"] = sorted({
+        item["net"] for group in ("segments", "arcs", "vias") for item in tracks[group]
+        if item.get("net") in affected_set and item.get("uuid") not in owned_uuids
+    })
+
+    session["current_score"] = score_board(scratch)
+    session["score_curve"].append(session["current_score"]["total"])
+    if session["current_score"]["total"] < session["best_score"]["total"]:
+        session["best_score"] = session["current_score"]
+    # The write guard compares the real board against the fingerprint taken at
+    # session creation, and the user has just deliberately changed that board.
+    # Re-taking it here is what lets an acknowledged, re-synced session still
+    # write; leaving it stale would refuse every future write for a change the
+    # session itself asked the user to make.
+    session["board_fingerprint"] = _board_fingerprint(project_path)
+    result["rerouted_nets"] = affected
+    result["resynced"] = True
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -1124,6 +1998,14 @@ def _resolve_pending(session: dict[str, Any], choice: str, rationale: str | None
     its own decision before the next one is generated.
     """
     pending = session["pending_decision"]
+    # 7.14: a pin-swap pause is answered on a separate path because it has no
+    # applied candidate to commit - there is no trial directory to promote, no
+    # score to move, and no move to log as accepted. Routing it through
+    # `_commit_choice` below would promote a board carrying a pad-net
+    # reassignment this tool is never allowed to make.
+    if pending.get("decision_type") == "pin_swap":
+        return _resolve_pin_swap_pending(session, choice, rationale, auto, auto_reason)
+
     options = {o["id"]: o for o in pending["options"]}
     resolved = pending["default_choice"] if choice == "defer" else choice
     if resolved not in options:
@@ -1176,6 +2058,16 @@ def decide_route(project_path: str | Path, session_id: str, decision_id: str,
 
     This call runs NO further iterations - resume with `optimize_board(...,
     session_id=...)` afterwards. `rationale` is recorded and never executed.
+
+    Phase 7.14 - a `pin_swap` decision is answered here too, but it commits
+    nothing: `opt1` declines the proposed connector pin swap, `opt2` reports
+    that you made the change in the schematic and re-exported the netlist, at
+    which point the session RE-SYNCS its scratch board against the real board's
+    current pad-net assignment (adopting it, never deciding it) and reports the
+    result under `resync`. Answering `opt2` without having made the change is
+    harmless: the re-sync finds nothing to adopt and says so. Either way the
+    pair is not proposed again, and this tool has still written neither the
+    schematic nor the real `.net` file.
     """
     config = _pcb.load_pcb_settings(project_path)["config"]
     data, sessions = _load_sessions(project_path)
@@ -1203,6 +2095,8 @@ def decide_route(project_path: str | Path, session_id: str, decision_id: str,
         "resolved_choice": outcome["resolved_choice"],
         "rationale": rationale,
         "decision": outcome["entry"],
+        # Present (non-None) only for a `pin_swap` decision answered `opt2`.
+        "resync": outcome.get("resync"),
         **_session_report(session),
         "notes": ["Decision recorded and applied; call optimize_kicad_board with this "
                   "session_id to continue optimizing."],
@@ -1270,7 +2164,8 @@ def _resolve_effort_knobs(optimizer: dict[str, Any], effort: str,
 def _new_session(project_path: str | Path, config: dict[str, Any],
                  seed: int | None, accept: str | None,
                  max_iterations: int | None, time_budget_s: float | None,
-                 effort: str | None = None) -> dict[str, Any]:
+                 effort: str | None = None,
+                 pin_swap_exclusions: list[str] | None = None) -> dict[str, Any]:
     optimizer = config.get("optimizer", {})
     resolved_seed = int(optimizer.get("seed", 1)) if seed is None else int(seed)
     resolved_effort = str(effort or optimizer.get("effort", "balanced")).lower()
@@ -1280,6 +2175,19 @@ def _new_session(project_path: str | Path, config: dict[str, Any],
     resolved_accept = knobs["accept"]
     if resolved_accept not in ("greedy", "sa"):
         raise ValueError(f"accept must be 'greedy' or 'sa'; got {resolved_accept!r}")
+
+    # Phase 7.14: validate the connector exclusion list against the REAL board
+    # before anything else happens. `validate_connector_exclusions` raises on an
+    # unresolved name and lists every detected ref - the plan's loud-abort
+    # contract, and the reason it exists: a typo'd exclusion that was quietly
+    # dropped would leave a connector the user meant to protect eligible for a
+    # swap proposal. Only worth the scan when the feature is actually on.
+    pin_swap = _pin_swap_config(config)
+    resolved_exclusions: list[str] = []
+    if pin_swap["enabled"] and pin_swap_exclusions:
+        resolved_exclusions = _pcb.validate_connector_exclusions(
+            project_path, list(pin_swap_exclusions),
+            ref_prefixes=pin_swap["ref_prefixes"])["resolved_exclusions"]
 
     scratch = Path(tempfile.mkdtemp(prefix="kicad_optimize_"))
     _r._copy_project_to_scratch(project_path, scratch)
@@ -1322,6 +2230,14 @@ def _new_session(project_path: str | Path, config: dict[str, Any],
         "applied": False,
         "stop_reason": None,
         "ai_decisions": _ai_decision_config(config),
+        # Phase 7.14: `pin_swap_examined` is the "ask once" ledger - a pair the
+        # advisor has already priced and put to the user is never re-proposed,
+        # whichever way they answered, so neither a decline nor an applied swap
+        # can wedge the session in a loop of the same question.
+        "pin_swap": pin_swap,
+        "pin_swap_exclusions": resolved_exclusions,
+        "pin_swap_examined": [],
+        "pin_swap_reports": [],
         "pending_decision": None,
         "decision_log": [],
         "pauses_used": 0,
@@ -1338,6 +2254,7 @@ def optimize_board(
     max_iterations: int | None = None,
     time_budget_s: float | None = None,
     effort: str | None = None,
+    pin_swap_exclusions: list[str] | None = None,
     write: bool = False,
     allow_while_open: bool = False,
 ) -> dict[str, Any]:
@@ -1366,7 +2283,18 @@ def optimize_board(
                             cost model cannot separate them; `pending_decision`
                             carries the option list. Answer with
                             `decide_kicad_route`, or just call this tool again
-                            to defer to the best-scored option.
+                            to defer to the best-scored option. (7.14) OR the
+                            pin-swap advisor found a connector pin swap worth
+                            `pin_swap.min_gain` board-score points. THAT pause
+                            is mandatory and is not gated by `ai_decisions` at
+                            all: the tool can never apply a pin swap itself -
+                            only a schematic edit + netlist re-export can - so
+                            a clear winner is exactly the case that must be
+                            escalated. Answer `opt1` to decline, or `opt2` to
+                            report that you made the change (the session then
+                            re-syncs against the board's new pad-net
+                            assignment and continues). Off unless
+                            `pin_swap.enabled` is true (default false).
 
     Each iteration ranks every cost contributor worst-first (routed nets at
     their trace cost, unrouted nets at `unrouted_penalty` x their missing
@@ -1399,13 +2327,26 @@ def optimize_board(
     still `running` or `awaiting_decision` (there is no "final state" yet) or if
     the real board file changed since the session started. As with every writer
     here, KiCad must refill zones and re-run DRC afterward.
+
+    `pin_swap_exclusions` (7.14, new session only) names connectors the pin-swap
+    advisor must never propose a swap on. Every name is resolved against
+    `detect_kicad_connectors` at session creation and an unresolved one RAISES,
+    listing the board's detected refs - a typo must not silently leave a
+    connector unprotected. Ignored when `pin_swap.enabled` is false.
+
+    HARD GUARANTEE (7.14): no path through this function - including
+    `write=True` - ever writes the schematic, writes the real `.net` file, or
+    changes which net a real pad belongs to. `write=True` asserts the last of
+    those explicitly by comparing the scratch board's pad-net map against the
+    real board's before copying anything, and refuses rather than writing a
+    board whose pad assignment it does not recognize.
     """
     config = _pcb.load_pcb_settings(project_path)["config"]
     data, sessions = _load_sessions(project_path)
 
     if session_id is None:
         session = _new_session(project_path, config, seed, accept, max_iterations,
-                               time_budget_s, effort)
+                               time_budget_s, effort, pin_swap_exclusions)
         sessions[session["session_id"]] = session
     else:
         if session_id not in sessions:
@@ -1493,6 +2434,47 @@ def _run_chunk(session: dict[str, Any], max_iterations_per_call: int,
             break
 
         iteration_started = time.monotonic()
+
+        # 7.14: the pin-swap advisor runs FIRST, before a single unit of RNG is
+        # consumed, and pauses unconditionally on a swap worth `min_gain` - see
+        # the Phase 7.14 section header for why a clear winner is exactly the
+        # case that must be escalated rather than auto-taken. With
+        # `pin_swap.enabled` false (the default) `_pin_swap_gate` returns on its
+        # first line, so everything below is reached in the identical state the
+        # pre-7.14 code reached it in.
+        try:
+            pending_swap = _pin_swap_gate(session, scratch, trial_root, session["iteration"] + 1)
+        except Exception as exc:
+            # An advisory feature must never be able to kill a routing session.
+            # Recorded rather than swallowed, though - "the advisor could not
+            # run on this board" is information, and a silent None here would
+            # be indistinguishable from "there was nothing to propose".
+            pending_swap = None
+            session["pin_swap_reports"].append({
+                "iteration": session["iteration"] + 1, "key": None, "priced": False,
+                "proposed": False, "error": f"{type(exc).__name__}: {exc}",
+            })
+        if pending_swap is not None:
+            session["pending_decision"] = pending_swap
+            session["state"] = "awaiting_decision"
+            session["stop_reason"] = "awaiting_decision"
+            # `pauses_used` is NOT incremented: it budgets the 7.7 AI escalations
+            # (`max_pauses_per_run`), and a pin swap is a question for the human
+            # that no budget may suppress. Nor is the iteration counter advanced
+            # or the temperature cooled - no move was made, and the interrupted
+            # iteration runs unchanged on the next chunk.
+            session["elapsed_s"] += time.monotonic() - iteration_started
+            session["rng_state"] = _rng_state_to_json(rng)
+            swap = pending_swap["pin_swap"]
+            notes.append(
+                f"Paused for pin-swap decision {pending_swap['decision_id']}: swapping "
+                f"{swap['ref']} pins {swap['pad_a']}/{swap['pad_b']} would gain "
+                f"{swap['gain']} board-score points (>= min_gain {swap['min_gain']}). This tool "
+                "CANNOT make that change - only a schematic edit + netlist re-export can. Answer "
+                "with decide_kicad_route (opt1 = decline, opt2 = I made the change)."
+            )
+            break
+
         worst = _ranked_nets(scratch)[: session["worst_k"]]
         candidates = _generate_candidates(scratch, worst, rng)
         evaluated = [_evaluate_candidate(scratch, trial_root, c, session["iteration"] + 1, i)
@@ -1650,6 +2632,31 @@ def _apply_session(session: dict[str, Any], project_path: str | Path,
     if current["size"] != recorded["size"] or current["mtime"] != recorded["mtime"]:
         return False, ("the real board changed since this session started "
                        "(size/mtime differ) - re-run the optimizer against the current board")
+
+    # Phase 7.14 SAFETY GATE. The scratch board is copied over the real board
+    # wholesale, so any difference in PAD NETS between the two would be a
+    # silent netlist edit - precisely the thing this tool must never do, and
+    # the one failure mode a pin-swap feature could plausibly introduce (a
+    # trial board escaping into the scratch). This asserts the property
+    # directly rather than trusting that no code path promotes a swap trial:
+    # the two maps must be identical, or nothing is written.
+    #
+    # It is deliberately not limited to connector pads or to sessions that ran
+    # the advisor - ANY divergence, from any cause, is a reason to refuse.
+    real_pad_nets = _board_pad_net_map(project_path)
+    scratch_pad_nets = _board_pad_net_map(scratch)
+    if real_pad_nets != scratch_pad_nets:
+        differing = sorted(
+            key for key in set(real_pad_nets) | set(scratch_pad_nets)
+            if real_pad_nets.get(key) != scratch_pad_nets.get(key)
+        )
+        return False, (
+            "REFUSING TO WRITE: the session's board disagrees with the real board about which "
+            f"net {len(differing)} pad(s) belong to ({differing[:10]}). This tool never changes a "
+            "pad's net - only a schematic edit + netlist re-export may - so a divergence here "
+            "means the session state is not safe to apply. Start a new session against the "
+            "current board."
+        )
 
     real_board, _, _ = _pcb._resolve_project_path(project_path)
     _pcb._check_not_locked_by_editor(real_board, allow_while_open)
