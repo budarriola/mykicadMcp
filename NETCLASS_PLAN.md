@@ -165,12 +165,11 @@ For whoever (human or AI) picks this up next:
   The 35 failures are now `unreachable_in_window` (genuine dense-board
   pathfinding), not budget — closing that gap is Opus-class whole-board
   optimization (7.6), not a bounded Sonnet patch. See ⭐ findings.
-- **Next work when resumed (updated 2026-07-28 — M7 opened, Phase 7.18
-  landed, see its anchor):** (1) Phase 7.19 lightweight route cost estimation
-  — branch its worktree fresh from current `main` (do not reuse an older
-  worktree — see the M7 sequencing note on why 7.18's dispatch predated the
-  M5 merge and needed an integration pass as a result). (2) Phase 7.20
-  adjacent-layer crosstalk avoidance, after 7.19 merges. (3) Phase 7.13
+- **Next work when resumed (updated 2026-07-28 — M7's 7.18 and 7.19 both
+  landed, see their anchors):** (1) Phase 7.20 adjacent-layer crosstalk
+  avoidance — branch its worktree fresh from current `main` (do not reuse an
+  older worktree — see the M7 sequencing note on why 7.18's dispatch predated
+  the M5 merge and needed an integration pass as a result). (2) Phase 7.13
   impedance-matched traces & matched sets — spec'd (see its section),
   Opus-class, not yet started. Still open: M6 item 17 (c) Flow B stack-up-gate
   question, and the small 7.3b "any same-net copper" termination bit.
@@ -699,9 +698,14 @@ router work):
   crosstalk avoidance), and Phase 7.18 LANDED 2026-07-28** (Opus subagent,
   worktree-isolated, coordinator-reviewed — see its anchor for the full
   write-up, including a nontrivial integration pass against the just-merged
-  M5 work). 365→398 passed, same 7 pre-existing failures. **The only clearly-
-  open items remaining anywhere in the plan are Phase 7.19, Phase 7.20, Phase
-  7.13 impedance-matched traces** (spec'd, not started) **and assorted
+  M5 work). 365→398 passed, same 7 pre-existing failures.
+  (25) ✅ **Phase 7.19 lightweight route cost estimation LANDED 2026-07-28**
+  (Opus subagent, worktree-isolated, coordinator-reviewed — full diff read,
+  independent full-suite run, AND an independent wall-clock spot-check on
+  the real kiln board; see its anchor for the honest wall-clock finding).
+  398→435 passed, same 7 pre-existing failures. **The only clearly-open
+  items remaining anywhere in the plan are Phase 7.20, Phase 7.13
+  impedance-matched traces** (spec'd, not started) **and assorted
   low-priority residuals** (viewer cancel-flag/decision banner, portfolio
   replicas, hybrid GPU/CPU scheduling, driving `torch` as a second GPU array
   module, the small 7.3b "any same-net copper" termination bit, and
@@ -2496,43 +2500,72 @@ flag on and off. Full suite: 365→398 passed (33 new tests), same 7
 pre-existing board-drift failures, confirmed by the coordinator's own
 independent run on the final integrated tree.
 
-## Phase 7.19 — Lightweight route cost estimation (added 2026-07-28 at user request)
+## Phase 7.19 — Lightweight route cost estimation — LANDED 2026-07-28 (anchor)
 
-User priority: faster discovery of the best route without paying full
-windowed-A* cost on every candidate. Today 7.3a's global stage already scores
-candidate coarse paths, and 7.3b's fine A* uses a plain octile-distance
-heuristic — admissible but not informed by the board's actual obstacle/
-congestion structure, so it explores more cells than a tighter heuristic would.
+(Opus subagent, worktree-isolated, coordinator-reviewed: full diff read,
+independent full-suite run, and independent spot-measurement of the
+heuristic's effect on the real kiln board.)
 
-- **7.19.1 Coarse-field heuristic for the fine A\*.** Precompute, once per
-  connection (reusing 7.3a's own coarse grid — no new grid resolution to
-  maintain), a backward cost-distance field from the goal via a coarse
-  Dijkstra/BFS wavefront over the SAME capacity/cost map 7.3a already builds.
-  Use this field (bilinearly resolved to the fine grid, or nearest-coarse-cell
-  as a first cut) as the fine A*'s heuristic in place of plain octile
-  distance. Must stay admissible (prove: coarse field values never overstate
-  the true fine-grid cost — same-direction argument as an admissible coarse-
-  to-fine heuristic in any hierarchical pathfinder) so the byte-identical-
-  result guarantee holds: a tighter heuristic changes exploration order and
-  count, never the returned path, when both heuristics are admissible and the
-  tie-break rule (already deterministic) is unchanged. This is the "find the
-  best route faster" lever — fewer cells expanded for the identical answer.
-- **7.19.2 Cheap pre-ranking of global-stage candidates.** 7.3a already
-  produces 1–3 ranked coarse candidates per connection/bundle; before handing
-  ALL of them to detailed routing, use a cheap estimate (candidate coarse cost
-  + a fixed per-via/per-layer-change constant, no fine A* run) to decide
-  whether the 2nd/3rd candidate is worth ever detail-routing at all, vs. only
-  falling back to it when the top candidate's detailed route fails/self-check-
-  fails. Must not change which candidate ultimately gets emitted when the top
-  candidate succeeds (identical to today); only changes whether a doomed
-  lower-ranked candidate's detailed A* is skipped.
-- Gate: measured wall-clock reduction on the real kiln board (this is one of
-  the few places in the plan where a timing measurement is actually the
-  point, unlike the "don't measure speedups" directive elsewhere — reducing
-  search time IS the deliverable here) with byte-identical routed geometry
-  before/after (a parity suite proving the tighter heuristic changes nothing
-  but exploration count), plus new tests for admissibility and pre-ranking
-  skip behavior. Delegate: Opus (touches the same A* core as 7.3b/M5).
+**7.19.1 — `_GoalDistanceField`** (`autorouter.goal_field_heuristic`, default
+`false`): a lazily-expanded backward Dijkstra wavefront over a RELAXATION of
+the fine search (state collapsed to bare `(cell)`, a cell is enterable if
+unblocked on ANY routable layer, every move cost floored, via moves free) —
+admissible and consistent by construction, since every relaxation adds edges
+and never raises a cost. Replaces plain octile distance as the fine A*'s
+heuristic. **Deliberate deviation from the original sketch, verified
+necessary:** NOT built on 7.3a's coarse `_CoarseModel` capacity/congestion
+map as originally proposed — that model is a capacity/congestion map, not a
+fine-cost lower bound (a coarse "capacity 0" cell says nothing about fine
+passability through the rest of the cell, and its congestion term adds cost
+the fine model may not charge), so a field built on it can OVERSTATE true
+fine cost, i.e. be inadmissible, which would silently change the returned
+path. Built directly from the fine window's own obstacle model instead, so
+admissibility is a property of the construction, not a hope. Byte-identical
+routing is guaranteed by pinning `_fine_backtrace`'s tie-break to plain
+octile regardless of which heuristic drove the search (reconstruction is a
+pure function of the optimal cost field), and by draining every state at
+`f <= C*` rather than stopping at the first goal pop, so the set of tight
+predecessors the backtrace sees is identical for any admissible heuristic.
+A second, smaller finding along the way: plain octile itself is marginally
+inadmissible (it floors the whole-distance conversion once, where the true
+cost is a sum of independently rounded per-move costs) — harmless for
+tie-breaking, pinned as a test, and the reason the new heuristic is used
+alone rather than `max(octile, field)`.
+
+**7.19.2 — cheap candidate pre-ranking** (`autorouter.candidate_fallback`,
+default off). **The plan's premise was wrong, and the subagent verified this
+against the code before building anything:** detailed routing was never
+trying 7.3a's ranked candidates in order — `_corridor_from_global` and
+`_hier_world_waypoints` both indexed candidate `[0]` unconditionally, so
+candidates 1/2 were computed by the global stage and thrown away outright.
+There was no wasteful "try them all" loop to gate; there was a discarded
+resource and NO fallback at all. This phase built both: a fallback tier
+(retry the whole detailed-routing ladder along candidate 1's, then 2's,
+corridor when candidate 0 fails outright) and `_prerank_candidates`, the
+actual cheap-estimate deliverable (coarse cost + a fixed per-layer-change
+constant, no grid/window/search) that decides whether a lower-ranked
+candidate is worth a full windowed A* at all. A connection whose candidate 0
+already succeeds never reaches any of this — byte-identical by construction.
+
+**Measured:** full suite 398→435 passed (37 new tests), same 7 pre-existing
+board-drift failures. Parity proven both by the construction argument above
+and by tests. **Wall-clock, reported honestly (both by the subagent and by
+the coordinator's own independent spot-check):** the field mechanism is
+real and demonstrable — proving an unreachable net infeasible took 33
+field-expansions vs. 2,344 full A* expansions before the legacy search gave
+up (coordinator's own measurement, unroute-and-reroute on a scratch kiln
+copy) — but a decisive whole-board wall-clock win on KILN SPECIFICALLY was
+not observed (subagent: 485.3s off vs. 484.7s on for one full-board run;
+coordinator: consistent with this on smaller spot-checks). Kiln's own
+currently-unrouted set is dominated by the topologically-isolated nets M5
+already diagnosed (no legal channel exists at any resolution — a bigger
+search proves that faster, it does not create a route), and its
+already-routed signal nets route fast enough today that search isn't the
+bottleneck. The mechanism's value is real (faster failure/congestion-detour
+detection, proven by construction) but this specific board doesn't showcase
+a dramatic end-to-end speedup; a board with more mid-difficulty congested
+routing (neither trivially easy nor topologically impossible) would show it
+more.
 
 ## Phase 7.20 — Adjacent-layer parallel-trace (crosstalk) avoidance (added 2026-07-28 at user request)
 
@@ -3040,9 +3073,10 @@ touched by this work, no write occurred).
     `plane.multilayer_attachment_choice`, 7.18.2 cross-layer continuity audit,
     7.18.3 return-path-aware via placement behind `plane.return_path_bonus`).
     Nothing remains in this item.
-23. Phase 7.19 lightweight route cost estimation (coarse-field A* heuristic,
-    cheap global-candidate pre-ranking) — see its section; Opus; land second,
-    after 7.18 merges.
+23. Phase 7.19 lightweight route cost estimation — **LANDED 2026-07-28** (see
+    its anchor: `_GoalDistanceField` heuristic behind
+    `autorouter.goal_field_heuristic`, candidate pre-ranking + fallback
+    behind `autorouter.candidate_fallback`). Nothing remains in this item.
 24. Phase 7.20 adjacent-layer parallel-trace (crosstalk) avoidance — see its
     section; Opus; land third, after 7.19 merges (all three touch the same
     router-core surface — see the sequencing note in Phase 7.20's section).
