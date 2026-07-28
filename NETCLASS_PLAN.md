@@ -2765,11 +2765,9 @@ landed 2026-07-21 — see their anchors; remaining:):
     stack-up-gate question (the tool already reports `stack_up_gate` per net).
 18. Phase 7.13 impedance-matched sets (coupled pair routing + length-matching
     meanders + profiles/assignments) — after 7.3b; Opus.
-19. Phase 7.14 connector pin-swap advisor — **detection LANDED 2026-07-23**
-    (`detect_kicad_connectors` + `validate_connector_exclusions`, 14 tests; see
-    the 7.14 anchor). Remaining: the optimizer swap move + pause-and-ask-the-user
-    protocol (after 7.6) and the session-layer exclusion prompt that calls the
-    landed validator.
+19. Phase 7.14 connector pin-swap advisor — **FULLY LANDED 2026-07-27** (see
+    the 7.14 anchor: detection, the optimizer swap move, and the
+    pause-and-ask-the-user protocol are all in). Nothing remains in this item.
 20. Phase 7.16 benchmark harness (`benchmark_kicad_autoroute`) — **LANDED
     2026-07-24** (see anchor; kiln complete_only: human 8552.276 vs auto
     8568.267, 3/39, `matched_or_beat_human:false` — the acceptance gate). The
