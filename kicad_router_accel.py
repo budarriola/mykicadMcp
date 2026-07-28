@@ -247,6 +247,16 @@ def fine_wavefront(
     # only ever pass by keyword (see `_fine_search`'s gpu branch).
     multilayer_attachment: bool = False,
     return_path: "dict[str, Any] | None" = None,
+    # Phase 7.19.1. Accepted so `_fine_search`'s positional passthrough hands
+    # every backend the same argument list, but DELIBERATELY NOT FORWARDED to
+    # `_build_fine_cost`: this tier is a full Bellman-Ford relaxation of the
+    # whole window, so it has no frontier for a heuristic to order and would pay
+    # for the backward Dijkstra without expanding one fewer cell. Everything the
+    # wavefront still needs a heuristic FOR (the goal-state pick below, and the
+    # shared backtrace) is pinned to the octile tie-break, which is exactly what
+    # makes this tier's output provably independent of the flag - and therefore
+    # the fixed point that cpu-with-field and cpu-without-field both match.
+    goal_field: bool = False,
     xp: Any = None,
 ) -> "list[tuple[int, int, str]] | None":
     """numpy/GPU detailed search — drop-in for `kicad_router_tool._fine_astar`.
@@ -279,7 +289,8 @@ def fine_wavefront(
         attachment_via_cost, goal_cell, goal_layers,
         multilayer_attachment, return_path)
     li = model["li"]
-    heuristic = model["heuristic"]
+    # 7.19.1: pinned octile tie-break (see the `goal_field` parameter comment).
+    heuristic = model["tiebreak_heuristic"]
     layers = win.layers
     R, C, L = win.rows, win.cols, len(layers)
 
