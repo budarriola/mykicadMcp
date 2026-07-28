@@ -3470,17 +3470,65 @@ def _resolve_backend(settings: dict[str, Any]) -> str:
     expands toward the goal. The detailed router runs many small windows, where
     A* is decisively faster, so "auto" resolves to "cpu". Choose "numpy"
     explicitly for the vectorized field backend (parity oracle / large-window
-    experiments)."""
+    experiments).
+
+    `"gpu"` selects the CUDA tier (same wavefront kernel, device arrays). It is
+    only ever chosen EXPLICITLY: a missing GPU is expected on most machines and
+    must degrade silently to the numpy/cpu tiers rather than error, which the
+    dispatch below does per call - so asking for `"gpu"` on a box without one
+    still routes, just on the CPU."""
     accel = str(settings.get("autorouter", {}).get("acceleration", "auto")).lower()
-    if accel in ("cpu", "numpy"):
+    if accel in ("cpu", "numpy", "gpu"):
         return accel
     return "cpu"  # "auto"/"hybrid"/anything else -> output-sensitive A*
 
 
+# Counters for GPU-tier demotions over the current process's routing work, so a
+# run report can say how much of the board the GPU actually carried (7.8: "every
+# demotion is counted, so 'the GPU helped 90% of this board' is visible rather
+# than silent"). Reset by `gpu_tier_report()`.
+_GPU_TIER_STATS: dict[str, Any] = {"on_gpu": 0, "demoted_no_device": 0,
+                                   "demoted_oversized": 0, "demoted_oom": 0,
+                                   "reason": None, "device": None}
+
+
+def gpu_tier_report(reset: bool = False) -> dict[str, Any]:
+    """Snapshot (optionally reset) the GPU tier's per-item demotion counters."""
+    snap = dict(_GPU_TIER_STATS)
+    if reset:
+        _GPU_TIER_STATS.update({"on_gpu": 0, "demoted_no_device": 0,
+                                "demoted_oversized": 0, "demoted_oom": 0,
+                                "reason": None, "device": None})
+    return snap
+
+
 def _fine_search(backend: str, win: "_FineWindow", *args: Any, **kwargs: Any):
-    """Dispatch one windowed detailed search to the selected backend. Both
+    """Dispatch one windowed detailed search to the selected backend. All three
     backends return byte-identical geometry (7.8 parity); `cpu` is the reference
-    pure-Python A*, `numpy` the vectorized integer-field wavefront."""
+    pure-Python A*, `numpy` the vectorized integer-field wavefront, `gpu` that
+    same wavefront with device arrays.
+
+    The GPU path is memory-planned and demotes rather than fails: if there is no
+    usable CUDA array module, or this window's estimated device footprint exceeds
+    `autorouter.gpu.memory_budget_mb` (0 = auto-probe free VRAM), or the allocator
+    OOMs mid-search, the window falls back to the numpy tier and the demotion is
+    counted in `_GPU_TIER_STATS`. Since every tier is bit-identical, a demotion
+    changes only WHERE the work ran, never the answer."""
+    # Popped unconditionally: it is dispatch metadata for the gpu tier, never an
+    # argument of the search itself, so cpu/numpy must not see it.
+    settings = kwargs.pop("_settings", None) or {}
+    if backend == "gpu":
+        import kicad_router_accel as _accel
+        item = {"rows": win.rows, "cols": win.cols, "layers": len(win.layers)}
+        results, report = _accel.run_windows(
+            [item], settings,
+            gpu_call=lambda _it, xp: _accel.fine_wavefront(win, *args, xp=xp, **kwargs),
+            fallback_call=lambda _it: _accel.fine_wavefront(win, *args, **kwargs))
+        for k in ("on_gpu", "demoted_no_device", "demoted_oversized", "demoted_oom"):
+            _GPU_TIER_STATS[k] += report.get(k, 0)
+        _GPU_TIER_STATS["reason"] = report.get("reason") or _GPU_TIER_STATS["reason"]
+        _GPU_TIER_STATS["device"] = report.get("device") or _GPU_TIER_STATS["device"]
+        return results[0]
     if backend == "numpy":
         import kicad_router_accel as _accel
         return _accel.fine_wavefront(win, *args, **kwargs)
@@ -5716,7 +5764,8 @@ def _route_one(
         path = _fine_search(backend, win, net_kind, weights, layer_purpose, directions,
                             s_cell, start_layers, g_cell, goal_layers,
                             home_layer, corridor, win_cong,
-                            plane_layers, goal_planes, plane_step, attachment_via_cost)
+                            plane_layers, goal_planes, plane_step, attachment_via_cost,
+                            _settings=ctx.get("gpu_settings"))
         if path is None:
             continue  # unreachable at this (margin, grid) - try the next ladder rung
 
@@ -5900,7 +5949,8 @@ def _route_wide_lazy(
     path = _fine_search(backend, win, net_kind, ctx["weights"], ctx["layer_purpose"],
                         ctx["directions"], s_cell, start_layers, g_cell, goal_layers,
                         home_layer, None, win_cong, plane_layers, goal_planes,
-                        ctx["plane_step"], ctx["attachment_via_cost"])
+                        ctx["plane_step"], ctx["attachment_via_cost"],
+                        _settings=ctx.get("gpu_settings"))
     if path is None:
         return None
 
@@ -6124,7 +6174,8 @@ def _route_hierarchical(
         path = _fine_search(backend, win, net_kind, weights, layer_purpose, directions,
                             s_cell, cur_layers, g_cell, leg_goal_layers,
                             home_layer, None, None, plane_layers, leg_goal_planes,
-                            plane_step, attachment_via_cost)
+                            plane_step, attachment_via_cost,
+                            _settings=ctx.get("gpu_settings"))
         if path is None and not is_last and leg_goal_layers != set(routable_layers):
             # Intermediate waypoint only: the coarse stage's layer preference
             # there isn't binding, only its (x, y) location is - retry with any
@@ -6135,7 +6186,8 @@ def _route_hierarchical(
             path = _fine_search(backend, win, net_kind, weights, layer_purpose, directions,
                                 s_cell, cur_layers, g_cell, leg_goal_layers,
                                 home_layer, None, None, plane_layers, leg_goal_planes,
-                                plane_step, attachment_via_cost)
+                                plane_step, attachment_via_cost,
+                                _settings=ctx.get("gpu_settings"))
         if path is None:
             return None  # this leg is unreachable even at the finest grid - terminal
 
@@ -6907,6 +6959,10 @@ def route_nets(
         "max_window_nodes": max_window_nodes,
         "base_margin": base_margin, "board_bbox": board_bbox, "board_min": board_min,
         "coarse_grid": coarse_grid, "coarse_min": coarse_min, "backend": backend,
+        # 7.8 GPU tier knobs (`memory_budget_mb` / `batch` / `oom_fallback`),
+        # carried as a small picklable slice of `settings` rather than the whole
+        # thing, so a spawned worker can plan its own VRAM budget identically.
+        "gpu_settings": {"autorouter": {"gpu": dict(autor.get("gpu", {}) or {})}},
         "plane_step": plane_step, "attachment_via_cost": attachment_via_cost,
         "weights": weights, "layer_purpose": layer_purpose, "directions": directions,
         "track_half": track_half, "via_radius": via_radius, "rules": rules,
@@ -7212,7 +7268,8 @@ def route_nets(
                                      core["s_cell"], core["start_layers"], core["g_cell"],
                                      core["goal_layers"], core["home_layer"], core["corridor"], win_cong,
                                      core["plane_layers"], core["goal_planes"],
-                                     plane_step, attachment_via_cost)
+                                     plane_step, attachment_via_cost,
+                                     _settings=ctx.get("gpu_settings"))
             if free_path is not None:
                 via_nodes = _path_via_nodes(free_path)
                 blockers: set[int] = set()
