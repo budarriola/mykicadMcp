@@ -165,16 +165,12 @@ For whoever (human or AI) picks this up next:
   The 35 failures are now `unreachable_in_window` (genuine dense-board
   pathfinding), not budget — closing that gap is Opus-class whole-board
   optimization (7.6), not a bounded Sonnet patch. See ⭐ findings.
-- **Next work when resumed (updated 2026-07-27 — 7.14 landed too, see its
-  anchor):** (1) 7.3b's one remaining bit: lifting the 60mm/400k-node window
-  cap toward whole-board (numpy/accel, M5) — a heavier M5/accel undertaking,
-  not a bounded Sonnet patch, and the only clearly-open item left in the
-  entire Phase 7 tree at this point. (2) 7.13 impedance-matched traces &
-  matched sets — spec'd (see its section), Opus-class per the plan's own
-  delegation strategy, not yet started. Still open: M6 item 17 (c) Flow B
-  stack-up-gate question.
-- **Nothing has been committed** in either repo as of this snapshot — review the
-  working tree before assuming git history matches this file.
+- **Next work when resumed (updated 2026-07-28 — M5 windowing/GPU tier landed
+  too, see its anchor):** (1) 7.13 impedance-matched traces & matched sets —
+  spec'd (see its section), Opus-class per the plan's own delegation
+  strategy, not yet started; this is now the only substantial open item in
+  the entire Phase 7 tree. Still open: M6 item 17 (c) Flow B stack-up-gate
+  question, and the small 7.3b "any same-net copper" termination bit.
 - Verify claims against the code (`kicad_pcb_tool.py`, `kicad_mcp_server.py`,
   `tests/`) rather than trusting this snapshot if they disagree — and then fix
   this file.
@@ -686,10 +682,17 @@ router work):
   safety gate refusing any `write=True` whose scratch/real pad-net maps
   disagree for any reason. 92 tools (unchanged), 303→317 passed, same 7
   pre-existing failures. **This closes out essentially all of Phase 7's
-  originally-scoped feature list** — the only clearly-open items remaining
-  anywhere in the plan are M5 whole-board windowing (7.3b's last bit) and
-  7.13 impedance-matched traces (spec'd, not started), plus assorted
-  low-priority residuals (viewer polish, portfolio replicas, GPU tier).
+  originally-scoped feature list.**
+  (22) ✅ **M5 whole-board windowing + GPU tier — LANDED 2026-07-28** (Opus
+  subagent, worktree-isolated, coordinator-reviewed: full diff read plus an
+  independent full-suite run against the merged tree — see the M5 anchor).
+  93 tools (was 92), 317→361 passed, same 7 pre-existing failures. **The only
+  clearly-open items remaining anywhere in the plan are 7.13 impedance-matched
+  traces** (spec'd, not started) **and assorted low-priority residuals**
+  (viewer polish, portfolio replicas, hybrid GPU/CPU scheduling, driving
+  `torch` as a second GPU array module, the small 7.3b "any same-net copper"
+  termination bit, and real-hardware GPU verification — no cupy/torch
+  installed in this environment).
 
 ## How to work this plan (living document — keep it current)
 
@@ -2703,10 +2706,10 @@ landed 2026-07-21 — see their anchors; remaining:):
     the stage-2 anchor). 7.12 neck-down and 7.3d direction-aware pad escape
     both landed 2026-07-27 (see their anchors; 7.3d's default stays `false`
     pending a real-board benchmark comparison + sign-off before ever flipping
-    it). **Remaining to close 7.3b:** "any same-net copper" termination, and
-    lifting the 60 mm / 400k-node window cap toward whole-board (needs the
-    memory planner + numpy/multi-core waves — those slip to M5's accel work;
-    the cpu tier remains the reference everything else must match).
+    it). Whole-board windowing (the 60 mm/400k-node cap) **LANDED 2026-07-28**
+    — see the M5 anchor. **Remaining to close 7.3b:** "any same-net copper"
+    termination (small, bounded, not yet scheduled — unrelated to the M5
+    windowing work, which did not touch this).
     Plane-aware via-drops through pours landed as 7.5.4 (see its anchor).
 11h. **[HEADLINE] Phase 7.17 minimal `route_board` — LANDED 2026-07-23** (see
     the 7.17 anchor): the one-command router (MCP tool `route_kicad_board` +
@@ -2741,12 +2744,83 @@ landed 2026-07-21 — see their anchors; remaining:):
 16. Phase 7.8 numpy tier + multi-core — **LANDED 2026-07-24** (see its anchor;
     premise-corrected: multi-core across independent connections is the
     delivered win, numpy is the parity oracle, not the fine-grid lever).
-    **Remaining:** the GPU tier — gated on parity + the M0 synthetic big-board
-    benchmarks (runtime *and* memory budgets); OOM-fallback acceptance = a
-    forced-tiny-VRAM run completes via demotion, not crash. Hybrid scheduling
-    last, once both executors exist (hybrid vs cpu-only parity proves executor
-    assignment can't change results). Whole-board windowing (lifting the 60mm/
-    400k-node cap) also still open — see 7.3b's cross-reference.
+    **Whole-board windowing + GPU tier LANDED 2026-07-28** (Opus subagent,
+    worktree-isolated, coordinator-reviewed: full diff read plus an
+    independent from-scratch full-suite run, not just a report review — see
+    the M5 anchor below). **Remaining:** hybrid scheduling (once both
+    executors exist, hybrid vs cpu-only parity proves executor assignment
+    can't change results) and driving `torch` as a second GPU array module
+    (currently detected/named only, not driven — see the M5 anchor for why)
+    — both low priority, no user-facing gap.
+
+### M5 — Whole-board windowing + GPU tier — LANDED 2026-07-28 (anchor)
+
+**Whole-board lazy window tier** (closes the 7.3b/M5 windowing residual):
+the 60 mm/400k-node cap was never a memory limit — `_FineWindow.build`
+rasterizes obstacle→cells at cost O(total inflated obstacle area / grid²)
+regardless of what the search then explores, so a board-spanning plane fill
+at a fine grid over a wide window dominated before A* took its first step
+(naively raising the constants "blows pure-Python runtime", per the
+2026-07-24 finding). Fix: `_ObstacleIndex` (uniform-grid spatial index over
+obstacles, each inserted into every bucket its bbox padded by its own reach
+overlaps — same one-bucket-complete argument `_ZoneEdgeGrid` already uses,
+generalized to per-obstacle reach) + `_LazyBlockedSet` (memoized per-cell
+membership, drop-in for the eager blocked-cell sets) + `_FineWindow(...,
+lazy=True)`. Build cost becomes O(obstacles); search cost is output-sensitive
+A* again. `_route_wide_lazy` is a new last-resort tier reached from both
+`unreachable_in_window` and `window_too_large`, deliberately ordered AFTER
+the existing hierarchical tier (a connection either tier already routes
+stays byte-identical) and going through the same `_finalize_core` self-check/
+emit path as every other tier — no parallel code path. `_MAX_LAZY_WINDOW_NODES
+= 4_000_000` (an order of magnitude above the eager cap, since nothing is
+rasterized up front; still coarsens via `_choose_grid` on a genuinely huge
+board). Verified byte-for-byte parity between lazy and eager blocked sets
+(`tests/test_lazy_window.py`, 14 tests). **Measured on the real kiln board:**
+0 connections changed (15/16 before and after) — the one remaining failure
+(`Net-(U6-BIAS)`) is confirmed a genuine `GND_Safty` zone-fill enclosure
+(0.0 mm clearance to a zone, not a window-size effect), matching item 10's
+flood-fill re-diagnosis; the new tier honestly reports this rather than
+forcing a route. The actual windowing failure mode (a legal path existing
+only via a long off-corridor detour no capped window or hierarchical chunk-
+chain can see) is proven instead on a dedicated synthetic case
+(`test_wide_lazy_tier_rescues_window_too_large`) where every `_route_attempts`
+ladder rung is proved (in-test) to miss the only legal 95mm-offset detour,
+and the new tier finds it.
+
+**GPU tier** (closes 7.8's deferred piece): `fine_wavefront` now takes an
+`xp` array-module parameter so numpy and CUDA (`cupy`) drive the identical
+kernel — parity is structural (integer milli-cost arithmetic throughout, no
+float divergence possible), not a second implementation to keep in sync.
+New in `kicad_router_accel.py`: `probe_gpu()` (fresh every call, never
+cached/written to JSON; `nvidia-smi` fallback for reporting when no array
+module is importable), `estimate_window_device_bytes`, `gpu_memory_budget_
+bytes` (0 = auto-probe free VRAM, reserving 25%/min 128MB headroom),
+`plan_batches`/`resolve_batch_limit` (memory-planned streaming batches, not
+a fused multi-window kernel — batching is a correctness/memory-discipline
+concern here, not a speed one), and `run_windows` (the demotion-ladder
+executor: no device → demote all; oversized item → demote that item; runtime
+OOM → retry at half batch size, then demote the individual item; every
+demotion counted in the report). New MCP tool `get_kicad_system_resources`
+(92→93 tools) reports live hardware (never cached) so a slow/CPU-only run is
+explainable. **Scope-down, stated plainly in-code:** `cupy` is driven;
+`torch` is detected and named but not driven (not a numpy drop-in for this
+kernel's `rint`/one-arg `where`/`minimum(out=)` — a real semantic risk with
+no acceptance gate needing it, recorded as a residual). **No GPU hardware
+(cupy/torch) is installed in this environment** — the box has a CUDA GPU
+(confirmed via `nvidia-smi`) but the tier itself has never executed on real
+device memory; parity and OOM-demotion are verified via a simulated device
+in `tests/test_gpu_tier.py` (22 tests) instead, including one test running
+the real wavefront through a mid-search OOM and confirming the demoted
+result matches the cpu A* exactly. `tests/test_bigboard_scale.py` (7 tests)
+proves the planner declares 10x/100x-kiln-scale windows oversized and
+demotes rather than crashing (memory-only gates, no timing, per the standing
+"don't measure speedups" directive).
+
+Full suite: 317→361 passed, same 7 pre-existing board-drift failures
+unaffected (coordinator ran the suite independently against the merged tree,
+not just trusting the subagent's numbers). Board state at merge time: kiln
+score 11765.700 (drifted from the plan's earlier-quoted 8552.276 — not
+touched by this work, no write occurred).
 
 **M6 — Routing intelligence (added 2026-07-21 at user request):**
 17. Phase 9 residuals — (a) and (b) LANDED 2026-07-23 (see the Phase 9 anchor):
