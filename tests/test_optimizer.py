@@ -852,3 +852,179 @@ def test_ai_decisions_settings_block_is_read_not_invented(tmp_path: Path) -> Non
     report = o.optimize_board(project, max_iterations_per_call=1, seed=2, max_iterations=1)
     assert report["ai_decisions"]["min_score_spread"] == 1.25
     assert report["ai_decisions"]["max_pauses_per_run"] == 3
+
+
+# --- Phase 7.15: effort presets ----------------------------------------------
+
+
+def _set_optimizer(project: Path, **overrides) -> None:
+    """Write arbitrary `optimizer.*` keys into the project's settings (the
+    same pattern `_set_ai_decisions` uses for the `ai_decisions` sub-block)."""
+    path = Path(project) / "pcb_settings.json"
+    config = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    config.setdefault("optimizer", {}).update(overrides)
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+
+def test_effort_presets_resolve_to_distinct_knob_bundles(tmp_path: Path) -> None:
+    """`quick` and `best` must resolve to visibly different session configs -
+    inspecting the session (via `max_iterations_per_call=0`, which starts the
+    session but runs zero iterations) is enough, no router work needed."""
+    quick_project = tmp_path / "quick"
+    _unrouted_project(quick_project)
+    quick = o.optimize_board(quick_project, max_iterations_per_call=0, effort="quick")
+    assert quick["effort"] == "quick"
+    assert quick["max_iterations"] == 5
+    assert quick["accept"] == "greedy"
+
+    best_project = tmp_path / "best"
+    _unrouted_project(best_project)
+    best = o.optimize_board(best_project, max_iterations_per_call=0, effort="best")
+    assert best["effort"] == "best"
+    assert best["accept"] == "sa"
+    assert best["time_budget_s"] == pytest.approx(8 * 3600.0)
+    # distinct from quick/balanced on every knob the presets touch.
+    assert best["accept"] != quick["accept"]
+    assert best["max_iterations"] != quick["max_iterations"]
+
+    balanced_project = tmp_path / "balanced"
+    _unrouted_project(balanced_project)
+    balanced = o.optimize_board(balanced_project, max_iterations_per_call=0)
+    assert balanced["effort"] == "balanced"
+    # "balanced" is defined as "today's optimizer.* defaults, unchanged".
+    assert balanced["max_iterations"] == k.DEFAULT_PCB_SETTINGS["optimizer"]["max_iterations"]
+    assert balanced["accept"] == k.DEFAULT_PCB_SETTINGS["optimizer"]["accept"]
+
+
+def test_effort_can_be_read_from_pcb_settings_not_just_the_call(tmp_path: Path) -> None:
+    project = _unrouted_project(tmp_path)
+    _set_optimizer(project, effort="quick")
+    report = o.optimize_board(project, max_iterations_per_call=0)
+    assert report["effort"] == "quick"
+    assert report["max_iterations"] == 5
+
+
+def test_invalid_effort_raises(tmp_path: Path) -> None:
+    project = _unrouted_project(tmp_path)
+    with pytest.raises(ValueError):
+        o.optimize_board(project, max_iterations_per_call=0, effort="overnight")
+
+
+def test_explicit_call_time_override_wins_over_the_effort_preset(tmp_path: Path) -> None:
+    """A preset is a DEFAULT, not a hard override - an explicit argument to
+    `optimize_board` must win regardless of which effort tier is selected."""
+    project = tmp_path / "override_max_iter"
+    _unrouted_project(project)
+    report = o.optimize_board(project, max_iterations_per_call=0, effort="best", max_iterations=1)
+    assert report["max_iterations"] == 1  # NOT best's un-set fallback (optimizer.max_iterations=20)
+
+    project2 = tmp_path / "override_accept"
+    _unrouted_project(project2)
+    report2 = o.optimize_board(project2, max_iterations_per_call=0, effort="quick", accept="sa")
+    assert report2["accept"] == "sa"  # NOT quick's "greedy"
+
+    project3 = tmp_path / "override_time_budget"
+    _unrouted_project(project3)
+    report3 = o.optimize_board(project3, max_iterations_per_call=0, effort="best", time_budget_s=42.0)
+    assert report3["time_budget_s"] == pytest.approx(42.0)  # NOT best's 8h default
+
+
+# --- Phase 7.15: plateau-based stopping --------------------------------------
+
+
+def test_plateau_check_computes_reference_and_trailing_rates(tmp_path: Path) -> None:
+    """Direct test of the plateau math (window/ratio/rates) against a
+    hand-constructed improvement history - deterministic and fast, since a
+    real router-driven score curve cannot be coerced into an exact shape."""
+    session = {
+        "plateau_window": 3,
+        "plateau_slope_ratio": 0.1,
+        "productive_improvements": [10.0, 12.0, 8.0],
+    }
+    # Exactly `plateau_window` productive iterations so far: reference and
+    # trailing are computed over the SAME 3 samples - no genuine slowdown is
+    # visible yet, so the rule must not fire.
+    assert o._plateau_check(session) is None
+    assert session["plateau_reference_rate"] == pytest.approx(10.0)
+    assert session["plateau_trailing_rate"] == pytest.approx(10.0)
+
+    # Three more iterations whose pace has collapsed to ~3% of the reference.
+    session["productive_improvements"].extend([0.5, 0.3, 0.1])
+    reason = o._plateau_check(session)
+    assert reason == "plateau"
+    assert session["plateau_reference_rate"] == pytest.approx(10.0)
+    assert session["plateau_trailing_rate"] == pytest.approx(0.3)
+
+
+def test_plateau_check_does_not_fire_on_a_mild_slowdown(tmp_path: Path) -> None:
+    """A trailing rate that dropped but stayed above `plateau_slope_ratio` x
+    the reference must not converge the run - the rule is a ratio test, not
+    "any slowdown at all"."""
+    session = {
+        "plateau_window": 3,
+        "plateau_slope_ratio": 0.1,
+        "productive_improvements": [10.0, 10.0, 10.0, 9.0, 8.0, 7.0],
+    }
+    assert o._plateau_check(session) is None
+    assert session["plateau_trailing_rate"] == pytest.approx(8.0)
+
+
+def test_plateau_check_needs_a_full_window_of_productive_iterations_first() -> None:
+    """Fewer than `plateau_window` productive iterations means there is no
+    reference rate to compare against yet - the rule must stay silent, and
+    report both rates as None rather than guessing."""
+    session = {
+        "plateau_window": 3,
+        "plateau_slope_ratio": 0.1,
+        "productive_improvements": [10.0, 0.01],
+    }
+    assert o._plateau_check(session) is None
+    assert session["plateau_reference_rate"] is None
+    assert session["plateau_trailing_rate"] is None
+
+
+def test_a_new_session_reports_no_plateau_rates_before_it_has_run(tmp_path: Path) -> None:
+    project = _unrouted_project(tmp_path)
+    report = o.optimize_board(project, max_iterations_per_call=0)
+    assert report["plateau_reference_rate"] is None
+    assert report["plateau_trailing_rate"] is None
+    assert report["productive_improvements"] == []
+    assert report["plateau_window"] == k.DEFAULT_PCB_SETTINGS["optimizer"]["plateau_window"]
+    assert report["plateau_slope_ratio"] == k.DEFAULT_PCB_SETTINGS["optimizer"]["plateau_slope_ratio"]
+
+
+def test_convergence_delta_floor_still_stops_a_run_before_plateau_can_fire(tmp_path: Path) -> None:
+    """The pre-7.15 floor behaviour must survive unchanged: a single
+    iteration whose improvement is below `convergence_delta` stops the run
+    immediately, and (since one iteration is fewer than the default
+    `plateau_window` of 3) the plateau rule cannot possibly have fired
+    instead - proving the floor still wins on its own terms."""
+    project = _unrouted_project(tmp_path)
+    # An impossibly high floor: any real improvement is "below" it, so the
+    # very first committed move converges the run via convergence_delta.
+    _set_optimizer(project, convergence_delta=1e9)
+    report = o.optimize_board(project, max_iterations_per_call=1, seed=5, accept="greedy")
+    assert report["state"] == "converged"
+    assert report["stop_reason"] == "convergence_delta"
+    # not enough productive history yet for the plateau rule to have an
+    # opinion at all.
+    assert report["plateau_reference_rate"] is None
+
+
+def test_plateau_rule_converges_a_run_independently_of_convergence_delta(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wiring test: force `_plateau_check` to fire and disable the
+    `convergence_delta` floor (an impossibly negative value, so it can never
+    be the reason), then prove `optimize_board`'s real code path honors the
+    plateau rule with its own distinguishable `stop_reason` - not a
+    reimplementation of the check, an assertion that `_run_chunk` actually
+    calls it."""
+    project = _unrouted_project(tmp_path)
+    _set_optimizer(project, convergence_delta=-1e9)
+    monkeypatch.setattr(o, "_plateau_check", lambda session: "plateau")
+
+    report = o.optimize_board(project, max_iterations_per_call=1, seed=9, accept="greedy")
+
+    assert report["state"] == "converged"
+    assert report["stop_reason"] == "plateau"

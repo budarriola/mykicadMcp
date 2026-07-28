@@ -357,8 +357,17 @@ def _session_report(session: dict[str, Any]) -> dict[str, Any]:
         "elapsed_s": round(session["elapsed_s"], 3),
         "time_budget_s": session["time_budget_s"],
         "seed": session["seed"],
+        "effort": session.get("effort", "balanced"),
         "accept": session["accept"],
         "temperature": round(session["temperature"], 6),
+        # Phase 7.15: the plateau rule's own view of "why did it stop" (or
+        # "how close is it to stopping") - both rates are None until the
+        # session has `plateau_window` productive moves to reference.
+        "plateau_window": session.get("plateau_window"),
+        "plateau_slope_ratio": session.get("plateau_slope_ratio"),
+        "plateau_reference_rate": session.get("plateau_reference_rate"),
+        "plateau_trailing_rate": session.get("plateau_trailing_rate"),
+        "productive_improvements": list(session.get("productive_improvements", [])),
         "initial_score": session["initial_score"],
         "current_score": session["current_score"],
         "best_score": session["best_score"],
@@ -380,20 +389,82 @@ def _session_report(session: dict[str, Any]) -> dict[str, Any]:
 
 
 def _migrate_session(session: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    """Bring a checkpoint written by the 7.6 core up to the 7.7 shape.
+    """Bring a checkpoint written by an older core up to the current shape.
 
     Sessions outlive the process AND the code version - a board-local JSON
     written before this landing is a perfectly legitimate thing to resume, and
-    it must not crash on a missing key. Resolving `ai_decisions` from the
-    CURRENT settings here is the only honest option: the older session never
-    recorded a policy to preserve.
+    it must not crash on a missing key. Resolving `ai_decisions`/`effort`/the
+    plateau knobs from the CURRENT settings here is the only honest option:
+    an older session never recorded a policy to preserve.
     """
     session.setdefault("pending_decision", None)
     session.setdefault("decision_log", [])
     session.setdefault("pauses_used", 0)
     if not session.get("ai_decisions"):
         session["ai_decisions"] = _ai_decision_config(config)
+    # Phase 7.15: a pre-7.15 session has no plateau bookkeeping and no
+    # productive-move history to backfill (the moves it already made were
+    # never scored against a reference rate), so it resumes with an EMPTY
+    # `productive_improvements` - the plateau rule simply needs
+    # `plateau_window` more productive iterations from here before it can
+    # fire, same as a brand new session. That is a correct, not a degraded,
+    # resumption: the rule's contract is "don't fire without enough data."
+    optimizer = config.get("optimizer", {})
+    session.setdefault("effort", str(optimizer.get("effort", "balanced")))
+    session.setdefault("plateau_window", int(optimizer.get("plateau_window", 3)))
+    session.setdefault("plateau_slope_ratio", float(optimizer.get("plateau_slope_ratio", 0.1)))
+    session.setdefault("productive_improvements", [])
+    session.setdefault("plateau_reference_rate", None)
+    session.setdefault("plateau_trailing_rate", None)
     return session
+
+
+def _plateau_check(session: dict[str, Any]) -> str | None:
+    """Phase 7.15 - the plateau-based stopping rule, alongside (not instead
+    of) the existing `convergence_delta` floor.
+
+    Reference rate = mean of the first `plateau_window` PRODUCTIVE
+    improvements (accepted moves that actually lowered the score - see
+    `_commit_choice`); trailing rate = mean of the most recent
+    `plateau_window` productive improvements. Fires when the trailing rate has
+    fallen below `plateau_slope_ratio` x the reference rate - i.e. the pace of
+    genuine improvement has slowed to a fraction of its initial pace.
+
+    Both rates are written back onto the session on EVERY call (even when the
+    rule does not fire, and even before there is enough data to compute them)
+    so `get_route_session`'s report always shows the current pace, not just
+    the pace at the moment the run stopped - "why did it stop" has to be
+    inspectable mid-run too, per the plan.
+
+    Returns a `stop_reason` string when the rule fires, else None. A session
+    that has not yet made `plateau_window` productive moves cannot have a
+    reference rate at all, so it returns None unconditionally - there is
+    nothing to compare the trailing rate against yet, and the existing
+    `convergence_delta` floor is the only thing that can stop such a session
+    early.
+    """
+    window = session["plateau_window"]
+    improvements = session["productive_improvements"]
+    if len(improvements) < window:
+        session["plateau_reference_rate"] = None
+        session["plateau_trailing_rate"] = None
+        return None
+
+    reference = sum(improvements[:window]) / window
+    trailing = sum(improvements[-window:]) / window
+    session["plateau_reference_rate"] = round(reference, 6)
+    session["plateau_trailing_rate"] = round(trailing, 6)
+
+    # A non-positive reference rate is degenerate (the first window's moves
+    # were, on average, non-improving despite being individually accepted -
+    # only possible under `sa`, which can accept a worse move). There is no
+    # meaningful "pace" to have slowed from, so leave stopping to the
+    # `convergence_delta` floor rather than divide-by-zero or fire on noise.
+    if reference <= 0:
+        return None
+    if trailing < session["plateau_slope_ratio"] * reference:
+        return "plateau"
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -1009,6 +1080,13 @@ def _commit_choice(session: dict[str, Any], chosen: dict[str, Any],
         session["current_score"] = chosen["score"]
         if chosen["score"]["total"] < session["best_score"]["total"]:
             session["best_score"] = chosen["score"]
+        # Phase 7.15: only an ACCEPTED move that genuinely lowered the score
+        # counts as "productive" for the plateau rate - an SA-accepted worse
+        # move (negative improvement) says nothing about the pace of genuine
+        # improvement, so it is excluded exactly like a rejected move.
+        productive = current_total - session["current_score"]["total"]
+        if productive > 0:
+            session["productive_improvements"].append(round(productive, 6))
 
     session["moves"].append({
         "iteration": session["iteration"],
@@ -1065,14 +1143,18 @@ def _resolve_pending(session: dict[str, Any], choice: str, rationale: str | None
         session["temperature"] *= session["sa_cooling"]
     session["rng_state"] = _rng_state_to_json(rng)
     session["pending_decision"] = None
-    # The SAME convergence test the auto path applies to the move it just
-    # committed. Skipping it here would be a parity break, not a simplification:
-    # a run whose final move happened to be escalated would report
-    # `budget_exhausted` on the next resume where the identical unescalated run
-    # reported `converged`.
+    # The SAME convergence/plateau tests the auto path applies to the move it
+    # just committed. Skipping them here would be a parity break, not a
+    # simplification: a run whose final move happened to be escalated would
+    # report `budget_exhausted` on the next resume where the identical
+    # unescalated run reported `converged`.
+    plateau_reason = _plateau_check(session)
     if improvement < session["convergence_delta"]:
         session["state"] = "converged"
         session["stop_reason"] = "convergence_delta"
+    elif plateau_reason:
+        session["state"] = "converged"
+        session["stop_reason"] = plateau_reason
     else:
         session["state"] = "running"
         session["stop_reason"] = None
@@ -1127,12 +1209,75 @@ def decide_route(project_path: str | Path, session_id: str, decision_id: str,
     }
 
 
+## Phase 7.15: effort presets ------------------------------------------------
+#
+# `optimizer.effort` bundles the OTHER optimizer knobs into one question ("how
+# much do you want to spend?") instead of asking a caller to tune six numbers
+# individually. "balanced" is deliberately NOT hardcoded below: it means
+# "whatever `optimizer.*` already says" - today's pre-7.15 behaviour, verbatim,
+# for every project that never touches `effort` at all. "quick"/"best" DO carry
+# their own numbers because the plan gives them concrete values (5 iterations/
+# greedy for quick; SA + an overnight time budget for best) that are meant to
+# win over the generic per-knob config, the same way a call-time argument wins
+# over the preset. The precedence is therefore three deep: call-time argument
+# > effort preset (quick/best only) > `optimizer.*` config value (which is
+# what "balanced" resolves to, and what a knob outside a preset's bundle
+# always resolves to).
+#
+# HONEST SCOPE-DOWN: `autorouter.cpu.replicas` (the knob the plan's "quick:
+# replicas 1" / "best: replicas max" language refers to) is defined in
+# `pcb_settings.json` but is not read by anything in this module, the router,
+# or anywhere else in the codebase today (grep confirms - see NETCLASS_PLAN.md
+# 7.15/7.9 notes on the CPU parallelism knobs being schema-only pending M4
+# wiring). Presets below therefore do NOT set `replicas`: doing so would be
+# decorative, and this module doesn't invent wiring for a knob nothing
+# consumes. This is noted in `optimize_board`'s docstring too.
+_EFFORT_PRESETS: dict[str, dict[str, Any]] = {
+    "quick": {
+        "max_iterations": 5,
+        "accept": "greedy",
+    },
+    "best": {
+        "accept": "sa",
+        # "Hours-scale... overnight" (plan's words) - 8 hours is a full
+        # unattended overnight run without assuming a multi-day session; a
+        # session still checkpoints every chunk, so this is a ceiling the run
+        # can converge or be stopped well before, not a promise to run 8h.
+        "time_budget_s": 8.0 * 3600.0,
+    },
+}
+
+
+def _resolve_effort_knobs(optimizer: dict[str, Any], effort: str,
+                          accept: str | None, max_iterations: int | None,
+                          time_budget_s: float | None) -> dict[str, Any]:
+    """Resolve `max_iterations`/`accept`/`time_budget_s` through the
+    call-time-arg > effort-preset > config precedence described above.
+    `worst_k`/`sa_initial_temp`/`sa_cooling`/`convergence_delta` are NOT part
+    of any effort bundle (the plan does not mention them for any tier), so
+    they are always resolved straight from `optimizer.*` regardless of
+    `effort` - unchanged from pre-7.15 behaviour."""
+    preset = _EFFORT_PRESETS.get(effort, {})
+    return {
+        "max_iterations": (int(max_iterations) if max_iterations is not None
+                          else int(preset.get("max_iterations", optimizer.get("max_iterations", 20)))),
+        "accept": str(accept or preset.get("accept", optimizer.get("accept", "greedy"))).lower(),
+        "time_budget_s": (float(time_budget_s) if time_budget_s is not None
+                         else float(preset.get("time_budget_s", optimizer.get("time_budget_s", 300)))),
+    }
+
+
 def _new_session(project_path: str | Path, config: dict[str, Any],
                  seed: int | None, accept: str | None,
-                 max_iterations: int | None, time_budget_s: float | None) -> dict[str, Any]:
+                 max_iterations: int | None, time_budget_s: float | None,
+                 effort: str | None = None) -> dict[str, Any]:
     optimizer = config.get("optimizer", {})
     resolved_seed = int(optimizer.get("seed", 1)) if seed is None else int(seed)
-    resolved_accept = str(accept or optimizer.get("accept", "greedy")).lower()
+    resolved_effort = str(effort or optimizer.get("effort", "balanced")).lower()
+    if resolved_effort not in ("quick", "balanced", "best"):
+        raise ValueError(f"effort must be 'quick', 'balanced' or 'best'; got {resolved_effort!r}")
+    knobs = _resolve_effort_knobs(optimizer, resolved_effort, accept, max_iterations, time_budget_s)
+    resolved_accept = knobs["accept"]
     if resolved_accept not in ("greedy", "sa"):
         raise ValueError(f"accept must be 'greedy' or 'sa'; got {resolved_accept!r}")
 
@@ -1148,16 +1293,27 @@ def _new_session(project_path: str | Path, config: dict[str, Any],
         "board_fingerprint": _board_fingerprint(project_path),
         "scratch_dir": str(scratch),
         "seed": resolved_seed,
+        "effort": resolved_effort,
         "accept": resolved_accept,
         "rng_state": _rng_state_to_json(rng),
         "iteration": 0,
         "elapsed_s": 0.0,
-        "max_iterations": int(optimizer.get("max_iterations", 20)) if max_iterations is None else int(max_iterations),
-        "time_budget_s": float(optimizer.get("time_budget_s", 300)) if time_budget_s is None else float(time_budget_s),
+        "max_iterations": int(knobs["max_iterations"]),
+        "time_budget_s": float(knobs["time_budget_s"]),
         "worst_k": int(optimizer.get("worst_k", 5)),
         "convergence_delta": float(optimizer.get("convergence_delta", 0.5)),
         "temperature": float(optimizer.get("sa_initial_temp", 50.0)),
         "sa_cooling": float(optimizer.get("sa_cooling", 0.9)),
+        # Phase 7.15: plateau-stopping bookkeeping. `productive_improvements`
+        # only ever records ACCEPTED moves that genuinely lowered the score
+        # (see `_commit_choice`) - a rejected/no-op iteration says nothing
+        # about the pace of genuine improvement, so it is excluded from both
+        # the reference and trailing rate, per the plan.
+        "plateau_window": int(optimizer.get("plateau_window", 3)),
+        "plateau_slope_ratio": float(optimizer.get("plateau_slope_ratio", 0.1)),
+        "productive_improvements": [],
+        "plateau_reference_rate": None,
+        "plateau_trailing_rate": None,
         "initial_score": initial,
         "current_score": initial,
         "best_score": initial,
@@ -1181,10 +1337,11 @@ def optimize_board(
     accept: str | None = None,
     max_iterations: int | None = None,
     time_budget_s: float | None = None,
+    effort: str | None = None,
     write: bool = False,
     allow_while_open: bool = False,
 ) -> dict[str, Any]:
-    """Phase 7.6 - run a BOUNDED chunk of whole-board optimization.
+    """Phase 7.6/7.15 - run a BOUNDED chunk of whole-board optimization.
 
     Omit `session_id` to start a new session (which snapshots the project into
     a private scratch directory and scores it); pass one to resume an existing
@@ -1194,8 +1351,14 @@ def optimize_board(
 
       `running`           - budget for THIS call is spent, more work remains.
       `converged`         - the best available move improved the score by less
-                            than `optimizer.convergence_delta` (or no move
-                            improved it at all).
+                            than `optimizer.convergence_delta` (a single
+                            degenerate iteration - the floor), OR (7.15) the
+                            trailing-window mean improvement rate has fallen
+                            below `plateau_slope_ratio` x its reference rate
+                            (the pace of genuine improvement has slowed to a
+                            fraction of its initial pace - `stop_reason`
+                            distinguishes the two: `"convergence_delta"` vs.
+                            `"plateau"`).
       `budget_exhausted`  - the SESSION's `max_iterations` / `time_budget_s`
                             ran out first.
       `awaiting_decision` - (7.7) the top two candidates are within
@@ -1215,6 +1378,18 @@ def optimize_board(
     simulated annealing, worse moves accepted with probability exp(-dS/T),
     T *= `sa_cooling` each iteration). `seed` makes the whole run reproducible.
 
+    `effort` (7.15, new session only - a resumed session keeps whatever effort
+    it started with) is `"quick" | "balanced" | "best"`, each a DEFAULT bundle
+    of the OTHER knobs (an explicit `accept`/`max_iterations`/`time_budget_s`
+    argument here still wins over the preset): `quick` = one pass + cheap
+    cleanup (`max_iterations=5`, `accept="greedy"`); `balanced` (the default)
+    = today's `optimizer.*` settings, unchanged; `best` = `accept="sa"` and an
+    8-hour ("overnight") `time_budget_s`. Omit to read `optimizer.effort` from
+    `pcb_settings.json` (also `"balanced"` by default). NOTE: the plan's
+    "replicas" knob for quick/best (`autorouter.cpu.replicas`) is not
+    consumed by anything in this codebase yet, so no preset here sets it -
+    see `_EFFORT_PRESETS`'s docstring-comment for the honest scope-down.
+
     `write=False` (the default) NEVER touches the real board - not on the first
     call, not on the last. `write=True` applies the session's final accepted
     board state (copper, vias and zones together, as one consistent state - not
@@ -1229,7 +1404,8 @@ def optimize_board(
     data, sessions = _load_sessions(project_path)
 
     if session_id is None:
-        session = _new_session(project_path, config, seed, accept, max_iterations, time_budget_s)
+        session = _new_session(project_path, config, seed, accept, max_iterations,
+                               time_budget_s, effort)
         sessions[session["session_id"]] = session
     else:
         if session_id not in sessions:
@@ -1386,9 +1562,19 @@ def _run_chunk(session: dict[str, Any], max_iterations_per_call: int,
         # Converged when the best available move cannot buy `convergence_delta`
         # worth of score. Under `greedy` a rejected move means nothing improved,
         # which is the same condition - so both policies stop here honestly.
+        # `convergence_delta` is checked FIRST and unconditionally (it is a
+        # floor for a single degenerate iteration); the Phase 7.15 plateau
+        # rule is evaluated whenever that floor didn't already stop the run,
+        # so a genuinely-slowed-but-still-above-floor pace can also converge.
+        plateau_reason = _plateau_check(session)
         if improvement < session["convergence_delta"]:
             session["state"] = "converged"
             session["stop_reason"] = "convergence_delta"
+            _finish_iteration(session, rng, iteration_started)
+            break
+        if plateau_reason:
+            session["state"] = "converged"
+            session["stop_reason"] = plateau_reason
             _finish_iteration(session, rng, iteration_started)
             break
         _finish_iteration(session, rng, iteration_started)

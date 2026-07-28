@@ -1337,7 +1337,7 @@ class KiCadMcpServer:
             },
             "optimize_kicad_board": {
                 "description": (
-                    "Phase 7.6 - iterative whole-board optimization. Optimizes ONE number: "
+                    "Phase 7.6/7.15 - iterative whole-board optimization. Optimizes ONE number: "
                     "S = sum of net trace costs (get_kicad_trace_cost's board total, incl. the 7.2 "
                     "layer-purpose penalties) + sum of plane island costs (audit_kicad_plane_islands) + "
                     "optimizer.unrouted_penalty x unrouted-connection count (get_kicad_ratsnest) - every "
@@ -1354,7 +1354,11 @@ class KiCadMcpServer:
                     "RESUMABLE, never a marathon: one call runs at most max_iterations_per_call "
                     "iterations or max_seconds of wall clock and returns {session_id, state, "
                     "score_curve, moves, diff}, with state in "
-                    "running|converged|budget_exhausted|awaiting_decision; pass "
+                    "running|converged|budget_exhausted|awaiting_decision (converged now also fires "
+                    "on Phase 7.15's plateau rule - trailing-window mean improvement rate below "
+                    "optimizer.plateau_slope_ratio x its reference rate, distinguishable from the "
+                    "convergence_delta floor via stop_reason - alongside the effort preset "
+                    "quick|balanced|best, see the effort parameter); pass "
                     "the session_id back to continue exactly where it stopped (RNG state and all loop "
                     "state checkpoint to the board-local JSON, so a session survives an MCP restart and "
                     "is inspectable via get_kicad_route_session). ALL iteration happens on a private "
@@ -1397,6 +1401,17 @@ class KiCadMcpServer:
                         "time_budget_s": {
                             "type": "number",
                             "description": "Total SESSION time budget; defaults to optimizer.time_budget_s.",
+                        },
+                        "effort": {
+                            "type": "string",
+                            "enum": ["quick", "balanced", "best"],
+                            "description": (
+                                "Phase 7.15 - new-session-only preset bundling the other optimizer knobs "
+                                "(an explicit accept/max_iterations/time_budget_s above still wins over "
+                                "it): quick=max_iterations 5 + greedy; balanced (default)=today's "
+                                "optimizer.* settings unchanged; best=simulated annealing + an 8h time "
+                                "budget. Defaults to optimizer.effort in pcb_settings.json ('balanced')."
+                            ),
                         },
                         "write": {"type": "boolean", "default": False},
                         "allow_while_open": {"type": "boolean", "default": False},
@@ -2415,6 +2430,7 @@ class KiCadMcpServer:
             accept=args.get("accept"),
             max_iterations=int(max_iterations) if max_iterations is not None else None,
             time_budget_s=float(time_budget_s) if time_budget_s is not None else None,
+            effort=args.get("effort"),
             write=bool(args.get("write", False)),
             allow_while_open=bool(args.get("allow_while_open", False)),
         )

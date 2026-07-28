@@ -4917,6 +4917,16 @@ DEFAULT_PCB_SETTINGS: dict[str, Any] = {
         "sa_cooling": 0.9,
         "convergence_delta": 0.5,
         "seed": 1,
+        # Phase 7.15: the effort preset a session starts with ("quick" |
+        # "balanced" | "best" - see `_EFFORT_PRESETS` in
+        # kicad_optimizer_tool.py) and the plateau-stopping window/ratio.
+        # `convergence_delta` above still stops a run whose single latest
+        # iteration barely moved the score; these two knobs additionally stop
+        # a run whose PACE of improvement has genuinely slowed, even while
+        # each individual iteration is still above that floor.
+        "effort": "balanced",
+        "plateau_window": 3,
+        "plateau_slope_ratio": 0.1,
         "ai_decisions": {
             "enabled": True,
             "min_score_spread": 5.0,
