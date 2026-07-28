@@ -165,14 +165,14 @@ For whoever (human or AI) picks this up next:
   The 35 failures are now `unreachable_in_window` (genuine dense-board
   pathfinding), not budget — closing that gap is Opus-class whole-board
   optimization (7.6), not a bounded Sonnet patch. See ⭐ findings.
-- **Next work when resumed (updated 2026-07-27 — 7.5.6 landed too, see its
+- **Next work when resumed (updated 2026-07-27 — 7.15 landed too, see its
   anchor):** (1) 7.14's optimizer pin-swap move + pause-the-user protocol —
-  was waiting on 7.6/7.7, both landed, so this is UNBLOCKED. (2) 7.3b's one
-  remaining bit: lifting the 60mm/400k-node window cap toward whole-board
-  (numpy/accel, M5) — a heavier M5/accel undertaking, not a bounded Sonnet
-  patch. (3) 7.15 effort presets + plateau stopping — spec'd, not built as
-  part of 7.6/7.7, genuinely open. Still open: M6 item 17 (c) Flow B
-  stack-up-gate question.
+  was waiting on 7.6/7.7, both landed, so this is UNBLOCKED; per the plan's
+  own delegation strategy this one is Opus-class ("rides the router core").
+  (2) 7.3b's one remaining bit: lifting the 60mm/400k-node window cap toward
+  whole-board (numpy/accel, M5) — a heavier M5/accel undertaking, not a
+  bounded Sonnet patch. Still open: M6 item 17 (c) Flow B stack-up-gate
+  question.
 - **Nothing has been committed** in either repo as of this snapshot — review the
   working tree before assuming git history matches this file.
 - Verify claims against the code (`kicad_pcb_tool.py`, `kicad_mcp_server.py`,
@@ -664,6 +664,16 @@ router work):
   **This closes out Phase 7.5 entirely** (see build-order item 13). Unblocks
   nothing further by itself, but was itself the last piece 7.14's pin-swap
   protocol and further M4 work were waiting on alongside 7.6/7.7.
+  (20) ✅ **Phase 7.15 effort presets + plateau stopping — LANDED 2026-07-27**
+  (Sonnet subagent, worktree-isolated, merged fast-forward). See its anchor
+  for the full write-up: `optimizer.effort` (quick/balanced/best) bundling
+  the other optimizer knobs with a three-deep precedence, and the plateau
+  rule running alongside `convergence_delta` rather than replacing it. Honest
+  scope-down: `cpu.replicas` stays unwired since nothing in this codebase
+  reads it. 92 tools (unchanged), 293→303 passed, same 7 pre-existing
+  failures. **This closes out build-order item 14 (7.6/7.7/7.15) entirely** —
+  only the viewer's cancel/decision UI and portfolio replicas remain as
+  low-priority residuals there.
 
 ## How to work this plan (living document — keep it current)
 
@@ -2171,24 +2181,50 @@ Sub-threshold swaps are reported, not proposed. Knobs `pin_swap`:
 `{enabled: false, min_gain: 25.0, ref_prefixes: ["J","P","CN","X"]}` (off by
 default — consent-gated anyway).
 
-### 7.15 Effort control & plateau-based stopping
+### 7.15 — LANDED 2026-07-27 (reference anchor; no work remains here)
 
-- **Effort question at session start:** the session asks the user
-  (AskUserQuestion) how much effort to spend, three defaults mapping to
-  `optimizer.effort` presets — **quick** (one pass + cheap cleanup:
-  max_iterations 5, replicas 1, greedy), **balanced** (today's defaults),
-  **best** (SA on, replicas max, hours-scale time budget — "overnight") — plus
-  free-form override of explicit knobs.
-- **Plateau stopping (primary rule; the user-requested "iterate until the pace
-  of improvement slows dramatically"):** track per-iteration board-score
-  improvement; reference rate = mean of the first `plateau_window` productive
-  iterations; **stop when the trailing-window mean rate <
-  `plateau_slope_ratio` × reference** (defaults: window 3, ratio 0.1 — pace
-  fell to a tenth), or on the hard budgets. Score curve + both rates land in
-  the session log and viewer so "why did it stop" is inspectable.
-  `convergence_delta` survives only as a floor for degenerate curves.
-- Knobs under `optimizer`: `"effort": "balanced"`, `"plateau_window": 3`,
-  `"plateau_slope_ratio": 0.1`.
+Implemented in `kicad_optimizer_tool.py` (Sonnet subagent, worktree-isolated,
+coordinator-reviewed, merged fast-forward). `optimizer.effort`
+(`"quick"|"balanced"|"best"`) bundles the other optimizer knobs via
+`_EFFORT_PRESETS` + `_resolve_effort_knobs`, with a three-deep precedence:
+explicit call-time argument > effort preset (quick/best only) > bare
+`optimizer.*` config value (what `"balanced"`, the default, always resolves
+to — verbatim pre-7.15 behavior for any project that never touches `effort`).
+`quick` = `max_iterations: 5`, `accept: "greedy"`; `best` = `accept: "sa"`,
+`time_budget_s`: 8 hours ("overnight," a ceiling a session still checkpoints
+through and can converge or be stopped well before, not a promise to run
+that long).
+
+**Honest scope-down:** the plan's "replicas 1"/"replicas max" language for
+quick/best refers to `autorouter.cpu.replicas`, which is schema-only —
+nothing in this codebase reads it yet (confirmed by grep) — so neither preset
+sets it; inventing wiring for a knob nothing consumes was correctly declined.
+
+The plateau rule (`_plateau_check`) runs alongside, not instead of, the
+existing `convergence_delta` floor: tracks `productive_improvements` (accepted
+moves that genuinely lowered the score — an SA-accepted worse move is
+excluded, same as a rejected move); reference rate = mean of the first
+`plateau_window` such moves; converges when the trailing-window mean falls
+below `plateau_slope_ratio × reference`. A session with fewer than
+`plateau_window` productive moves so far cannot fire the rule at all (nothing
+to compare against yet) — `convergence_delta` remains the only thing that can
+stop it early in that phase, exactly as specced. `stop_reason` distinguishes
+`"convergence_delta"` from `"plateau"`; both rates are reported on every
+session via `get_kicad_route_session`, not just at the moment of stopping, so
+"why did it stop" (or "how close is it") is inspectable mid-run.
+
+New knobs in `DEFAULT_PCB_SETTINGS["optimizer"]`: `"effort": "balanced"`,
+`"plateau_window": 3`, `"plateau_slope_ratio": 0.1`. 92 tools (unchanged — no
+new MCP tool; `optimize_kicad_board` gained the `effort` parameter plus new
+session-state fields). 10 new tests in `tests/test_optimizer.py` (47 total in
+that file). Full suite 293→303 passed, same 7 pre-existing board-drift
+failures, 7 skipped.
+
+**Not built (out of the original spec's scope, never claimed otherwise):**
+the "session asks the user via AskUserQuestion at start" UX — that is a
+session/client-side interaction convention, not something this Python
+function can perform; `effort` is exposed as a plain parameter for a calling
+session to surface however it chooses.
 
 ### 7.16 Benchmark harness — other people's boards vs. the autorouter
 
@@ -2440,13 +2476,19 @@ board`/`get_kicad_route_session` (7.6) and `decide_kicad_route` (7.7) also now
 documented (the latter two passes needed a small in-place fix each time,
 since a docs pass for 7.6 that merges just before 7.7 lands goes stale
 immediately — the "Known Limitation: 7.7 not implemented" note had to be
-replaced right after landing); README synced to **90 tools**. **CLAUDE.md
-tool-count bump still owed** (coordinator has it staged locally in the parent
-repo — now needs to go to **92**, not 90, since 7.5.6 landed after that
-staged edit — needs the user's own commit). **Remaining docs debt:**
-`run_kicad_stitching_pass`/`remove_kicad_stitching_vias` (7.5.6, landed
-2026-07-27) have no docs rows yet, and README needs its count bumped from 90
-to 92; future Phase 7 tools add rows as they land)
+replaced right after landing); `run_kicad_stitching_pass`/`remove_kicad_
+stitching_vias` (7.5.6) also documented — that docs subagent's worktree
+branched from a very stale point (before several intervening docs passes),
+so its diff would have reintroduced/conflicted with content already on main;
+the coordinator applied just its two new tool sections by hand instead of
+merging the branch (a pattern worth repeating if a future docs subagent's
+diff looks unexpectedly large — check `git show <commit> --stat` against
+what the task actually asked for before merging). README synced to **92
+tools**. **CLAUDE.md tool-count bump still owed** (coordinator has it staged
+locally in the parent repo at 92 — needs the user's own commit; 7.15 added no
+new tool so the count doesn't need to move again yet). **Remaining docs
+debt:** none currently known for landed tools; future Phase 7 tools add rows
+as they land)
 - Extend `docs/mcp-tools/10-netclasses-and-buses.md` (or the autorouter page,
   as fits) as each remaining tool in the summary table above lands (same
   per-tool format).
@@ -2614,14 +2656,14 @@ landed 2026-07-21 — see their anchors; remaining:):
     the detailed A*, signal parity by construction; both 7.5.4 residuals wired
     in with 7.5.5; stitching's ordering-contract dependency on a "7.6 stopping
     rule" satisfied once 7.6/7.7 landed). Nothing remains in this item.
-14. Phase 7.6/7.7 optimizer + decision protocol — **BOTH LANDED 2026-07-27**
-    (see their anchors; `greedy` and `sa` accept policies, sessions/resume,
-    `awaiting_decision`/`decide_kicad_route`, and `decision_log` auditability
-    all implemented and tested, incl. the scripted-decider harness the
-    original plan called for). **Remaining:** 7.15 effort presets + plateau
-    stopping were NOT built as part of either landing — still open, track as
-    a residual of this item. Viewer's cancel flag + decision banner, and
-    portfolio replicas (`cpu.replicas`), also still open.
+14. Phase 7.6/7.7/7.15 optimizer + decision protocol + effort/plateau —
+    **ALL LANDED 2026-07-27** (see their anchors; `greedy` and `sa` accept
+    policies, sessions/resume, `awaiting_decision`/`decide_kicad_route`,
+    `decision_log` auditability, the scripted-decider harness, effort presets,
+    and plateau-based stopping all implemented and tested). **Remaining:**
+    viewer's cancel flag + decision banner, and portfolio replicas
+    (`cpu.replicas`, still schema-only/unread) — both still open, low
+    priority.
 15. Phase 7.10 warm start — adoption with 7.6 (ownership flag + backup rule);
     cross-board seeding after it (feeds 7.3a priors). Acceptance: adopt kiln's
     routing on a scratch copy, optimize, verify backup exists and the diff only
