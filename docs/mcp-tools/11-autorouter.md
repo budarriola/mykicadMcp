@@ -1138,6 +1138,174 @@ on the session's private scratch copy until `optimize_kicad_board` is called wit
 }
 ```
 
+## `run_kicad_stitching_pass`
+
+**Phase 7.5.6 — The Plane Stitching Pass**
+
+Fill power/ground planes with stitching vias after routing and plane creation have converged. This
+tool runs **LAST**, never mid-routing — a stitching via placed early becomes a congestion obstacle
+for subsequent routing and defeats the purpose of the pass. The pass consists of three ordered steps,
+each reusing existing read-only analysis tools rather than inventing new geometry:
+
+1. **Island rescue** — Place one via per costed island/orphan that `audit_kicad_plane_islands`
+   already reports, at its own `suggested_stitching_via.position`. This is the same target-selection
+   logic the optimizer's move (d) uses, applied to EVERY island in a single sweep rather than one
+   per iteration.
+
+2. **Return-path stitching** — Place vias near high-speed/critical nets (from `classify_kicad_critical_nets`)
+   on the same-layer power/ground PLANE (not the signal net's own layer). Vias are spaced
+   `stitching.near_high_speed_pitch_mm` apart, placed within `stitching.near_high_speed_mm` of the
+   routed trace, wherever a candidate point actually lands inside that plane's drawn outline.
+
+3. **General stitching** — Grid-fill each power/ground plane's outline toward `stitching.target_spacing_mm`,
+   skipping any grid point already covered by a step 1 or 2 via (deduplicating at the spacing).
+
+Every via is placed via `_place_stitching_via(..., stitching=True)`, marking it as both `autorouter_owned`
+(undoable via `unroute_kicad_nets`) AND tagged `"stitching": True` in the board-local record, so
+`remove_kicad_stitching_vias` can target exactly these vias — never an ordinary routing via, never
+a hand-placed via, and never the optimizer's own untagged move-(d) island-rescue via (which belongs
+to an optimizer session, not this pass's bookkeeping).
+
+**write=false** (default) previews the full plan (every via's net/zone/layer/position, and for island
+rescue its projected cost change) without touching the board. **write=true** places every planned
+via for real and additionally returns each one's uuid. After `write=true`, refill zones (Fill All
+Zones) and re-run DRC in KiCad to reflect the vias in copper, the same as every other copper writer
+here.
+
+**SESSION CONVENTION (documented, not enforced):** Before routing or optimizing in an area that
+already contains stitching vias (owned or foreign), the calling session should ask the user whether
+to remove them first via `remove_kicad_stitching_vias` — removed stitching copper is simply
+re-placed by the next run of this pass, so nothing is lost by asking. This is the same kind of
+session-level contract as `route_kicad_nets`'s `allow_hand_copper_ripup` opt-in.
+
+**Stitching Configuration** — Settings come from `pcb_settings.json` under the `stitching` block
+(or defaults):
+- `enabled` (default true) — Gate the entire pass; when false, this tool returns early and reports
+  `enabled: false` with empty plans.
+- `target_spacing_mm` (default 5.0) — Target grid spacing for general stitching.
+- `near_high_speed_mm` (default 1.0) — Offset distance (both sides of trace) for return-path vias
+  near critical nets.
+- `near_high_speed_pitch_mm` (default 2.0) — Spacing between return-path vias along a critical-net
+  trace.
+
+**Args:** `project_path`, `write` (default false)
+
+**Example output (excerpt):**
+```json
+{
+  "board_path": "path/to/kiln.kicad_pcb",
+  "write": false,
+  "enabled": true,
+  "planned_count": 47,
+  "placed_count": 0,
+  "island_rescue": [
+    {
+      "kind": "island_rescue",
+      "net": "GND_Main",
+      "zone": "mainGnd",
+      "layer": "F.Cu",
+      "x": 72.1,
+      "y": 58.3,
+      "current_cost": 13.3333,
+      "projected_cost": 10.0
+    }
+  ],
+  "return_path": [
+    {
+      "kind": "return_path",
+      "net": "GND_Main",
+      "zone": "mainGnd",
+      "layer": "In1.Cu",
+      "x": 55.25,
+      "y": 62.5,
+      "near_net": "/MainControler/CLK"
+    }
+  ],
+  "general": [
+    {
+      "kind": "general",
+      "net": "GND_Main",
+      "zone": "mainGnd",
+      "layer": "F.Cu",
+      "x": 50.0,
+      "y": 55.0
+    }
+  ]
+}
+```
+
+When `write=true`, each entry in the `placed` array additionally carries its uuid.
+
+## `remove_kicad_stitching_vias`
+
+**Phase 7.5.6 — Undo for the Plane Stitching Pass**
+
+Undo for `run_kicad_stitching_pass`. Deletes ONLY autorouter-owned vias tagged `"stitching": True`
+in the board-local `autorouter_owned` records — never an ordinary routing via, never a hand-placed
+via, and never the optimizer's own untagged move-(d) island-rescue stitching via (which belongs to
+an optimizer session, not this pass's bookkeeping).
+
+**Area Scoping** — `area` restricts deletion to a region; omit for the whole board. Two formats:
+- **Rect:** `{"x_min": ..., "x_max": ..., "y_min": ..., "y_max": ...}` (any bound may be omitted
+  for an open side)
+- **Polygon:** `{"points": [[x0, y0], [x1, y1], ...]}`
+
+**write=false** (default) previews the uuids that would be removed without touching the board.
+
+**include_foreign=true** additionally LISTS (never deletes) every OTHER via in the resolved area
+that this tool does not own, using this codebase's existing free/oversized via heuristic
+(net=='' is an unconnected stitching/mounting via; more than 3× the Default netclass via diameter
+is oversized). This is the same `get_kicad_track_inventory` characterization, applied here so a
+real board's already-present freestanding vias can surface for a human to review one at a time.
+**This is NOT a full connectivity trace** — it does not prove a same-net via has no track soldered
+to it; it is a cheap first-pass heuristic only.
+
+**SESSION CONVENTION (documented, not enforced):** Before routing or optimizing in an area containing
+stitching vias (owned or foreign), the calling session should ask the user whether to remove them
+first — the same kind of contract as `route_kicad_nets`'s `allow_hand_copper_ripup` opt-in. This
+tool performs the deletion requested of it; the "ask first" step is the calling session's own
+responsibility.
+
+**Args:** `project_path`, `area` (optional; omit for whole board), `write` (default false),
+`include_foreign` (default false), `allow_while_open` (default false)
+
+**Example output (excerpt):**
+```json
+{
+  "board_path": "path/to/kiln.kicad_pcb",
+  "area": null,
+  "write": false,
+  "written": false,
+  "candidates": 47,
+  "removed": 0,
+  "removed_uuids": [
+    "12345678-abcd-1234-abcd-123456789abc",
+    "87654321-dcba-4321-dcba-fedcba123456",
+    ...
+  ],
+  "include_foreign": false,
+  "foreign_vias": []
+}
+```
+
+With `include_foreign=true`, the `foreign_vias` array carries vias this tool does not own:
+```json
+{
+  "foreign_vias": [
+    {
+      "uuid": "foreign-via-uuid",
+      "net": "",
+      "x": 60.0,
+      "y": 65.0,
+      "size": 0.8,
+      "drill": 0.4,
+      "free": true,
+      "oversized": false
+    }
+  ]
+}
+```
+
 ---
 
 ## Autorouter Architecture & Cost Model
