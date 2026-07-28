@@ -917,11 +917,49 @@ committed move — auto-accepted or AI-decided — is appended to a `decision_lo
 `get_kicad_route_session`) for audit and replay. Per-option SVG previews are not built (nothing in
 this codebase renders a board to SVG yet); the numbers and summary are what the decision is made on.
 
+**Phase 7.15 — Effort presets & plateau-based stopping:**
+`effort` (`"quick" | "balanced" | "best"`, new-session only) bundles the other optimizer knobs
+into one choice — `quick` = `max_iterations: 5` + greedy; `balanced` (default) = today's
+`optimizer.*` settings, unchanged; `best` = simulated annealing + an 8-hour ("overnight")
+`time_budget_s`. An explicit `accept`/`max_iterations`/`time_budget_s` argument still wins over
+whatever the preset would set. Alongside the existing `convergence_delta` floor (which stops a run
+whose single latest move barely improved the score), the **plateau rule** also converges a run
+whose *pace* of genuine improvement has slowed: once `optimizer.plateau_window` productive
+(score-lowering) moves have landed, the trailing-window mean improvement rate is compared to the
+reference rate (the first `plateau_window` such moves); falling below
+`optimizer.plateau_slope_ratio` × reference converges the session with `stop_reason: "plateau"`
+(vs. `"convergence_delta"` for the floor). Both rates are reported on every call via
+`plateau_reference_rate`/`plateau_trailing_rate`, so "why did it stop" (or "how close is it") is
+inspectable mid-run, not just at the end. `cpu.replicas` (the "replicas" language for quick/best in
+the original design) is not wired to anything in this codebase yet, so no preset sets it.
+
+**Phase 7.14 — Connector pin-swap advisor (off by default, `pin_swap.enabled: false`):**
+A seventh "move" this tool can never apply on its own. It looks for two SIGNAL nets (power/ground
+pins excluded) on different pins of one `detect_kicad_connectors` connector whose swap would score
+better, prices each candidate as a controlled A/B on two disposable board+netlist copies (both
+arms strip and reroute the same two nets; the swap arm additionally trades the two pads' nets via
+trial-only s-expr surgery — never the real project), and when the gain clears `pin_swap.min_gain`
+board-score points returns `state: "awaiting_decision"` with `decision_type: "pin_swap"`. **This
+pause is MANDATORY**, unlike every other decision type — it is never gated by `ai_decisions`
+(not `min_score_spread`, not `max_pauses_per_run`, not the `decision_types` allowlist), because the
+tool cannot realize a pin swap itself; only a human editing the schematic and re-exporting the
+netlist can. Answer via `decide_kicad_route`: `opt1` declines, `opt2` reports the change was made,
+triggering a re-sync that *adopts* (never decides) the real board's new pad-net assignment onto the
+session and reroutes only autorouter-owned copper on affected nets (hand copper on an affected net
+is reported, not touched). Sub-`min_gain` swaps are recorded in `pin_swap_reports` but never
+proposed. `pin_swap_exclusions` (new-session only) lists connector refs the advisor must never
+touch — an unresolved ref name raises rather than being silently dropped. **The schematic and the
+real `.net` file are never written by this tool on any path**, and `write=true` additionally
+refuses outright if the session's board and the real board disagree about any pad's net, for any
+reason.
+
 **Args:** `project_path`, `session_id` (optional; omit to start a new session), `max_iterations_per_call`
 (default 3), `max_seconds` (optional; omit for iterations-only bounding), `seed` (optional; overrides
 `optimizer.seed`), `accept` (optional; "greedy" or "sa"; overrides `optimizer.accept`), `max_iterations`
 (optional; total SESSION budget; defaults to `optimizer.max_iterations`), `time_budget_s` (optional;
-total SESSION time budget; defaults to `optimizer.time_budget_s`), `write` (default false), `allow_while_open`
+total SESSION time budget; defaults to `optimizer.time_budget_s`), `effort` (optional; "quick",
+"balanced", or "best"; new-session only), `pin_swap_exclusions` (optional array of connector refs;
+new-session only), `write` (default false), `allow_while_open`
 (default false)
 
 **Example output (excerpt):**
@@ -1120,6 +1158,17 @@ auto-taken without ever pausing.
 Raises if the session is not `awaiting_decision` or if `decision_id` doesn't match the pending one
 (a stale answer is refused). Never touches the real board — like the rest of the optimizer it works
 on the session's private scratch copy until `optimize_kicad_board` is called with `write=true`.
+
+**Phase 7.14 — answering a `pin_swap` decision:** a pending decision with `decision_type:
+"pin_swap"` is answered here too, but it is advisory and commits nothing (no trial is ever
+promoted). `opt1` declines the proposed connector pin swap; `opt2` reports that you made the
+change in the schematic and re-exported the netlist, which triggers a re-sync — the session adopts
+the real board's current pad-net assignment onto its scratch copy (never the reverse) and reports
+what changed, plus any hand-routed copper on an affected net that needs redoing by hand, under
+`resync` in the response. Answering `opt2` without having actually made the change is harmless: the
+re-sync finds nothing to adopt and says so. This tool never writes the schematic or the real `.net`
+file on this or any other path — relay the question to the human who can make the schematic edit,
+don't answer it on their behalf.
 
 **Args:** `project_path`, `session_id`, `decision_id` (must equal `pending_decision.decision_id`),
 `choice` (an option id or `"defer"`), `rationale` (optional; recorded, never executed)
