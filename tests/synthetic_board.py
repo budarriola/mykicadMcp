@@ -129,6 +129,7 @@ def generate_synthetic_board(
     route: bool = True,
     layers: int = 2,
     scale: float = 1.0,
+    unrouted_count: int = 0,
 ) -> str:
     """Build a minimal but parser-valid `.kicad_pcb` text with
     `round(component_count * scale)` two-pad footprints (R1..Rn), each on its
@@ -142,10 +143,24 @@ def generate_synthetic_board(
     components, matching the real board's ~259-component golden count) -
     combine with route=False for an unrouted ratsnest benchmark.
 
-    See also `generate_fanout_field_board` for dense many-pad footprints, and
-    `write_synthetic_project` for a full board + `.kicad_pro` + `.net` project.
+    `unrouted_count` (only meaningful with `route=True`): the LAST
+    `unrouted_count` components (by index, e.g. the highest-numbered R refs)
+    are left WITHOUT their connecting segment even though `route=True` routes
+    everything else - a per-component copper-presence toggle for scale/parse
+    tests. **Note: this mode's `NET_i_A`/`NET_i_B` nets are each single-pad
+    (one pad per net, unique per component), so they NEVER produce a
+    `get_ratsnest` connection regardless of routing state** - use
+    `generate_large_board_few_unrouted` (real shared multi-pad `FANOUT_p`
+    nets) for a fixture that needs actual ratsnest connections at scale.
+
+    See also `generate_fanout_field_board` for dense many-pad footprints,
+    `generate_large_board_few_unrouted` for a large-but-mostly-routed variant
+    of it, and `write_synthetic_project` for a full board + `.kicad_pro` +
+    `.net` project.
     """
     n = round(component_count * scale)
+    if unrouted_count < 0 or unrouted_count > n:
+        raise ValueError(f"unrouted_count must be between 0 and {n}, got {unrouted_count}")
     header = _HEADER_TEMPLATE.format(layer_lines=_layer_stack_lines(layers))
     net_names: list[str] = []
     for i in range(1, n + 1):
@@ -153,6 +168,7 @@ def generate_synthetic_board(
         net_names.append(f"NET_{i}_B")
 
     parts = [header, _net_table(net_names)]
+    first_unrouted = n - unrouted_count + 1
     for i in range(1, n + 1):
         ref = f"R{i}"
         net_a = f"NET_{i}_A"
@@ -161,7 +177,7 @@ def generate_synthetic_board(
         y = 10.0
         fp_uuid = f"synth-fp-{i:06d}"
         parts.append(_footprint_block(ref, "10k", x, y, fp_uuid, net_a, net_b))
-        if route:
+        if route and i < first_unrouted:
             seg_uuid = f"synth-seg-{i:06d}"
             parts.append(_segment_block(x - 0.75, y, x + 0.75, y, track_width, "F.Cu", net_a, seg_uuid))
     parts.append(_FOOTER)
@@ -277,6 +293,109 @@ def generate_fanout_field_board(
 
 def write_fanout_field_board(path: Path, **kwargs) -> Path:
     path.write_text(generate_fanout_field_board(**kwargs), encoding="utf-8")
+    return path
+
+
+def generate_large_board_few_unrouted(
+    component_count: int = 300,
+    spacing_mm: float = 5.0,
+    layers: int = 2,
+    unrouted_count: int = 5,
+    track_width: float = 0.2,
+) -> str:
+    """A LARGE board (many two-pad components, kiln-scale by default) that is
+    mostly ALREADY ROUTED, leaving only a HANDFUL of connections genuinely
+    unrouted - added to the test set 2026-07-29 (user request) as a "large
+    board, mostly done" fixture, distinct from the all-unrouted dense fields
+    `generate_fanout_field_board`/`generate_synthetic_board(route=False)`
+    already provide for stress-testing an empty board.
+
+    Topology: a resistor ladder - R1, R2, ..., R<component_count> in series,
+    each `spacing_mm` apart, `R_i` pad 2 wired to `R_{i+1}` pad 1 by a single
+    shared 2-pad net `CHAIN_i` (a genuine, realistic series topology, not an
+    invented net model). R1's pad 1 and the last component's pad 2 are the
+    two open ends of the ladder - single-pad nets, never ratsnested. Every
+    `CHAIN_i` gets a straight connecting segment EXCEPT the last
+    `unrouted_count` links, which are left with no copper at all - so
+    `get_ratsnest` reports exactly `unrouted_count` missing connections
+    (each a single, short, trivially-routable 2-pad net) no matter how large
+    `component_count` is.
+
+    Deliberately NOT the dense many-pad-per-component fanout topology: an
+    earlier version of this fixture chained EVERY pad position of a dense
+    BGA-style grid, which packs many parallel already-routed nets into the
+    same inter-component gap as the deliberately-unrouted ones - realistic
+    dense-board congestion, but it made the "few connections" behave like a
+    real hard `unreachable_in_window`/`self_check_failed` case instead of a
+    reliably fast-routing handful. This ladder keeps every component's own
+    footprint and its neighbors' clear of any other net (spacing_mm apart,
+    tiny 0.9mm pads, single chain net per gap), so the deliberately-missing
+    links have nothing to congest against.
+    """
+    if component_count < 2:
+        raise ValueError("component_count must be >= 2 (need at least one chain link)")
+    if unrouted_count < 0 or unrouted_count > component_count - 1:
+        raise ValueError(
+            f"unrouted_count must be between 0 and {component_count - 1}, got {unrouted_count}")
+
+    header = _HEADER_TEMPLATE.format(layer_lines=_layer_stack_lines(layers))
+    n_links = component_count - 1
+    chain_nets = [f"CHAIN_{i}" for i in range(1, n_links + 1)]
+    net_names = ["CHAIN_END_A", "CHAIN_END_B"] + chain_nets
+    first_unrouted_link = n_links - unrouted_count + 1
+
+    parts = [header, _net_table(net_names)]
+    for c in range(1, component_count + 1):
+        ref = f"R{c}"
+        x = c * spacing_mm
+        y = 10.0
+        fp_uuid = f"synth-ladder-fp-{c:06d}"
+        net_a = "CHAIN_END_A" if c == 1 else chain_nets[c - 2]
+        net_b = "CHAIN_END_B" if c == component_count else chain_nets[c - 1]
+        parts.append(_footprint_block(ref, "10k", x, y, fp_uuid, net_a, net_b))
+    for i in range(1, n_links + 1):
+        if i >= first_unrouted_link:
+            continue  # the deliberate gap - the "handful" connection
+        x1 = i * spacing_mm + 0.75
+        x2 = (i + 1) * spacing_mm - 0.75
+        seg_uuid = f"synth-ladder-seg-{i:06d}"
+        parts.append(_segment_block(x1, 10.0, x2, 10.0, track_width, "F.Cu", chain_nets[i - 1], seg_uuid))
+    parts.append(_FOOTER)
+    return "".join(parts)
+
+
+def _synthetic_netlist_text_ladder(component_count: int) -> str:
+    """`.net` text matching `generate_large_board_few_unrouted`: R1..Rn in
+    series, `R_i` pin 2 -> `R_{i+1}` pin 1 sharing net `CHAIN_i`, plus the two
+    open-end single-pad nets."""
+    parts = [
+        "(export",
+        '  (version "E")',
+        "  (design",
+        '    (source "synthetic.kicad_sch")',
+        '    (date "2026-07-29")',
+        '    (tool "synthetic_board.py")',
+        "  )",
+        "  (components",
+    ]
+    for c in range(1, component_count + 1):
+        parts.append(f'    (comp (ref "R{c}") (value "10k") (footprint "synthetic:R_0603"))')
+    parts.append("  )")
+    parts.append("  (nets")
+    code = 1
+    parts.extend(_netlist_net_block(code, "CHAIN_END_A", [("R1", "1")]))
+    code += 1
+    for i in range(1, component_count):
+        parts.extend(_netlist_net_block(code, f"CHAIN_{i}", [(f"R{i}", "2"), (f"R{i + 1}", "1")]))
+        code += 1
+    parts.extend(_netlist_net_block(code, "CHAIN_END_B", [(f"R{component_count}", "2")]))
+    parts.append("  )")
+    parts.append(")")
+    return "\n".join(parts) + "\n"
+
+
+def write_large_board_few_unrouted(path: Path, **kwargs) -> Path:
+    path.write_text(generate_large_board_few_unrouted(**kwargs), encoding="utf-8")
     return path
 
 
@@ -685,6 +804,7 @@ def write_synthetic_project(
     layers: int = 2,
     scale: float = 1.0,
     pads_per_component: int = 32,
+    unrouted_count: int = 0,
 ) -> dict[str, Path]:
     """Write a full synthetic KiCad project - board + `.kicad_pro` + `.net` -
     into `directory`, all named `project_name` (e.g. `synthetic.kicad_pcb`,
@@ -693,11 +813,24 @@ def write_synthetic_project(
 
     `mode="simple"` (default) uses `generate_synthetic_board` (two-pad R<n>
     footprints; `component_count`/`spacing_mm`/`track_width`/`route`/`layers`/
-    `scale` are forwarded to it) with a matching isolated-net `.net` file.
+    `scale`/`unrouted_count` are forwarded to it) with a matching isolated-net
+    `.net` file. Note `unrouted_count` here is copper-presence only - this
+    mode's nets are single-pad and never produce a `get_ratsnest` connection
+    (see `generate_synthetic_board`'s docstring); use `mode="ladder_partial"`
+    for a fixture with real unrouted connections at scale.
 
     `mode="fanout"` uses `generate_fanout_field_board` (`component_count`
     many-pad U<n> footprints, `pads_per_component` pads each, `spacing_mm`/
-    `layers` forwarded) with a matching shared-bus `.net` file.
+    `layers` forwarded, always fully unrouted) with a matching shared-bus
+    `.net` file.
+
+    `mode="ladder_partial"` uses `generate_large_board_few_unrouted`
+    (`component_count`/`spacing_mm`/`track_width`/`layers`/`unrouted_count`
+    forwarded - a resistor-ladder series chain, pre-routed except the last
+    `unrouted_count` links), so `get_ratsnest` reports exactly
+    `unrouted_count` missing connections no matter how large
+    `component_count` is. This is the "large board, mostly done, handful of
+    connections" fixture.
 
     Returns `{"board": ..., "project": ..., "netlist": ...}` paths.
     """
@@ -716,6 +849,7 @@ def write_synthetic_project(
             route=route,
             layers=layers,
             scale=scale,
+            unrouted_count=unrouted_count,
         )
         n = round(component_count * scale)
         netlist_text = _synthetic_netlist_text_simple(n)
@@ -728,8 +862,18 @@ def write_synthetic_project(
             layers=layers,
         )
         netlist_text = _synthetic_netlist_text_fanout(component_count, pads_per_component)
+    elif mode == "ladder_partial":
+        write_large_board_few_unrouted(
+            board_path,
+            component_count=component_count,
+            spacing_mm=spacing_mm if spacing_mm is not None else 5.0,
+            layers=layers,
+            unrouted_count=unrouted_count,
+            track_width=track_width,
+        )
+        netlist_text = _synthetic_netlist_text_ladder(component_count)
     else:
-        raise ValueError(f"Unknown mode: {mode!r} (expected 'simple' or 'fanout')")
+        raise ValueError(f"Unknown mode: {mode!r} (expected 'simple', 'fanout', or 'ladder_partial')")
 
     project_path.write_text(_synthetic_kicad_pro_text(), encoding="utf-8")
     netlist_path.write_text(netlist_text, encoding="utf-8")

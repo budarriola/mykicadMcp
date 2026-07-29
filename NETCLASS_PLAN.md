@@ -2578,6 +2578,63 @@ must fail cleanly rather than silently stacking.
 
 ---
 
+## Phase 7.22 — Bus-first direct routing pass — SPEC'd 2026-07-29, not yet started
+
+**User directive (2026-07-29), verbatim intent:** "when routing start with the
+busses in the most direct line, they can be riped up and optimized later."
+Two distinct changes, both in `route_nets`'s worklist, not the global-route
+(7.3a) stage:
+
+1. **Ordering — bus nets go first.** Today `conns` is sorted purely by
+   `(-priority, airline_length_mm, net)` (`kicad_router_tool.py:8124` — user
+   `net_overrides.priority` only, default 0 for everyone, so bus membership
+   currently has NO effect on routing order). Reuse `_crosstalk_bus_groups`
+   (`kicad_router_tool.py:5852`, landed in 7.20) as the bus-membership
+   source — same `confirmed_buses` (board-local JSON) + `detect_buses`
+   candidates, same safe-degradation direction (a lookup failure should
+   degrade to treating a net as NOT a bus member, i.e. fewer nets get the
+   early slot, never silently more — the same "fail toward the conservative
+   side" convention 7.20 already established for this exact data source, not
+   a new invented policy). Give every bus-member net a synthetic priority
+   boost ABOVE any `net_overrides.priority` value seen today (or thread it as
+   a distinct primary sort key ahead of the existing one) so buses are always
+   routed first, before ordinary signal/power nets, with the existing
+   shortest-airline tie-break preserved within and after that group.
+2. **Directness for that first pass.** While routing the bus-priority group,
+   bias the detailed A* toward the most direct (least deviation from the
+   straight pad-to-pad line) path rather than the board's general congestion-
+   avoidance behavior — the point is to lay buses down close to their airline
+   while the board is still empty, not to have them thread around copper that
+   doesn't exist yet. Needs a design decision (pick one, don't invent a third
+   without checking the existing knobs first): (a) reuse the existing
+   `deviation_mm` trace-cost weight (Phase 6) and Phase 5 bundle-corridor
+   machinery, which already biases a bus toward its own centerline — verify
+   whether that alone is sufficient before adding a new knob; or (b) if not,
+   add a scoped bonus/knob (following the 7.18/7.19/7.20 "inert at default"
+   convention: `{}`/`None` at default must reproduce the exact pre-7.22
+   arithmetic) that only applies during this first bus-priority pass.
+3. **Conflicts are explicitly OK and deferred, not prevented.** The user's own
+   framing — "they can be ripped up and optimized later" — means this phase
+   must NOT try to make the first bus pass conflict-free with nets that
+   haven't routed yet. The existing rip-up worklist (7.3b step 4) and the
+   Phase 7.6 whole-board optimizer are the reconciliation mechanisms; do not
+   add new speculative lookahead or conflict-avoidance logic here — that
+   would defeat the "route buses directly now, fix it up later" intent and
+   duplicate work 7.6 already owns.
+
+**Sequencing note (coordinator, 2026-07-29):** spec'd but intentionally
+queued behind 7.21 — both would touch `kicad_router_tool.py`'s core
+`route_nets` worklist/window machinery, and 7.21 is already in flight with a
+subagent as of this writing. Land and merge 7.21 first to avoid two
+concurrent worktree edits colliding in the same hot functions, then take up
+7.22 before Phase 7.6 (per the same 2026-07-29 priority ordering — this
+directly affects what geometry Phase 7.6 will have to optimize on top of, so
+it belongs before, not after, that work).
+
+**Not yet started** — spec only.
+
+---
+
 ## Phase 8 — LANDED 2026-07-21 (reference anchor; only its M2 docs item remains, in the build order)
 
 `_infer_net_voltage(net_name, net_voltages, gnd_tokens)` (standalone helper

@@ -44,6 +44,31 @@ def test_unrouted_mode_emits_no_segments(tmp_path: Path) -> None:
     assert len(components) == 4
 
 
+def test_unrouted_count_leaves_only_the_last_n_components_unrouted(tmp_path: Path) -> None:
+    text = generate_synthetic_board(component_count=6, unrouted_count=2)
+    board_path = tmp_path / "partial.kicad_pcb"
+    board_path.write_text(text, encoding="utf-8")
+    components = k._parse_board_components(board_path)
+    assert len(components) == 6
+    # R1..R4 routed (segment present), R5/R6 (the last 2) unrouted.
+    for i in range(1, 5):
+        assert f'"synth-seg-{i:06d}"' in text
+    for i in range(5, 7):
+        assert f'"synth-seg-{i:06d}"' not in text
+
+
+def test_unrouted_count_zero_is_byte_identical_to_default(tmp_path: Path) -> None:
+    assert (generate_synthetic_board(component_count=5, unrouted_count=0)
+            == generate_synthetic_board(component_count=5))
+
+
+def test_unrouted_count_rejects_out_of_range() -> None:
+    with pytest.raises(ValueError):
+        generate_synthetic_board(component_count=3, unrouted_count=4)
+    with pytest.raises(ValueError):
+        generate_synthetic_board(component_count=3, unrouted_count=-1)
+
+
 def test_default_two_layer_stack_unchanged(tmp_path: Path) -> None:
     text = generate_synthetic_board(component_count=2)
     assert '(0 "F.Cu" signal)' in text
