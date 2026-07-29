@@ -4856,6 +4856,7 @@ def _build_fine_cost(
     multilayer_attachment: bool = False,
     return_path: dict[str, Any] | None = None,
     goal_field: bool = False,
+    crosstalk: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The ONE integer-milli cost model for the fine detailed search.
 
@@ -4895,7 +4896,18 @@ def _build_fine_cost(
     obstacle, no goal test consults it, and the signal net is never routed
     through the reference plane's fill (the 2026-07-24 REQUIRED CONSTRAINT gate
     in `_plane_components_for` is untouched - `plane_layers` is still None for
-    every signal net, so every plane-traversal branch above stays False)."""
+    every signal net, so every plane-traversal branch above stays False).
+
+    PHASE 7.20 (`crosstalk`, non-None only when `crosstalk.enabled` AND
+    `crosstalk.adjacent_layer_penalty_per_mm` > 0 AND at least one cell in this
+    window is actually flagged - see `_resolve_crosstalk`) adds a PER-MM
+    surcharge to a PLANAR move landing on a cell that sits over/under a
+    different, non-bus-exempt net's track copper on a stack-ADJACENT layer. It
+    is priced exactly like the existing `off_corridor` / `away_from_home_per_mm`
+    terms (weight x `dist_mm`), so a longer run over the aggressor accrues
+    proportionally more - which is what makes it a run-LENGTH penalty without
+    the A* state having to remember any run length. Vias are untouched: a via is
+    a point, not a parallel run."""
     g = win.grid
     lp_kind = layer_purpose.get(net_kind, {})
     layers = win.layers
@@ -4957,6 +4969,16 @@ def _build_fine_cost(
             hit = any(r.covers(nx, ny, rp_near_mm) for r in rasters)
             _rp_cache[key] = hit
         return hit
+
+    # 7.20 crosstalk. `xt_cells is None` is the inert default and means the
+    # `planar` closure below executes byte-for-byte its pre-7.20 arithmetic.
+    xt_cells: dict[str, set[tuple[int, int]]] | None = None
+    xt_pen = 0.0
+    if crosstalk:
+        xt_cells = crosstalk.get("cells") or None
+        xt_pen = float(crosstalk.get("penalty_per_mm", 0.0) or 0.0)
+        if xt_pen <= 0.0:
+            xt_cells = None
 
     def octile_heuristic(cx: int, cy: int) -> int:
         ax, ay = abs(cx - gx), abs(cy - gy)
@@ -5029,6 +5051,13 @@ def _build_fine_cost(
                 extra += weights.away_from_home_per_mm * dist_mm
         if corridor_cells is not None and (ncx, ncy) not in corridor_cells:
             extra += weights.off_corridor * dist_mm
+        if xt_cells is not None:
+            # 7.20: charged on the TARGET cell, per mm travelled into it - the
+            # same shape as the two terms above, so the numpy tier can add it
+            # as one more `(R, C, L, 8)` summand in the identical position.
+            lc = xt_cells.get(layer)
+            if lc is not None and (ncx, ncy) in lc:
+                extra += xt_pen * dist_mm
         if prev_d != -1 and di != prev_d:
             extra += weights.direction_change
         move_milli = weights.q(base + extra)
@@ -5084,6 +5113,10 @@ def _build_fine_cost(
         "return_path_bonus": rp_bonus,
         "multilayer_attachment": multilayer_attachment,
         "min_via_milli": _MIN_VIA_MILLI,
+        # 7.20: exposed so the numpy/gpu backend builds bit-identical cost
+        # arrays. None (the default) means "add no term at all".
+        "crosstalk_cells": xt_cells,
+        "crosstalk_penalty": xt_pen,
     }
 
 
@@ -5184,6 +5217,7 @@ def _fine_astar(
     multilayer_attachment: bool = False,
     return_path: dict[str, Any] | None = None,
     goal_field: bool = False,
+    crosstalk: dict[str, Any] | None = None,
 ) -> list[tuple[int, int, str]] | None:
     """Integer-milli-cost A* over fine (cx, cy, layer) nodes with an octile
     heuristic, mirroring the 7.3a coarse A* cost model (step x layer-purpose x
@@ -5246,7 +5280,7 @@ def _fine_astar(
         win, net_kind, weights, layer_purpose, directions, home_layer,
         corridor_cells, congestion, plane_layers, goal_planes, plane_step,
         attachment_via_cost, goal_cell, goal_layers,
-        multilayer_attachment, return_path, goal_field)
+        multilayer_attachment, return_path, goal_field, crosstalk)
     planar = model["planar"]
     via = model["via"]
     heuristic = model["heuristic"]
@@ -5800,6 +5834,364 @@ def _compute_plane_components_for(
     if cache is not None:
         cache[net] = result
     return result
+
+
+def _seg_point_dist(x1: float, y1: float, x2: float, y2: float,
+                    px: float, py: float) -> float:
+    """Distance from (px, py) to the SEGMENT (x1,y1)-(x2,y2) (not the infinite
+    line). A zero-length segment degrades to point distance."""
+    vx, vy = x2 - x1, y2 - y1
+    L2 = vx * vx + vy * vy
+    if L2 <= 0.0:
+        return math.hypot(px - x1, py - y1)
+    t = ((px - x1) * vx + (py - y1) * vy) / L2
+    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+    return math.hypot(px - (x1 + t * vx), py - (y1 + t * vy))
+
+
+def _crosstalk_bus_groups(project_path: str | Path,
+                          settings: dict[str, Any]) -> list[frozenset[str]]:
+    """Phase 7.20 - the net GROUPS that are allowed to run parallel on adjacent
+    layers without penalty: every `confirmed_buses` entry in the board-local
+    JSON, plus every `detect_buses` candidate.
+
+    Both sources are used deliberately. Confirmed buses are the authoritative
+    user-verified answer, but a board the user has not walked through Flow A on
+    has none, and silently penalising an obviously-detectable SPI bus on such a
+    board would make the feature actively harmful on first use. `detect_buses`
+    candidates cover that case with the SAME structural qualification (shared
+    IC, name signature) Phase 3 already trusts elsewhere.
+
+    FAILURE DIRECTION IS DELIBERATE: any problem reading either source degrades
+    to FEWER exemption groups, never more. Fewer exemptions means more nets are
+    penalised - the feature over-fires rather than silently switching itself off
+    - which is the safe direction for a safety-shaped check (see the exemption
+    discussion in NETCLASS_PLAN.md 7.20: a false exemption is the failure that
+    hides real crosstalk risk)."""
+    groups: list[frozenset[str]] = []
+    try:
+        for entry in _pcb.load_board_local(project_path)["data"].get("confirmed_buses", []):
+            if isinstance(entry, dict) and entry.get("nets"):
+                nets = frozenset(str(n) for n in entry["nets"])
+                if len(nets) >= 2:
+                    groups.append(nets)
+    except Exception:  # pragma: no cover - unreadable/absent state file
+        pass
+    try:
+        cfg = settings.get("bus_detection", {}) or {}
+        det = _pcb.detect_buses(project_path, ic_ref_prefixes=cfg.get("ic_ref_prefixes"))
+        for cand in det.get("candidates", []):
+            nets = frozenset(str(m["net"]) for m in cand.get("nets", []) if m.get("net"))
+            if len(nets) >= 2:
+                groups.append(nets)
+    except (TypeError, AttributeError):
+        # DELIBERATELY NOT swallowed. These are call-signature/programming
+        # errors, and swallowing one is precisely the "silent disable" failure
+        # 7.20 is most exposed to: it costs no test and no warning, the
+        # exemption set just quietly becomes empty and every bus starts paying
+        # a penalty it should not. (This is not hypothetical - an early draft
+        # of this function passed a kwarg `detect_buses` does not accept, and
+        # the broad `except` below hid it completely.) Data problems below stay
+        # tolerated; bugs must surface.
+        raise
+    except Exception:  # netlist missing/stale - confirmed buses still apply
+        pass
+    # De-duplicate while preserving discovery order (determinism).
+    seen: set[frozenset[str]] = set()
+    out: list[frozenset[str]] = []
+    for g in groups:
+        if g not in seen:
+            seen.add(g)
+            out.append(g)
+    return out
+
+
+def _crosstalk_exempt_nets(net: str, groups: list[frozenset[str]]) -> frozenset[str]:
+    """Every net that shares at least one bus group with `net` - i.e. the nets
+    whose adjacent-layer copper `net` may run parallel to for free.
+
+    Note this is a UNION over groups, not a single group: a net that belongs to
+    two buses (a shared clock, say) is exempt against the members of both."""
+    out: set[str] = set()
+    for g in groups:
+        if net in g:
+            out |= g
+    out.discard(net)
+    return frozenset(out)
+
+
+def _crosstalk_window_cells(
+    win: "_FineWindow", obstacles: list["_Obst"], net: str,
+    stack_adjacent: dict[str, list[str]], exempt: frozenset[str],
+    min_spacing_mm: float, min_parallel_run_mm: float,
+) -> dict[str, set[tuple[int, int]]]:
+    """Phase 7.20 - `{layer: {(ix, iy), ...}}`: the window cells on each layer
+    that sit within `min_spacing_mm` (EDGE to centreline) of a DIFFERENT,
+    non-bus-exempt net's track copper on a STACK-ADJACENT copper layer.
+
+    Sources of aggressor copper: whatever is in `obstacles`, which during a run
+    is the live `active_obstacles` list - so this covers BOTH pre-existing board
+    copper AND this run's own placements, with no separate bookkeeping (a
+    placement becomes an `_Obst` the moment it is committed).
+
+    Only `kind == "seg"` copper is an aggressor. Pads and vias are points - they
+    do not form a parallel RUN - and a zone fill is the reference plane the
+    signal is coupled TO, not a broadside aggressor; treating a pour as an
+    aggressor would flag essentially the whole board on a plane-heavy design
+    like kiln and drown the real signal.
+
+    `min_parallel_run_mm` is applied here to the AGGRESSOR SEGMENT'S OWN LENGTH.
+    That is the memoryless reading of the threshold, and it is the only one a
+    per-cell cost term can express: the true quantity ("how far do MY trace and
+    THEIRS stay aligned") is a property of a path that does not exist yet, and
+    threading it into the A* state would multiply the state space by a run-length
+    axis. Segment length upper-bounds the achievable overlap, so this never flags
+    a cell whose true overlap could not reach the threshold, and short incidental
+    crossing stubs - the case the knob exists to excuse - are correctly exempt.
+    The EXACT overlap-length semantics are implemented in `audit_crosstalk`,
+    which measures real emitted geometry and is what the reported numbers use."""
+    out: dict[str, set[tuple[int, int]]] = {}
+    if min_spacing_mm <= 0.0:
+        return out
+    g = win.grid
+    routable = set(win.layers)
+    for ob in obstacles:
+        if ob.kind != "seg" or ob.is_edge:
+            continue
+        if ob.net == net or ob.net in exempt:
+            continue
+        if math.hypot(ob.x2 - ob.x1, ob.y2 - ob.y1) < min_parallel_run_mm:
+            continue
+        # Layers this aggressor threatens: the routable layers stack-adjacent to
+        # any layer it occupies. NOT its own layer (same-layer copper is already
+        # a hard obstacle) and NOT distant layers (a non-adjacent pair has a
+        # reference plane / enough dielectric between it - see 7.20's spec).
+        threatened: set[str] = set()
+        for lo in ob.layers:
+            for la in stack_adjacent.get(lo, ()):
+                if la in routable:
+                    threatened.add(la)
+        if not threatened:
+            continue
+        reach = min_spacing_mm + ob.half
+        ix0 = max(0, int(math.floor((min(ob.x1, ob.x2) - reach - win.minx) / g)))
+        ix1 = min(win.cols - 1, int(math.ceil((max(ob.x1, ob.x2) + reach - win.minx) / g)))
+        iy0 = max(0, int(math.floor((min(ob.y1, ob.y2) - reach - win.miny) / g)))
+        iy1 = min(win.rows - 1, int(math.ceil((max(ob.y1, ob.y2) + reach - win.miny) / g)))
+        if ix0 > ix1 or iy0 > iy1:
+            continue
+        hits: set[tuple[int, int]] = set()
+        for iy in range(iy0, iy1 + 1):
+            for ix in range(ix0, ix1 + 1):
+                px, py = win.node_xy(ix, iy)
+                if _seg_point_dist(ob.x1, ob.y1, ob.x2, ob.y2, px, py) <= reach:
+                    hits.add((ix, iy))
+        if not hits:
+            continue
+        for la in threatened:
+            out.setdefault(la, set()).update(hits)
+    return out
+
+
+def _resolve_crosstalk(
+    settings: dict[str, Any], win: "_FineWindow", obstacles: list["_Obst"],
+    net: str, stack_adjacent: dict[str, list[str]],
+    bus_groups: list[frozenset[str]],
+) -> dict[str, Any] | None:
+    """Build the per-window crosstalk payload, or **None** when the feature is
+    inert - which is the default and the parity guarantee.
+
+    None is returned when `crosstalk.enabled` is false, when
+    `adjacent_layer_penalty_per_mm` is 0, or when no cell in this window is
+    actually flagged. Returning None (rather than a zero-weighted payload) is
+    the whole parity mechanism: `_build_fine_cost` and `_build_cost_arrays` both
+    branch on `crosstalk is None` and, when it is None, execute EXACTLY the
+    pre-7.20 arithmetic - not `+ 0.0`, but no operation at all. An untuned
+    project is therefore byte-identical by construction."""
+    cfg = settings.get("crosstalk", {}) or {}
+    if not cfg.get("enabled", True):
+        return None
+    penalty = float(cfg.get("adjacent_layer_penalty_per_mm", 0.0) or 0.0)
+    if penalty <= 0.0:
+        return None
+    exempt = (_crosstalk_exempt_nets(net, bus_groups)
+              if cfg.get("same_bus_exempt", True) else frozenset())
+    cells = _crosstalk_window_cells(
+        win, obstacles, net, stack_adjacent, exempt,
+        float(cfg.get("min_spacing_mm", 0.3) or 0.0),
+        float(cfg.get("min_parallel_run_mm", 0.0) or 0.0))
+    if not cells:
+        return None
+    return {"penalty_per_mm": penalty, "cells": cells, "exempt": exempt}
+
+
+def _parallel_overlap_mm(a: dict[str, Any], b: dict[str, Any],
+                         min_spacing_mm: float, step: float) -> float:
+    """Length of `a` that runs within `min_spacing_mm` EDGE-to-edge of `b`.
+
+    This is the EXACT quantity 7.20's `min_parallel_run_mm` is defined against -
+    how far the two traces actually stay aligned - as opposed to the aggressor's
+    own length, which is the memoryless upper bound the routing-time cost term
+    uses (see `_crosstalk_window_cells`). Measured by marching along `a`, so a
+    pair that merely CROSSES contributes only the width of the crossing (well
+    under any sane threshold) while a genuine broadside run contributes its full
+    coupled length.
+
+    Edge-to-edge (`- half_a - half_b`) is deliberate and is the one place this
+    differs from the router-time predicate, which measures from the candidate
+    NODE (a centreline point, so no `half_a` to subtract). The audit is the
+    exact/reporting path, so it uses the physically correct gap."""
+    ax1, ay1 = a["start"]["x"], a["start"]["y"]
+    ax2, ay2 = a["end"]["x"], a["end"]["y"]
+    bx1, by1 = b["start"]["x"], b["start"]["y"]
+    bx2, by2 = b["end"]["x"], b["end"]["y"]
+    reach = min_spacing_mm + float(a.get("width", 0.0)) / 2.0 + float(b.get("width", 0.0)) / 2.0
+    L = math.hypot(ax2 - ax1, ay2 - ay1)
+    if L <= 0.0:
+        return 0.0
+    n = max(1, int(math.ceil(L / step)))
+    dt = L / n
+    total = 0.0
+    for i in range(n + 1):
+        t = i / n
+        px, py = ax1 + (ax2 - ax1) * t, ay1 + (ay2 - ay1) * t
+        if _seg_point_dist(bx1, by1, bx2, by2, px, py) <= reach:
+            # Trapezoid-ish: interior samples own a full step, endpoints half.
+            total += dt if 0 < i < n else dt / 2.0
+    return min(total, L)
+
+
+def audit_crosstalk(
+    project_path: str | Path,
+    min_spacing_mm: float | None = None,
+    min_parallel_run_mm: float | None = None,
+    penalty_per_mm: float | None = None,
+    same_bus_exempt: bool | None = None,
+    adjacent_layer_pairs: list[tuple[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Phase 7.20 - measure ACTUAL adjacent-layer parallel runs on a board's
+    existing copper, with the same-bus exemption applied.
+
+    Read-only. This is the exact counterpart to the routing-time cost term: it
+    knows the real emitted geometry, so it applies `min_parallel_run_mm` to the
+    TRUE overlap length rather than to the aggressor's own length.
+
+    Both sides of the exemption are reported: `violations` are the runs that
+    would be penalised, `exempt_runs` are the runs that qualify as parallel but
+    are excused because the two nets share a bus. Reporting the exempt set is
+    the point - it is what makes a false exemption (the failure mode that
+    silently disables the feature) visible instead of invisible.
+
+    `adjacent_layer_pairs` overrides which layer pairs count as stack-adjacent
+    (default: consecutive pairs of the board's own copper stack). It exists for
+    STACK-UP WHAT-IFs: kiln, for instance, carries track copper only on F.Cu and
+    B.Cu - which are three apart in its 4-layer stack, with two plane layers
+    between them - so its real adjacency has no track-vs-track exposure at all.
+    Asking what the same physical routing would cost on a 2-layer stack-up,
+    where F.Cu and B.Cu ARE adjacent, is a real design question and the only way
+    to exercise this board's actual geometry against the term."""
+    board_path, _, _ = _pcb._resolve_project_path(project_path)
+    settings = _pcb.load_pcb_settings(project_path)["config"]
+    cfg = settings.get("crosstalk", {}) or {}
+    spacing = float(cfg.get("min_spacing_mm", 0.3) if min_spacing_mm is None else min_spacing_mm)
+    min_run = float(cfg.get("min_parallel_run_mm", 2.0)
+                    if min_parallel_run_mm is None else min_parallel_run_mm)
+    penalty = float(cfg.get("adjacent_layer_penalty_per_mm", 0.0)
+                    if penalty_per_mm is None else penalty_per_mm)
+    exempt_on = bool(cfg.get("same_bus_exempt", True)
+                     if same_bus_exempt is None else same_bus_exempt)
+
+    all_cu = [l["name"] for l in _pcb._parse_board_layers_cached(board_path)] or ["F.Cu", "B.Cu"]
+    order = {name: i for i, name in enumerate(all_cu)}
+    adjacent_pairs = ([(str(a), str(b)) for a, b in adjacent_layer_pairs]
+                      if adjacent_layer_pairs is not None
+                      else [(all_cu[i], all_cu[i + 1]) for i in range(len(all_cu) - 1)])
+
+    groups = _crosstalk_bus_groups(project_path, settings) if exempt_on else []
+
+    def bus_of(a: str, b: str) -> bool:
+        return any(a in g and b in g for g in groups)
+
+    tracks = _pcb._parse_tracks_cached(Path(board_path))
+    by_layer: dict[str, list[dict[str, Any]]] = {}
+    for s in tracks.get("segments", []):
+        if s.get("layer") in order and s.get("net"):
+            by_layer.setdefault(s["layer"], []).append(s)
+
+    step = max(0.02, min(0.1, min_run / 4.0 if min_run > 0 else 0.1))
+    violations: list[dict[str, Any]] = []
+    exempt_runs: list[dict[str, Any]] = []
+    for la, lb in adjacent_pairs:
+        A, B = by_layer.get(la, []), by_layer.get(lb, [])
+        if not A or not B:
+            continue
+        for a in A:
+            ah = float(a.get("width", 0.0)) / 2.0
+            amnx = min(a["start"]["x"], a["end"]["x"])
+            amxx = max(a["start"]["x"], a["end"]["x"])
+            amny = min(a["start"]["y"], a["end"]["y"])
+            amxy = max(a["start"]["y"], a["end"]["y"])
+            for b in B:
+                if a["net"] == b["net"]:
+                    continue
+                r = spacing + ah + float(b.get("width", 0.0)) / 2.0
+                if (max(b["start"]["x"], b["end"]["x"]) < amnx - r
+                        or min(b["start"]["x"], b["end"]["x"]) > amxx + r
+                        or max(b["start"]["y"], b["end"]["y"]) < amny - r
+                        or min(b["start"]["y"], b["end"]["y"]) > amxy + r):
+                    continue
+                ov = _parallel_overlap_mm(a, b, spacing, step)
+                if ov < min_run or ov <= 0.0:
+                    continue
+                rec = {
+                    "net_a": a["net"], "layer_a": la,
+                    "net_b": b["net"], "layer_b": lb,
+                    "overlap_mm": round(ov, 4),
+                    "penalty": round(ov * penalty, 4),
+                    "uuid_a": a.get("uuid", ""), "uuid_b": b.get("uuid", ""),
+                }
+                if bus_of(a["net"], b["net"]):
+                    rec["exempt_reason"] = "same_bus"
+                    rec["penalty"] = 0.0
+                    exempt_runs.append(rec)
+                else:
+                    violations.append(rec)
+    violations.sort(key=lambda r: (-r["overlap_mm"], r["net_a"], r["net_b"]))
+    exempt_runs.sort(key=lambda r: (-r["overlap_mm"], r["net_a"], r["net_b"]))
+    return {
+        "board": str(board_path),
+        "settings_used": {
+            "min_spacing_mm": spacing, "min_parallel_run_mm": min_run,
+            "adjacent_layer_penalty_per_mm": penalty, "same_bus_exempt": exempt_on,
+        },
+        "layer_stack": all_cu,
+        "adjacent_layer_pairs": [list(p) for p in adjacent_pairs],
+        "bus_group_count": len(groups),
+        "violations": violations,
+        "exempt_runs": exempt_runs,
+        "totals": {
+            "flagged_runs": len(violations),
+            "flagged_parallel_mm": round(sum(r["overlap_mm"] for r in violations), 4),
+            "total_penalty": round(sum(r["penalty"] for r in violations), 4),
+            "exempt_runs": len(exempt_runs),
+            "exempt_parallel_mm": round(sum(r["overlap_mm"] for r in exempt_runs), 4),
+        },
+    }
+
+
+def _crosstalk_for(ctx: dict[str, Any], win: "_FineWindow",
+                   obstacles: list["_Obst"], net: str) -> dict[str, Any] | None:
+    """Per-window 7.20 payload from the run-level `ctx` slices, or None.
+
+    The `crosstalk_adjacent` emptiness check is the fast path: `route_nets` only
+    populates it when the penalty is tuned above 0, so an untuned run returns
+    None here without touching the obstacle list at all."""
+    adj = ctx.get("crosstalk_adjacent") or {}
+    if not adj:
+        return None
+    return _resolve_crosstalk(
+        {"crosstalk": ctx.get("crosstalk_cfg") or {}}, win, obstacles, net, adj,
+        ctx.get("crosstalk_bus_groups") or [])
 
 
 def _reference_plane_rasters(
@@ -6523,6 +6915,7 @@ def _route_one_candidate(
                             home_layer, corridor, win_cong,
                             plane_layers, goal_planes, plane_step, attachment_via_cost,
                             ml_attach, return_path, goal_field,
+                            _crosstalk_for(ctx, win, active_obstacles, net),
                             _settings=ctx.get("gpu_settings"))
         if path is None:
             continue  # unreachable at this (margin, grid) - try the next ladder rung
@@ -6718,6 +7111,7 @@ def _route_wide_lazy(
                         home_layer, None, win_cong, plane_layers, goal_planes,
                         ctx["plane_step"], ctx["attachment_via_cost"],
                         ml_attach, return_path, goal_field,
+                        _crosstalk_for(ctx, win, active_obstacles, net),
                         _settings=ctx.get("gpu_settings"))
     if path is None:
         return None
@@ -6956,6 +7350,7 @@ def _route_hierarchical(
                             home_layer, None, None, plane_layers, leg_goal_planes,
                             plane_step, attachment_via_cost, ml_attach, return_path,
                             goal_field,
+                            _crosstalk_for(ctx, win, active_obstacles, net),
                             _settings=ctx.get("gpu_settings"))
         if path is None and not is_last and leg_goal_layers != set(routable_layers):
             # Intermediate waypoint only: the coarse stage's layer preference
@@ -6969,6 +7364,7 @@ def _route_hierarchical(
                                 home_layer, None, None, plane_layers, leg_goal_planes,
                                 plane_step, attachment_via_cost, ml_attach, return_path,
                                 goal_field,
+                                _crosstalk_for(ctx, win, active_obstacles, net),
                                 _settings=ctx.get("gpu_settings"))
         if path is None:
             return None  # this leg is unreachable even at the finest grid - terminal
@@ -7765,6 +8161,26 @@ def route_nets(
             gnd_tokens, all_cu, routable_set, rp_near_mm)
         for rec in return_path_by_net.values():
             rec["bonus"] = return_path_bonus
+    # Phase 7.20 crosstalk: the two board-wide inputs the per-window payload
+    # needs, resolved ONCE per run. Both are small and picklable, so a spawned
+    # worker flags identically to the parent (no re-reading the netlist per
+    # connection, and no chance of a worker disagreeing about bus membership).
+    #
+    # Like 7.18.3 above, nothing is computed unless the term is actually tuned
+    # on: at the default penalty of 0 the `detect_buses` call - the expensive
+    # part, it parses the netlist - never happens at all.
+    crosstalk_cfg = dict(settings.get("crosstalk", {}) or {})
+    crosstalk_live = (bool(crosstalk_cfg.get("enabled", True))
+                      and float(crosstalk_cfg.get("adjacent_layer_penalty_per_mm", 0.0) or 0.0) > 0.0)
+    crosstalk_bus_groups: list[frozenset[str]] = []
+    crosstalk_adjacent: dict[str, list[str]] = {}
+    if crosstalk_live:
+        _xt_ord = {name: i for i, name in enumerate(all_cu)}
+        crosstalk_adjacent = {
+            L: [o for o in all_cu if abs(_xt_ord[o] - _xt_ord[L]) == 1] for L in all_cu
+        }
+        if crosstalk_cfg.get("same_bus_exempt", True):
+            crosstalk_bus_groups = _crosstalk_bus_groups(project_path, settings)
     ctx: dict[str, Any] = {
         "power_patterns": power_patterns, "routable_layers": routable_layers,
         "routable_set": routable_set, "layer_types": layer_types, "grid": grid,
@@ -7791,6 +8207,12 @@ def route_nets(
         # a spawned worker gates identically to the parent.
         "candidate_fallback": dict(autor.get("candidate_fallback", {}) or {}),
         "return_path_by_net": return_path_by_net,
+        # Phase 7.20: `{}`/`[]` when the penalty is 0 (the default), which makes
+        # `_resolve_crosstalk` return None at every call site and the cost model
+        # take its untouched pre-7.20 branch.
+        "crosstalk_cfg": crosstalk_cfg,
+        "crosstalk_adjacent": crosstalk_adjacent,
+        "crosstalk_bus_groups": crosstalk_bus_groups,
         # Phase 7.12 neck-down: config + per-(ref, pad) copper size + the
         # board's min_track_width DRC floor. Small, picklable primitives -
         # shipped to workers with the rest of `ctx` unchanged.
@@ -8091,6 +8513,12 @@ def route_nets(
             for ob in hand_candidates:
                 win.remove_obstacle(ob)
             win_cong = _project_congestion(win, congestion, board_min[0], board_min[1], grid)
+            # 7.20: copper just RIPPED out of the window is no longer a crosstalk
+            # aggressor either - it is gone. Mirror the `remove_obstacle` calls
+            # above so the re-search prices the window it is actually searching.
+            _ripped_ids = {id(ob) for ob in rippable} | {id(ob) for ob in hand_candidates}
+            _xt_obs = [ob for ob in (core.get("active_obstacles") or [])
+                       if id(ob) not in _ripped_ids]
             free_path = _fine_search(backend, win, core["net_kind"], weights, layer_purpose, directions,
                                      core["s_cell"], core["start_layers"], core["g_cell"],
                                      core["goal_layers"], core["home_layer"], core["corridor"], win_cong,
@@ -8098,6 +8526,7 @@ def route_nets(
                                      plane_step, attachment_via_cost,
                                      ml_attach, (return_path_by_net or {}).get(core["net"]),
                                      bool(ctx.get("goal_field_heuristic", False)),
+                                     _crosstalk_for(ctx, win, _xt_obs, core["net"]),
                                      _settings=ctx.get("gpu_settings"))
             if free_path is not None:
                 via_nodes = _path_via_nodes(free_path)

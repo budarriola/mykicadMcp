@@ -1487,6 +1487,73 @@ The autorouter consumes settings from `pcb_settings.json` under the `autorouter`
 
 ---
 
+## `audit_kicad_crosstalk` — adjacent-layer parallel runs (Phase 7.20)
+
+Measures **broadside crosstalk risk**: places where a trace runs parallel to a *different* net's
+trace on a **stack-adjacent** copper layer.
+
+Adjacency is by the board's own copper stack, and this restriction is the point — a non-adjacent
+pair has a reference plane or enough dielectric between it, so it is not reported. On kiln that is
+decisive: kiln's track copper is only on `F.Cu` (1392 segments) and `B.Cu` (640), which are *three
+apart* in its 4-layer stack, so its real adjacency has **zero** track-vs-track exposure.
+
+The tool reports **both sides of the same-bus exemption**:
+
+| key | meaning |
+| --- | --- |
+| `violations` | runs that would be penalised |
+| `exempt_runs` | runs excused because both nets share a bus (a `confirmed_buses` entry or a `detect_buses` candidate) |
+
+Reporting the exempt set is deliberate: a *false exemption* silently hides real crosstalk risk, and
+is invisible unless shown. Nets on the same bus are expected to run parallel — that is what a bus
+is — but they still pay the penalty against third-party nets, and two *different* buses (kiln's SPI
+`/MainControler/` vs its I2C `/MainControler/`) are **not** exempt against each other.
+
+`adjacent_layer_pairs` overrides stack adjacency for a stack-up what-if. Measured on kiln at
+penalty 4.0/mm, spacing 0.5 mm, min run 1.0 mm, treating `F.Cu`/`B.Cu` as adjacent (the 2-layer
+what-if):
+
+```
+exemption ON : 337 flagged runs / 576.62 mm   23 exempt runs / 31.77 mm
+exemption OFF: 360 flagged runs / 608.39 mm    0 exempt
+```
+
+The 23-run / 31.77 mm delta *is* the exemption, and every one of those runs is a pair of confirmed
+same-bus members (SPI `CLK`/`MISO`/`MOSI`/`CS*`, I2C `SDA`/`SCL`).
+
+### The routing-time counterpart
+
+`audit_kicad_crosstalk` measures existing copper. The **cost term** that avoids creating such runs
+in the first place lives in `route_kicad_board` / `route_kicad_nets` and is configured by the
+`crosstalk` block in `pcb_settings.json`:
+
+```json
+{
+  "crosstalk": {
+    "enabled": true,
+    "adjacent_layer_penalty_per_mm": 0.0,
+    "min_parallel_run_mm": 2.0,
+    "min_spacing_mm": 0.3,
+    "same_bus_exempt": true
+  }
+}
+```
+
+**`adjacent_layer_penalty_per_mm` is 0.0 by default and the term is then completely inert** — no
+cell set is built and the cost model performs no extra arithmetic, so an untuned project routes
+byte-identically to before Phase 7.20. Try `2.0`–`8.0` to make the router genuinely prefer crossing
+at right angles or detouring. `enabled` is a separate master switch so a tuned weight can be
+suspended without losing it.
+
+The two sides apply `min_parallel_run_mm` differently, on purpose. The audit knows the real
+geometry and applies it to the **true overlap length**. The router does not yet have a path, so it
+applies the threshold to the **aggressor segment's own length** — the memoryless upper bound, which
+is the only reading a per-cell cost term can express without adding a run-length axis to the A*
+state. Segment length upper-bounds achievable overlap, so the router never flags a cell whose true
+overlap could not reach the threshold.
+
+---
+
 ## References
 
 - **mykicadMcp/NETCLASS_PLAN.md** — Design document and roadmap (Phases 1–9, including planned

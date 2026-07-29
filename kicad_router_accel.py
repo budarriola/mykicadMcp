@@ -154,8 +154,28 @@ def _build_cost_arrays(
                 off[cy, cx] = False
         corridor_extra = off[:, :, None, None] * (weights.off_corridor * dist_mm)[None, None, None, :]
 
-    # S0 = base + away + corridor  (same float add order as the scalar model).
-    s0 = base + away + corridor_extra
+    # 7.20 crosstalk: per-mm surcharge on a planar move landing on a flagged
+    # cell/layer. Built ONLY when the term is live - when `crosstalk_cells` is
+    # None (the default) not a single array op is added here, which is what
+    # makes an untuned project byte-identical to pre-7.20 (mirrors the scalar
+    # `planar` closure's `xt_cells is not None` branch exactly).
+    xt_cells = model.get("crosstalk_cells")
+    if xt_cells:
+        xt_pen = float(model.get("crosstalk_penalty", 0.0) or 0.0)
+        xt_flag = np.zeros((R, C, L), dtype=bool)
+        for layer, cs in xt_cells.items():
+            if layer not in layer_types:
+                continue
+            li_ = layers.index(layer)
+            for (cx, cy) in cs:
+                if 0 <= cx < C and 0 <= cy < R:
+                    xt_flag[cy, cx, li_] = True
+        crosstalk_extra = xt_flag[..., None] * (xt_pen * dist_mm)[None, None, None, :]
+        # Same summand ORDER as the scalar model: base + away + corridor + xt.
+        s0 = base + away + corridor_extra + crosstalk_extra
+    else:
+        # S0 = base + away + corridor (same float add order as the scalar model).
+        s0 = base + away + corridor_extra
     s1 = s0 + weights.direction_change
 
     q0 = np.rint(s0 * 1000.0).astype(np.int64)
@@ -257,6 +277,12 @@ def fine_wavefront(
     # makes this tier's output provably independent of the flag - and therefore
     # the fixed point that cpu-with-field and cpu-without-field both match.
     goal_field: bool = False,
+    # Phase 7.20 crosstalk. UNLIKE `goal_field` above, this one IS forwarded to
+    # `_build_fine_cost`: it is a genuine cost-model term (it changes what a move
+    # COSTS, not merely how the frontier is ordered), so a tier that ignored it
+    # would compute a different field and break parity. It keeps the same
+    # positional slot `_fine_astar` uses, ahead of `xp`.
+    crosstalk: "dict[str, Any] | None" = None,
     xp: Any = None,
 ) -> "list[tuple[int, int, str]] | None":
     """numpy/GPU detailed search — drop-in for `kicad_router_tool._fine_astar`.
@@ -287,7 +313,7 @@ def fine_wavefront(
         win, net_kind, weights, layer_purpose, directions, home_layer,
         corridor_cells, congestion, plane_layers, goal_planes, plane_step,
         attachment_via_cost, goal_cell, goal_layers,
-        multilayer_attachment, return_path)
+        multilayer_attachment, return_path, False, crosstalk)
     li = model["li"]
     # 7.19.1: pinned octile tie-break (see the `goal_field` parameter comment).
     heuristic = model["tiebreak_heuristic"]

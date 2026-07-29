@@ -4911,6 +4911,35 @@ DEFAULT_PCB_SETTINGS: dict[str, Any] = {
         "near_high_speed_pitch_mm": 2.0,
         "enabled": True,
     },
+    # Phase 7.20 - adjacent-layer parallel-trace (crosstalk) avoidance.
+    #
+    # `adjacent_layer_penalty_per_mm` is the ON/OFF switch that matters: at 0.0
+    # (the default) the whole term is not merely weighted to zero, it is never
+    # constructed - `_resolve_crosstalk` returns None, no cell set is built, and
+    # neither the scalar `planar` closure nor `_build_cost_arrays` grows a
+    # single float operation. That is what makes an untuned project provably
+    # BYTE-IDENTICAL to pre-7.20 routing, by construction rather than by
+    # floating-point argument (same discipline as `plane.return_path_bonus`).
+    #
+    # `enabled` is a separate master switch so a project that HAS tuned a
+    # weight can suspend the feature without losing the tuned number.
+    "crosstalk": {
+        "enabled": True,
+        # Cost per mm of trace run that sits over/under a DIFFERENT net's
+        # copper on a stack-ADJACENT copper layer. Try ~2.0-8.0 to make the
+        # router genuinely prefer crossing at right angles / detouring.
+        "adjacent_layer_penalty_per_mm": 0.0,
+        # Adjacent-layer copper shorter than this is incidental overlap (a
+        # crossing, a pad stub), not a coupled parallel run, and is exempt.
+        "min_parallel_run_mm": 2.0,
+        # XY offset within which two layers' traces count as "aligned"
+        # (broadside-coupled). Beyond this the coupling falls off fast.
+        "min_spacing_mm": 0.3,
+        # Nets that belong to the same confirmed/detected bus are EXPECTED to
+        # run parallel - that is the point of a bus - so they never penalise
+        # each other. They still pay the penalty against third-party nets.
+        "same_bus_exempt": True,
+    },
     "schematic_checks": {
         "cap_voltage": {
             "derating_min_ratio": 2.0,
