@@ -39,6 +39,7 @@ from pathlib import Path
 import pytest
 
 import kicad_pcb_tool as pcb
+import kicad_router_accel as accel
 import kicad_router_tool as router
 
 _LAYERS = ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
@@ -225,6 +226,73 @@ def test_penalty_is_charged_per_mm_on_a_flagged_cell():
     diag_delta = withx["planar"](ix, iy, "F.Cu", 4, -1) - base["planar"](ix, iy, "F.Cu", 4, -1)
     straight_delta = straight_x - straight_base
     assert diag_delta == pytest.approx(straight_delta * router._SQRT2, rel=1e-3)
+
+
+# --------------------------------------------------------------------------- #
+# 3b. cpu vs numpy tier parity WITH the term live
+# --------------------------------------------------------------------------- #
+
+def _tier_window():
+    """A window with a real decision to make (round the wall on F.Cu, or via to
+    In1.Cu and straight across) AND an In2.Cu aggressor that makes the In1.Cu
+    crossing expensive - so the crosstalk term genuinely participates in the
+    choice rather than being a constant offset."""
+    layers = ["F.Cu", "In1.Cu", "In2.Cu"]
+    types = {n: "signal" for n in layers}
+    win = router._FineWindow(-1.0, -3.0, 11.0, 5.0, 0.25, layers, types, "NET")
+    win.build([router._Obst("seg", "WALL", frozenset(["F.Cu"]), 0.3,
+                            5.0, -3.0, 5.0, 2.0)], 0.1, 0.3, 0.2, 0.2)
+    return win, layers
+
+
+def test_cpu_and_numpy_tiers_agree_with_the_crosstalk_term_active():
+    """The 7.8 parity guarantee must survive a NEW cost term. If the numpy
+    `_build_cost_arrays` summand were placed in a different position (or
+    omitted, as `goal_field` deliberately is) the two tiers would silently
+    diverge - this is the test that would catch it."""
+    win, layers = _tier_window()
+    order = {n: i for i, n in enumerate(layers)}
+    adj = {L: [o for o in layers if abs(order[o] - order[L]) == 1] for L in layers}
+    pay = router._resolve_crosstalk(
+        _settings(min_parallel_run_mm=1.0, min_spacing_mm=0.6),
+        win, [_seg("AGGRESSOR", "In2.Cu", 0.0, 0.0, 10.0, 0.0)], "NET", adj, [])
+    assert pay is not None and pay["cells"], "term must be live for this to prove anything"
+    s = win.nearest_free(0.0, 0.0, layers, max_ring=max(win.cols, win.rows))
+    g = win.nearest_free(10.0, 0.0, layers, max_ring=max(win.cols, win.rows))
+    args = (win, "signal", router._Weights({}, 1.0), {}, {}, s, layers, g,
+            set(layers), None, None, None, None, None, 0.0, 0.0, False, None,
+            False, pay)
+    assert router._fine_astar(*args) == accel.fine_wavefront(*args)
+
+
+def test_crosstalk_term_changes_the_chosen_path():
+    """Sanity that the term is not merely a constant offset: a heavy penalty on
+    one layer must actually move the route off it."""
+    win, layers = _tier_window()
+    order = {n: i for i, n in enumerate(layers)}
+    adj = {L: [o for o in layers if abs(order[o] - order[L]) == 1] for L in layers}
+    s = win.nearest_free(0.0, 0.0, layers, max_ring=max(win.cols, win.rows))
+    g = win.nearest_free(10.0, 0.0, layers, max_ring=max(win.cols, win.rows))
+
+    def run(pay):
+        return router._fine_astar(
+            win, "signal", router._Weights({}, 1.0), {}, {}, s, layers, g,
+            set(layers), None, None, None, None, None, 0.0, 0.0, False, None,
+            False, pay)
+
+    # The aggressor sits on In2.Cu directly under the In1.Cu corridor the
+    # unpenalised route uses, so the term bears on the actual decision.
+    heavy = router._resolve_crosstalk(
+        _settings(adjacent_layer_penalty_per_mm=500.0, min_parallel_run_mm=1.0,
+                  min_spacing_mm=1.5),
+        win, [_seg("AGGRESSOR", "In2.Cu", 0.0, 0.0, 10.0, 0.0)], "NET", adj, [])
+    assert heavy is not None
+    free_route = run(None)
+    # Precondition: the unpenalised route really does use the corridor we are
+    # about to make expensive - otherwise this test proves nothing.
+    assert any((cx, cy) in heavy["cells"].get(layer, set())
+               for (cx, cy, layer) in free_route)
+    assert free_route != run(heavy)
 
 
 # --------------------------------------------------------------------------- #
