@@ -4881,6 +4881,23 @@ DEFAULT_PCB_SETTINGS: dict[str, Any] = {
         # unconditional and deliberately has NO knob - two overlapping drilled
         # holes are never physically valid.
         "allow_via_in_pad": False,
+        # Phase 7.22 - route bus members (confirmed_buses + detect_buses
+        # candidates, resolved by `_crosstalk_bus_groups`) BEFORE every other
+        # connection in `route_nets`' worklist. ON by default: this is the
+        # user's directive ("when routing start with the busses..."), and it is
+        # self-inerting - a board with no detected/confirmed bus has an empty
+        # member set and sorts on the literal pre-7.22 key. Set False to pin
+        # the old (priority, airline, name) order exactly.
+        "bus_first": True,
+        # Phase 7.22 directness, OFF (0.0) by default. When > 0, a bus member's
+        # FIRST routing attempt is discounted toward the straight pad-to-pad
+        # line (a corridor of this half-width) instead of toward the global
+        # stage's coarse path - which is what actually removes the bowing that
+        # `off_direction` + via costs produce even on a totally empty board.
+        # It reuses the existing `cost.off_corridor` weight, so nothing new is
+        # priced; 0.0 skips the branch entirely rather than weighting it to
+        # zero. Rip-up re-routes are corridor-free and so never see it.
+        "bus_first_direct_corridor_mm": 0.0,
         "acceleration": "auto",
         "gpu": {"memory_budget_mb": 0, "batch": "auto", "oom_fallback": True},
         "cpu": {"workers": 0, "ram_budget_mb": 0, "replicas": "auto", "replica_sync": "chunk_end"},

@@ -5796,6 +5796,54 @@ def _corridor_from_global(win: _FineWindow, global_conn: dict[str, Any] | None,
     return cells or None
 
 
+def _straight_line_corridor(win: _FineWindow, from_xy: tuple[float, float],
+                            to_xy: tuple[float, float],
+                            half_width_mm: float) -> set[tuple[int, int]] | None:
+    """Phase 7.22 - fine window nodes within `half_width_mm` of the STRAIGHT
+    pad-to-pad line, in the same shape/units `_corridor_from_global` produces
+    (a set of `(ix, iy)` window cells, square-stamped exactly the way that
+    function stamps its coarse-path cells, so the two are interchangeable at
+    the one call site that chooses between them).
+
+    This is the whole of 7.22's "directness" lever: instead of discounting the
+    detailed search toward the GLOBAL stage's chosen coarse path (which carries
+    the same layer-direction and congestion bias the fine search has, so an
+    against-axis run is already bowed into a diagonal V before detailed routing
+    ever sees it), it discounts toward the airline itself. No new cost term is
+    introduced anywhere - the existing `off_corridor` weight prices leaving this
+    set exactly as it prices leaving the global one, so `_build_fine_cost`,
+    `_build_cost_arrays` and the numpy/GPU tiers are untouched and stay
+    bit-identical across backends.
+
+    `half_width_mm <= 0` returns None (the default, never reached - the caller
+    branches on the knob before calling).
+
+    HONEST RESIDUAL: only the ordinary `_route_one_candidate` ladder consults
+    this. The Phase-5.x hierarchical last-resort tier (`_route_hierarchical`,
+    reached only after every rung of that ladder has already failed) keeps
+    following the global stage's coarse path, exactly as 7.12's neck-down is
+    also not wired into that tier - a bus net that only routes via that rare
+    fallback lands on the coarse corridor, not on its airline."""
+    if half_width_mm <= 0.0:
+        return None
+    ax, ay = from_xy
+    bx, by = to_xy
+    length = math.hypot(bx - ax, by - ay)
+    # Half-cell sampling along the line: dense enough that consecutive stamps
+    # always overlap, so the corridor is a connected tube and not a dotted one.
+    steps = max(1, int(math.ceil(length / win.grid)) * 2)
+    rr = int(math.ceil(half_width_mm / win.grid))
+    cells: set[tuple[int, int]] = set()
+    for i in range(steps + 1):
+        t = i / steps
+        cix, ciy = win.cell_of(ax + (bx - ax) * t, ay + (by - ay) * t)
+        for iy in range(ciy - rr, ciy + rr + 1):
+            for ix in range(cix - rr, cix + rr + 1):
+                if win.in_bounds(ix, iy):
+                    cells.add((ix, iy))
+    return cells or None
+
+
 # --------------------------------------------------------------------------- #
 # Step 4 - rip-up & reroute (PathFinder-style negotiated congestion) helpers
 # --------------------------------------------------------------------------- #
@@ -6008,6 +6056,26 @@ def _crosstalk_exempt_nets(net: str, groups: list[frozenset[str]]) -> frozenset[
         if net in g:
             out |= g
     out.discard(net)
+    return frozenset(out)
+
+
+def _bus_member_nets(groups: list[frozenset[str]]) -> frozenset[str]:
+    """Phase 7.22 - the flat set of every net that belongs to ANY bus group.
+
+    `groups` is whatever `_crosstalk_bus_groups` returned, and the failure
+    direction is inherited unchanged from it BY CONSTRUCTION: that function
+    degrades to FEWER groups whenever either source (board-local
+    `confirmed_buses`, `detect_buses` candidates) is unreadable, so this
+    degrades to FEWER bus-member nets. For 7.22 that means fewer nets get the
+    early slot in the worklist and the ordering falls back toward the
+    pre-7.22 (priority, airline, name) order - never the other way round,
+    where a mis-read would silently promote nets the user never called a bus.
+    That is the same "fail toward the conservative side" convention 7.20
+    established for this exact data source; it is deliberately NOT a second,
+    independently-derived notion of bus membership."""
+    out: set[str] = set()
+    for g in groups:
+        out |= g
     return frozenset(out)
 
 
@@ -6955,6 +7023,16 @@ def _route_one_candidate(
     # Phase 7.19.1 obstacle-aware goal-distance heuristic (default off).
     goal_field = bool(ctx.get("goal_field_heuristic", False))
     return_path = (ctx.get("return_path_by_net") or {}).get(net)
+    # Phase 7.22 bus-first DIRECTNESS (default off). Non-zero ONLY when
+    # `autorouter.bus_first_direct_corridor_mm` > 0 AND this connection's net is
+    # a bus member (`bus_first_direct_nets` - empty unless the knob is on AND a
+    # bus was actually found). At the shipped default of 0.0 that set is never
+    # even built, this stays 0.0, and the corridor call site below takes its
+    # untouched pre-7.22 `_corridor_from_global` branch: no extra float
+    # operation anywhere, not a zero-weighted term.
+    direct_corridor_mm = 0.0
+    if net in (ctx.get("bus_first_direct_nets") or frozenset()):
+        direct_corridor_mm = float(ctx.get("bus_first_direct_corridor_mm", 0.0) or 0.0)
 
     # Ordered (margin, grid) attempts: attempt 1 is the legacy (base_margin,
     # adaptive-grid) pair (so any connection that already routes on it is
@@ -7005,8 +7083,16 @@ def _route_one_candidate(
                                   toward_xy=to_xy if pad_escape_aware else None) or win.cell_of(*from_xy)
         g_cell = win.nearest_free(to_xy[0], to_xy[1], list(goal_layers),
                                   toward_xy=from_xy if pad_escape_aware else None) or win.cell_of(*to_xy)
-        corridor = (_corridor_from_global(win, gconn, coarse_grid, coarse_min,
-                                          candidate_index) if use_corridor else None)
+        if direct_corridor_mm > 0.0 and use_corridor:
+            # Phase 7.22 first bus pass. `use_corridor` is what scopes this to
+            # the FIRST attempt at this connection: every rip-up re-route calls
+            # `_route_one` with use_corridor=False (corridor-free by design),
+            # so a bus net that gets ripped and re-routed later negotiates
+            # normally instead of being pinned back onto its airline.
+            corridor = _straight_line_corridor(win, from_xy, to_xy, direct_corridor_mm)
+        else:
+            corridor = (_corridor_from_global(win, gconn, coarse_grid, coarse_min,
+                                              candidate_index) if use_corridor else None)
         win_cong = _project_congestion(win, congestion, board_min[0], board_min[1], grid)
         out.update({"win": win, "s_cell": s_cell, "g_cell": g_cell,
                     "corridor": corridor, "margin": margin,
@@ -8235,9 +8321,50 @@ def route_nets(
         if nets is not None:
             wanted = set(nets)
             conns = [c for c in conns if c.get("net") in wanted]
-    conns = sorted(conns, key=lambda c: (-float(c.get("priority", 0.0)),
-                                         float(c.get("airline_length_mm", 0.0)),
-                                         c.get("net", "")))
+    # -- Phase 7.22 bus-first ordering -------------------------------------- #
+    # User directive (2026-07-29): "when routing start with the busses in the
+    # most direct line, they can be riped up and optimized later."
+    #
+    # Bus membership comes from `_crosstalk_bus_groups` - the SAME resolver
+    # 7.20 already uses below for the crosstalk exemption, called once and
+    # shared, so the worklist and the cost model can never disagree about what
+    # a bus is. Its failure direction (fewer groups on any read problem)
+    # carries straight through `_bus_member_nets`: fewer nets get the early
+    # slot, never more.
+    #
+    # `bus_first` ships ON (it IS the deliverable), but the term is INERT the
+    # moment the board has no buses: `bus_member_nets` is empty and the sort
+    # below takes the literal pre-7.22 key, so an untuned bus-less board routes
+    # byte-identically to before this phase.
+    bus_first = bool(autor.get("bus_first", True))
+    bus_groups_resolved: list[frozenset[str]] | None = None
+    bus_member_nets: frozenset[str] = frozenset()
+    if bus_first:
+        bus_groups_resolved = _crosstalk_bus_groups(project_path, settings)
+        bus_member_nets = _bus_member_nets(bus_groups_resolved)
+    if bus_member_nets:
+        # A leading 0/1 group key, so bus members sort STRICTLY before every
+        # non-member while the existing key is preserved verbatim behind it -
+        # user `net_overrides.priority` still orders within each group, and the
+        # shortest-airline-then-name tie-break still settles the rest.
+        conns = sorted(conns, key=lambda c: (0 if c.get("net", "") in bus_member_nets else 1,
+                                             -float(c.get("priority", 0.0)),
+                                             float(c.get("airline_length_mm", 0.0)),
+                                             c.get("net", "")))
+    else:
+        conns = sorted(conns, key=lambda c: (-float(c.get("priority", 0.0)),
+                                             float(c.get("airline_length_mm", 0.0)),
+                                             c.get("net", "")))
+    # Phase 7.22 directness knob, default 0.0 = off. Only a bus member can ever
+    # be in this set, and only when the knob is tuned on, so `_route_one_
+    # candidate`'s `direct_corridor_mm` stays 0.0 for every connection on a
+    # default project. NOTE this deliberately adds NO conflict avoidance: the
+    # straight-line corridor ignores what has and has not routed yet, exactly
+    # as the user asked ("they can be riped up and optimized later") - rip-up
+    # (7.3b step 4) and Phase 7.6 remain the reconciliation mechanisms.
+    bus_first_direct_corridor_mm = float(autor.get("bus_first_direct_corridor_mm", 0.0) or 0.0)
+    bus_first_direct_nets = (bus_member_nets if bus_first_direct_corridor_mm > 0.0
+                             else frozenset())
 
     # global stage (for home layer + corridor), routed on the same connections.
     global_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
@@ -8294,7 +8421,11 @@ def route_nets(
             L: [o for o in all_cu if abs(_xt_ord[o] - _xt_ord[L]) == 1] for L in all_cu
         }
         if crosstalk_cfg.get("same_bus_exempt", True):
-            crosstalk_bus_groups = _crosstalk_bus_groups(project_path, settings)
+            # Phase 7.22 shares the ONE resolution when `bus_first` already made
+            # it (identical arguments, so an identical value - this only avoids
+            # a second netlist parse, it can never change what is resolved).
+            crosstalk_bus_groups = (bus_groups_resolved if bus_groups_resolved is not None
+                                    else _crosstalk_bus_groups(project_path, settings))
     ctx: dict[str, Any] = {
         "power_patterns": power_patterns, "routable_layers": routable_layers,
         "routable_set": routable_set, "layer_types": layer_types, "grid": grid,
@@ -8344,6 +8475,13 @@ def route_nets(
         # companion via-on-via rule is UNCONDITIONAL and needs no knob. Small
         # picklable bool, so a spawned worker gates identically to the parent.
         "allow_via_in_pad": allow_via_in_pad,
+        # Phase 7.22 bus-first directness. `frozenset()` / 0.0 at the shipped
+        # default, which makes `_route_one_candidate`'s `direct_corridor_mm`
+        # 0.0 for every connection and leaves the corridor choice on its
+        # untouched `_corridor_from_global` branch. Small picklable primitives,
+        # so a spawned worker gates identically to the parent.
+        "bus_first_direct_nets": bus_first_direct_nets,
+        "bus_first_direct_corridor_mm": bus_first_direct_corridor_mm,
         # Picklable "recipe" fields used ONLY to let a worker process rebuild
         # `base_obstacles`/`plane_by_net` locally instead of receiving them
         # through pickle (see `_worker_init`) - never read by `_route_one`.
