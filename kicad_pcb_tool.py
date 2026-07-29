@@ -4873,6 +4873,14 @@ DEFAULT_PCB_SETTINGS: dict[str, Any] = {
         # deliberate before/after `benchmark_kicad_autoroute` comparison (see
         # NETCLASS_PLAN.md's 7.3d section) - never as a casual default change.
         "pad_escape_direction_aware": False,
+        # Phase 7.21: a via may never land inside a footprint pad (same-net or
+        # foreign) unless this is turned on. Via-in-pad is a deliberate
+        # manufacturing technique (filled + plated over), so it must be an
+        # explicit opt-in, never something the autorouter does implicitly.
+        # NOTE: the companion "two vias may never overlap" rule is
+        # unconditional and deliberately has NO knob - two overlapping drilled
+        # holes are never physically valid.
+        "allow_via_in_pad": False,
         "acceleration": "auto",
         "gpu": {"memory_budget_mb": 0, "batch": "auto", "oom_fallback": True},
         "cpu": {"workers": 0, "ram_budget_mb": 0, "replicas": "auto", "replica_sync": "chunk_end"},

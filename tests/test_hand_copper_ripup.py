@@ -239,12 +239,12 @@ def _patch_self_check_for_b(monkeypatch, violation: dict, fail_calls: int = 2):
     real_self_check = router._self_check
     counts = {"B": 0}
 
-    def fake(net, segments, vias, obstacles, rules, via_radius):
+    def fake(net, segments, vias, obstacles, rules, via_radius, *args, **kwargs):
         if net == "B":
             counts["B"] += 1
             if 2 <= counts["B"] <= 1 + fail_calls:
                 return [violation]
-        return real_self_check(net, segments, vias, obstacles, rules, via_radius)
+        return real_self_check(net, segments, vias, obstacles, rules, via_radius, *args, **kwargs)
 
     monkeypatch.setattr(router, "_self_check", fake)
     return counts

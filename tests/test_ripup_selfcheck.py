@@ -87,12 +87,12 @@ def _patch_self_check_for_b(monkeypatch, owner_to_blame: int | None, fail_calls:
     real_self_check = router._self_check
     counts = {"B": 0}
 
-    def fake(net, segments, vias, obstacles, rules, via_radius):
+    def fake(net, segments, vias, obstacles, rules, via_radius, *args, **kwargs):
         if net == "B":
             counts["B"] += 1
             if 2 <= counts["B"] <= 1 + fail_calls:
                 return [_fake_violation(owner_to_blame)]
-        return real_self_check(net, segments, vias, obstacles, rules, via_radius)
+        return real_self_check(net, segments, vias, obstacles, rules, via_radius, *args, **kwargs)
 
     monkeypatch.setattr(router, "_self_check", fake)
     return counts
