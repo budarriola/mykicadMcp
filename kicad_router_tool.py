@@ -3956,6 +3956,30 @@ class _Obst:
         return _dist_point_segment(self.x1, self.y1, ax, ay, bx, by) < need
 
 
+def _same_net_blocks_via(ob: "_Obst", allow_via_in_pad: bool) -> bool:
+    """Phase 7.21 — does this SAME-NET, non-edge obstacle still block a VIA?
+
+    "Same-net copper is free" is correct for TRACKS (a route legitimately runs
+    alongside / touches its own net's copper) but wrong for VIAS in exactly two
+    cases, and this predicate is the single source of truth for both. Callers
+    must have already established `ob.net == <routed net> and not ob.is_edge`;
+    it says nothing about tracks, which stay unconditionally exempt.
+
+    - PAD (`is_pad`): a via must not land inside a footprint pad unless the user
+      opts in via `autorouter.allow_via_in_pad` (default False). Via-in-pad is a
+      deliberate manufacturing technique (filled/plated), never something the
+      router should do implicitly. `allow_via_in_pad=True` restores the
+      pre-7.21 behavior exactly (same-net pads via-permeable).
+    - EXISTING VIA (`kind == "pt"` and not `is_pad`): two overlapping drilled
+      holes are never physically valid, same net or not. UNCONDITIONAL — no
+      config gate.
+
+    Everything else (same-net segments, same-net zone fills) stays free."""
+    if ob.is_pad:
+        return not allow_via_in_pad
+    return ob.kind == "pt"
+
+
 def _edge_cut_segments(board_path: Path) -> list[tuple[float, float, float, float]]:
     """Edge.Cuts geometry as line segments: gr_line as one segment, gr_rect as
     its four sides. gr_poly points as consecutive segments. gr_arc/gr_circle are
@@ -4310,11 +4334,11 @@ class _FineWindow:
                  "blocked_track", "blocked_via", "net",
                  "_track_cnt", "_via_cnt", "_track_half", "_via_radius",
                  "_clearance", "_edge_clearance", "_zone_cache",
-                 "_lazy", "_index", "_zgrids")
+                 "_lazy", "_index", "_zgrids", "allow_via_in_pad")
 
     def __init__(self, minx: float, miny: float, maxx: float, maxy: float, grid: float,
                  layers: list[str], layer_types: dict[str, str], net: str,
-                 lazy: bool = False) -> None:
+                 lazy: bool = False, allow_via_in_pad: bool = False) -> None:
         self.grid = grid
         self.minx, self.miny = minx, miny
         self.cols = max(2, int(math.ceil((maxx - minx) / grid)) + 1)
@@ -4322,6 +4346,9 @@ class _FineWindow:
         self.layers = layers
         self.layer_types = layer_types
         self.net = net
+        # Phase 7.21: `autorouter.allow_via_in_pad` (default False). Read ONLY
+        # through `_same_net_via_blocks` below - see `_same_net_blocks_via`.
+        self.allow_via_in_pad = bool(allow_via_in_pad)
         # `blocked_*` are the sets A* reads; `_*_cnt` are the per-cell reference
         # counts backing them, so an obstacle can be added OR removed
         # incrementally (a cell stays blocked while any obstacle still reaches
@@ -4364,13 +4391,22 @@ class _FineWindow:
     def in_bounds(self, ix: int, iy: int) -> bool:
         return 0 <= ix < self.cols and 0 <= iy < self.rows
 
+    def _same_net_via_blocks(self, ob: "_Obst") -> bool:
+        """Phase 7.21: this window's net-aware wrapper over `_same_net_blocks_via`
+        - True when a same-net, non-edge obstacle must STILL block vias."""
+        return _same_net_blocks_via(ob, self.allow_via_in_pad)
+
     def obstacle_cells(self, ob: "_Obst") -> tuple[set[tuple[int, int]], dict[str, set[tuple[int, int]]]]:
         """The window cells this obstacle blocks: (via_cells, {layer: track_cells}).
 
         Pure geometry (uses the window's stored track/via/clearance params) so it
         is identical whether called during the bulk build, an incremental add, an
         incremental remove, or the rip-up on-path blocker test - a single source
-        of truth for "which cells does this copper occupy"."""
+        of truth for "which cells does this copper occupy".
+
+        Phase 7.21: a same-net non-edge obstacle is free for TRACKS always, but
+        a same-net PAD (unless `allow_via_in_pad`) or a same-net EXISTING VIA
+        still contributes VIA cells - see `_same_net_blocks_via`."""
         g = self.grid
         track_half = self._track_half
         via_radius = self._via_radius
@@ -4383,8 +4419,13 @@ class _FineWindow:
         wmaxy = self.miny + (self.rows - 1) * g + g
         via_cells: set[tuple[int, int]] = set()
         track_cells: dict[str, set[tuple[int, int]]] = {}
-        if ob.net == self.net and not ob.is_edge:
+        same_net = ob.net == self.net and not ob.is_edge
+        if same_net and not self._same_net_via_blocks(ob):
             return via_cells, track_cells  # same-net copper is free
+        # A same-net obstacle that survives the line above blocks VIAS ONLY
+        # (7.21): tracks stay free against it, so `block_track` is False and
+        # `track_cells` stays empty for it below.
+        block_track = not same_net
         reach = max(track_half, via_radius) + max(clearance, edge_clearance) + ob.half + margin
         if (ob.maxx < wminx - reach or ob.minx > wmaxx + reach
                 or ob.maxy < wminy - reach or ob.miny > wmaxy + reach):
@@ -4392,7 +4433,11 @@ class _FineWindow:
         cl = edge_clearance if ob.is_edge else clearance
         track_reach = track_half + cl + ob.half + margin
         via_reach = via_radius + cl + ob.half + margin
-        big = max(track_reach, via_reach)
+        # 7.21: a via-only (same-net) obstacle never needs the track reach, so
+        # the scan box is sized by `via_reach` alone. Cell membership below is
+        # decided by `via_reach` either way, so this is a tightening of the
+        # scan bound only - never a change to the resulting cell set.
+        big = max(track_reach, via_reach) if block_track else via_reach
         ix0 = max(0, int(math.floor((ob.minx - big - self.minx) / g)))
         ix1 = min(self.cols - 1, int(math.ceil((ob.maxx + big - self.minx) / g)))
         iy0 = max(0, int(math.floor((ob.miny - big - self.miny) / g)))
@@ -4434,13 +4479,13 @@ class _FineWindow:
                     dmin = 0.0 if inside else zgrid.min_dist(px, py)
                     if block_via and dmin < via_reach:
                         via_cells.add((ix, iy))
-                    if dmin < track_reach:
+                    if block_track and dmin < track_reach:
                         for l in ob_layers:
                             track_cells[l].add((ix, iy))
                     continue
                 if block_via and ob.point_within(px, py, via_reach):
                     via_cells.add((ix, iy))
-                if ob.point_within(px, py, track_reach):
+                if block_track and ob.point_within(px, py, track_reach):
                     for l in ob_layers:
                         track_cells[l].add((ix, iy))
         return via_cells, track_cells
@@ -4496,7 +4541,7 @@ class _FineWindow:
         independent of the fine grid — the whole point of the tier."""
         entries: list[tuple[_Obst, float]] = []
         for ob in obstacles:
-            if ob.net == self.net and not ob.is_edge:
+            if ob.net == self.net and not ob.is_edge and not self._same_net_via_blocks(ob):
                 continue  # same-net copper is free (obstacle_cells' first line)
             if self._window_rejects(ob):
                 continue
@@ -4519,6 +4564,11 @@ class _FineWindow:
         ix, iy = cell
         px, py = self.node_xy(ix, iy)
         for ob in idx.query(px, py):
+            if layer is not None and ob.net == self.net and not ob.is_edge:
+                # 7.21 mirror of `obstacle_cells`' `block_track`: the only
+                # same-net obstacles `_lazy_build` indexes are via-blockers, and
+                # they contribute NO track cells.
+                continue
             if layer is None:
                 # `obstacle_cells` adds via cells WITHOUT consulting ob.layers.
                 if ob.via_transparent:
@@ -4543,7 +4593,9 @@ class _FineWindow:
 
     def add_obstacle(self, ob: "_Obst") -> None:
         if self._lazy:
-            if not (ob.net == self.net and not ob.is_edge) and not self._window_rejects(ob):
+            same_net_free = (ob.net == self.net and not ob.is_edge
+                             and not self._same_net_via_blocks(ob))
+            if not same_net_free and not self._window_rejects(ob):
                 if self._index is None:
                     self._index = _ObstacleIndex([], max(self.grid * 8.0, 2.0),
                                                  (self.minx, self.miny))
@@ -5526,11 +5578,20 @@ def _is_hand_copper_obstacle(ob: "_Obst") -> bool:
 def _self_check(
     net: str, segments: list[dict[str, Any]], vias: list[dict[str, Any]],
     obstacles: list["_Obst"], rules: dict[str, Any], via_radius: float,
+    allow_via_in_pad: bool = False,
 ) -> list[dict[str, Any]]:
     """Prove every proposed segment/via against ALL foreign copper at netclass
     clearance (edge-to-edge >= clearance). Returns a list of violation records;
     empty means the route is DRC-safe to emit. Same-net obstacles are skipped
-    (a route legitimately touches its own endpoints' copper).
+    for SEGMENTS (a route legitimately touches its own endpoints' copper).
+
+    PHASE 7.21 — same-net obstacles are NO LONGER blanket-skipped for VIAS. A
+    proposed via is checked against a same-net PAD (unless `allow_via_in_pad`,
+    from `autorouter.allow_via_in_pad`, default False) and ALWAYS against a
+    same-net EXISTING VIA; two drilled holes may never overlap. This is the
+    gate that previously let via-in-pad and via-on-via reach the board
+    unflagged, since it never checked a via against same-net copper at all.
+    Segment checking is unchanged - same-net copper stays free for tracks.
 
     Each violation carries `owner`: None for existing/human board copper (never
     rippable) or the integer connection id that owns the colliding AUTOROUTER-
@@ -5551,11 +5612,14 @@ def _self_check(
     edge_cl = rules["edge_clearance"]
     violations: list[dict[str, Any]] = []
     for ob in obstacles:
-        if ob.net == net and not ob.is_edge:
+        same_net = ob.net == net and not ob.is_edge
+        if same_net and not _same_net_blocks_via(ob, allow_via_in_pad):
             continue
         cl = edge_cl if ob.is_edge else clearance
         ob_layers = ob.layers
-        for s in segments:
+        # 7.21: a same-net obstacle reaching here is a VIA-ONLY blocker - skip
+        # the segment loop entirely so track behavior is bit-for-bit as before.
+        for s in ([] if same_net else segments):
             if s["layer"] not in ob_layers:
                 continue
             seg_half = s.get("width", rules["track_width"]) / 2.0
@@ -5588,21 +5652,48 @@ def _self_check(
 
 
 def _nearest_blocker(win: _FineWindow, obstacles: list["_Obst"], net: str,
-                     goal_xy: tuple[float, float]) -> dict[str, Any] | None:
+                     goal_xy: tuple[float, float],
+                     allow_via_in_pad: bool = False) -> dict[str, Any] | None:
     """The foreign obstacle nearest the (blocked) goal - named in a failure so a
-    net that cannot route says WHAT is in the way (human copper especially)."""
+    net that cannot route says WHAT is in the way (human copper especially).
+
+    PHASE 7.21: same-net copper that now blocks VIAS (a pad when
+    `allow_via_in_pad` is off, or an existing via, per `_same_net_blocks_via`)
+    is a real blocker too, but it is reported ADDITIVELY under
+    `same_net_via_blocker`, NOT merged into the primary ranking. Reason: the
+    connection's own GOAL pad is a same-net via-blocker sitting at distance ~0
+    from `goal_xy` by construction, so merging would make it win the nearest
+    contest on essentially every failure and bury the foreign copper the field
+    exists to name (this is exactly what `test_human_copper_is_never_ripped`
+    catches). The primary pick is therefore byte-identical to pre-7.21 - the
+    nearest FOREIGN obstacle - with one exception: when there is no foreign
+    obstacle at all, the same-net via-blocker is promoted to primary (flagged
+    `same_net: True`) instead of returning None."""
     best: tuple[float, _Obst] | None = None
+    best_same: tuple[float, _Obst] | None = None
     for ob in obstacles:
         if ob.net == net and not ob.is_edge:
+            if not _same_net_blocks_via(ob, allow_via_in_pad):
+                continue
+            d = ob.center_dist(goal_xy[0], goal_xy[1])
+            if best_same is None or d < best_same[0]:
+                best_same = (d, ob)
             continue
         d = ob.center_dist(goal_xy[0], goal_xy[1])
         if best is None or d < best[0]:
             best = (d, ob)
+
+    def _rec(dist: float, ob: "_Obst", same_net: bool) -> dict[str, Any]:
+        return {"net": ob.net or "(edge/keepout)", "kind": ob.kind,
+                "distance_mm": round(dist, 4), "layers": sorted(ob.layers),
+                "same_net": same_net, "is_pad": ob.is_pad}
+
     if best is None:
-        return None
-    ob = best[1]
-    return {"net": ob.net or "(edge/keepout)", "kind": ob.kind,
-            "distance_mm": round(best[0], 4), "layers": sorted(ob.layers)}
+        return None if best_same is None else _rec(best_same[0], best_same[1], True)
+    out = _rec(best[0], best[1], False)
+    if best_same is not None:
+        out["same_net_via_blocker"] = _rec(best_same[0], best_same[1], True)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -6528,7 +6619,8 @@ def _finalize_core(
             segments = _apply_neck_endpoint(segments, True, target_len, neck_targets["from"])
         if "to" in neck_targets:
             segments = _apply_neck_endpoint(segments, False, target_len, neck_targets["to"])
-    violations = _self_check(net, segments, vias, active_obstacles, rules, ctx["via_radius"])
+    violations = _self_check(net, segments, vias, active_obstacles, rules, ctx["via_radius"],
+                             ctx.get("allow_via_in_pad", False))
     if violations:
         return None, segments, vias, violations
     length = sum(math.hypot(s["x2"] - s["x1"], s["y2"] - s["y1"]) for s in segments)
@@ -6583,14 +6675,18 @@ def _prefilter_window_obstacles(
     to_xy: tuple[float, float], board_bbox: tuple[float, float, float, float],
     ctx_grid: float, attempts: list[tuple[float, float]],
     track_half: float, via_radius: float, clearance: float, edge_clearance: float,
+    allow_via_in_pad: bool = False,
 ) -> list["_Obst"]:
     """Subset of `obstacles` that COULD be kept by at least one ladder rung's
     `_FineWindow.build` (i.e. NOT bbox-rejected by `obstacle_cells`'s early-out,
     see line ~3507), evaluated once against the UNION of every rung's window
     (`_max_ladder_window_bound`) instead of per-rung.
 
-    A same-net non-edge obstacle is unconditionally free at every rung (the
-    first line of `obstacle_cells`), so it is dropped here regardless of bbox."""
+    A same-net non-edge obstacle is free at every rung (the first line of
+    `obstacle_cells`), so it is dropped here regardless of bbox - EXCEPT, since
+    Phase 7.21, one that still blocks vias (a pad when `allow_via_in_pad` is
+    off, or an existing via). Dropping those here would silently defeat the fix
+    before the window ever sees them."""
     if not attempts:
         return obstacles
     wminx, wminy, wmaxx, wmaxy, max_grid = _max_ladder_window_bound(
@@ -6598,8 +6694,9 @@ def _prefilter_window_obstacles(
     base_reach = max(track_half, via_radius) + max(clearance, edge_clearance) + max_grid * _FINE_CELL_MARGIN_FRAC
     out: list[_Obst] = []
     for ob in obstacles:
-        if ob.net == net and not ob.is_edge:
-            continue  # same-net copper is free at every rung, unconditionally
+        if (ob.net == net and not ob.is_edge
+                and not _same_net_blocks_via(ob, allow_via_in_pad)):
+            continue  # same-net copper is free at every rung
         reach = base_reach + ob.half
         if (ob.maxx < wminx - reach or ob.minx > wmaxx + reach
                 or ob.maxy < wminy - reach or ob.miny > wmaxy + reach):
@@ -6798,6 +6895,9 @@ def _route_one_candidate(
     # Phase 7.3d: the toward_xy bias below is only ever computed if this is
     # True (settings default False) - see `nearest_free`'s docstring.
     pad_escape_aware = bool(ctx.get("pad_escape_direction_aware", False))
+    # Phase 7.21 `autorouter.allow_via_in_pad` (default False): a picklable
+    # bool read once per connection, exactly like the flag above.
+    allow_via_in_pad = bool(ctx.get("allow_via_in_pad", False))
     from_item_layers = (conn.get("from") or {}).get("layers") or conn.get("from_layers") or routable_layers
     to_item_layers = (conn.get("to") or {}).get("layers") or conn.get("to_layers") or routable_layers
     start_layers = [l for l in from_item_layers if l in routable_set] or routable_layers
@@ -6870,7 +6970,8 @@ def _route_one_candidate(
     # keep using the untouched `active_obstacles`.
     window_obstacles = _prefilter_window_obstacles(
         active_obstacles, net, from_xy, to_xy, board_bbox, grid, attempts,
-        track_half, via_radius, rules["clearance"], rules["edge_clearance"])
+        track_half, via_radius, rules["clearance"], rules["edge_clearance"],
+        allow_via_in_pad)
     # Per-connection zone-edge-grid cache (see `_build_zone_edge_cache`): built
     # LAZILY, only once attempt 1 (the legacy, byte-identical-parity rung) has
     # failed and the ladder is actually going to run more than one rung -
@@ -6892,7 +6993,8 @@ def _route_one_candidate(
         miny = max(min(from_xy[1], to_xy[1]) - margin, board_bbox[1] - grid)
         maxx = min(max(from_xy[0], to_xy[0]) + margin, board_bbox[2] + grid)
         maxy = min(max(from_xy[1], to_xy[1]) + margin, board_bbox[3] + grid)
-        win = _FineWindow(minx, miny, maxx, maxy, win_grid, routable_layers, layer_types, net)
+        win = _FineWindow(minx, miny, maxx, maxy, win_grid, routable_layers, layer_types, net,
+                          allow_via_in_pad=allow_via_in_pad)
         if win.cols * win.rows * max(1, len(routable_layers)) > max_window_nodes:
             win = None
             continue  # over budget at this (margin, grid) - a tighter/coarser one may fit
@@ -6990,7 +7092,8 @@ def _route_one_candidate(
         return out
 
     # unreachable within every attempted window/grid (finest grid included).
-    blocker = _nearest_blocker(win, active_obstacles, net, to_xy) if win is not None else None
+    blocker = (_nearest_blocker(win, active_obstacles, net, to_xy, allow_via_in_pad)
+               if win is not None else None)
     result_rec["failure"] = {"reason": "unreachable_in_window",
                              "nearest_blocker": blocker, "window_margin_mm": margin}
     return out
@@ -7067,6 +7170,9 @@ def _route_wide_lazy(
     via_radius = ctx["via_radius"]
     backend = ctx["backend"]
     pad_escape_aware = bool(ctx.get("pad_escape_direction_aware", False))
+    # Phase 7.21 `autorouter.allow_via_in_pad` (default False): a picklable
+    # bool read once per connection, exactly like the flag above.
+    allow_via_in_pad = bool(ctx.get("allow_via_in_pad", False))
     # Phase 7.18: identical reads to `_route_one`/`_route_hierarchical`. This
     # tier goes through the same `_finalize_core`, so it must also cost a move
     # the same way - a connection rescued here has to be priced by the same
@@ -7089,7 +7195,8 @@ def _route_wide_lazy(
                             _MAX_LAZY_WINDOW_NODES)
 
     win = _FineWindow(minx, miny, maxx, maxy, win_grid, routable_layers,
-                      layer_types, net, lazy=True)
+                      layer_types, net, lazy=True,
+                      allow_via_in_pad=allow_via_in_pad)
     if win.cols * win.rows * n_layers > _MAX_LAZY_WINDOW_NODES:
         return None  # even `max_grid_mm` cannot fit a board this big - give up
     # No `_prefilter_window_obstacles` here on purpose: the window IS the board,
@@ -7294,6 +7401,9 @@ def _route_hierarchical(
     # Phase 7.3d: per-leg "other endpoint" bias (settings default False) -
     # see `nearest_free`'s docstring and `_route_one`'s identical read.
     pad_escape_aware = bool(ctx.get("pad_escape_direction_aware", False))
+    # Phase 7.21 `autorouter.allow_via_in_pad` (default False): a picklable
+    # bool read once per connection, exactly like the flag above.
+    allow_via_in_pad = bool(ctx.get("allow_via_in_pad", False))
     # Phase 7.18: identical reads to `_route_one`, so this last-resort tier
     # costs a leg exactly the way the ordinary tier costs a window.
     ml_attach = bool(ctx.get("multilayer_attachment", False))
@@ -7324,14 +7434,15 @@ def _route_hierarchical(
         miny = max(min(leg_from[1], leg_to[1]) - _HIER_WINDOW_MARGIN_MM, board_bbox[1] - grid)
         maxx = min(max(leg_from[0], leg_to[0]) + _HIER_WINDOW_MARGIN_MM, board_bbox[2] + grid)
         maxy = min(max(leg_from[1], leg_to[1]) + _HIER_WINDOW_MARGIN_MM, board_bbox[3] + grid)
-        win = _FineWindow(minx, miny, maxx, maxy, grid, routable_layers, layer_types, net)
+        win = _FineWindow(minx, miny, maxx, maxy, grid, routable_layers, layer_types, net,
+                          allow_via_in_pad=allow_via_in_pad)
         if win.cols * win.rows * max(1, len(routable_layers)) > max_window_nodes:
             return None  # a chunk still too big for the node budget - bail, no partial emit
 
         leg_obstacles = _prefilter_window_obstacles(
             active_obstacles, net, leg_from, leg_to, board_bbox, grid,
             [(_HIER_WINDOW_MARGIN_MM, grid)], track_half, via_radius,
-            rules["clearance"], rules["edge_clearance"])
+            rules["clearance"], rules["edge_clearance"], allow_via_in_pad)
         win.build(leg_obstacles, track_half, via_radius, rules["clearance"], rules["edge_clearance"])
 
         # A generous escape ring (not the pad-escape default of 6 = 1.2mm):
@@ -7376,7 +7487,8 @@ def _route_hierarchical(
 
     if not all_segments and not all_vias:
         return None
-    violations = _self_check(net, all_segments, all_vias, active_obstacles, rules, via_radius)
+    violations = _self_check(net, all_segments, all_vias, active_obstacles, rules, via_radius,
+                             allow_via_in_pad)
     if violations:
         return None  # stitched result fails the end-to-end exact-clearance pass
 
@@ -7991,6 +8103,8 @@ def route_nets(
     track_half = rules["track_width"] / 2.0
     via_radius = rules["via_diameter"] / 2.0
 
+    # Phase 7.21 via placement safety knob (see `_same_net_blocks_via`).
+    allow_via_in_pad = bool(autor.get("allow_via_in_pad", False))
     weights = _Weights(autor.get("cost", {}),
                        float(settings.get("trace_cost", {}).get("via_weights", {}).get("through", 1.0)))
     layer_purpose = settings.get("layer_purpose", {})
@@ -8224,6 +8338,12 @@ def route_nets(
         # `toward_xy` doc and NETCLASS_PLAN.md's 7.3d section for why this is
         # gated behind a flag instead of a plain new-default addition.
         "pad_escape_direction_aware": bool(autor.get("pad_escape_direction_aware", False)),
+        # Phase 7.21 via placement safety. `allow_via_in_pad` default False =
+        # a via may not land inside ANY pad, same-net or foreign (opt in to
+        # restore the pre-7.21 same-net-pads-are-via-permeable behavior). The
+        # companion via-on-via rule is UNCONDITIONAL and needs no knob. Small
+        # picklable bool, so a spawned worker gates identically to the parent.
+        "allow_via_in_pad": allow_via_in_pad,
         # Picklable "recipe" fields used ONLY to let a worker process rebuild
         # `base_obstacles`/`plane_by_net` locally instead of receiving them
         # through pickle (see `_worker_init`) - never read by `_route_one`.
@@ -8457,7 +8577,8 @@ def route_nets(
                     _emit_connection_progress(owner, res["net"], False, None, None, None)
             continue
         violations = _self_check(res["net"], res["segments"], res["vias"],
-                                 active_obstacles_for(owner), rules, via_radius)
+                                 active_obstacles_for(owner), rules, via_radius,
+                                 allow_via_in_pad)
         if not violations:
             _place(owner, res["net"], res["segments"], res["vias"], res["rec"])
         # else: leaves owner neither placed nor failed -> falls into `pending`
