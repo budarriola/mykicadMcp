@@ -25,146 +25,25 @@ pattern (handlers import from whichever module owns the function).
 
 ---
 
-## Status snapshot — read this first (updated 2026-07-23)
+## Status snapshot — read this first (updated 2026-07-29)
 
-For whoever (human or AI) picks this up next:
+For whoever (human or AI) picks this up next: this snapshot used to carry a
+full session-by-session history (2026-07-21 through 2026-07-28). It has been
+trimmed (2026-07-29, user request) now that every item in that history has
+its own dedicated "LANDED" anchor section elsewhere in this file — go read
+the phase's own anchor for what shipped, tool/test counts at that landing,
+and residuals; don't rely on this snapshot for that detail.
 
-- **Landed & verified on the real board**: Phases 1–6 complete — 1, 2, 3
-  (named buses + DIFF_PAIR/PARALLEL/RS485 structural detectors), 4, 5
-  (corridor areas), and 6 (deviation term live, fed by Phase 5 bundles).
-  M0 and M1 are fully done (docs page `10-netclasses-and-buses.md` — note:
-  verify tool counts by instantiating `KiCadMcpServer`, not by grepping; a
-  grep-count once came back wrong).
-  **83 MCP tools registered; full 205-test pytest suite green** (1 slow
-  real-kiln benchmark skipped unless `KICAD_BENCHMARK_REAL=1`; fixtures,
-  golden parser tests, writer round-trip, synthetic board/project
-  + multi-drop SPI generators, kicad-cli acceptance, corridor/deviation,
-  ratsnest, global-route, detailed-route, plane-routing, route-board,
-  zone-parser, plane-island, benchmark, DRC-constraint, critical-net, connector
-  tests; runs in parallel (`-n auto`, pytest-xdist); `pytest.ini`
-  registers the `slow` marker used by the kiln global-route smoke). Each
-  landed phase is collapsed to a short "LANDED" anchor section in
-  place, kept because later phases reference it. All subagent work above was
-  coordinator-reviewed and folded in before this snapshot.
-- **Phase 8 landed 2026-07-21** (coordinator-verified: 72 tools, 60-test suite
-  green, kiln audit hand-checked — see its anchor; notable real finding: C9's
-  schematic Value field lost its voltage rating, flagged `unknown_rating`).
-- **M2 is closed** (2026-07-21) and **M3 step 10 (Phases 7.1 + 7.2) landed**
-  same day, coordinator-verified: 73 tools, 79-test suite green, kiln board
-  cost total now 6241.7 with the `layer_penalty` term (see the 7.1/7.2
-  anchors).
-- **7.3 stage 1 (connectivity + `get_kicad_ratsnest`) landed 2026-07-21**,
-  coordinator-verified: 74 tools, 87-test suite green, kiln = 39 missing
-  connections / 25 unrouted nets, hand-checked genuine (see the stage-1
-  anchor in 7.3, incl. the approved zone-fill stopgap 7.5 must retire).
-- **Plan extended 2026-07-21 at user request** (of the items planned then,
-  7.11 and Phase 9 have since landed — see the next bullet; still pending):
-  7.3c adjacent-layer crossing preference; 7.5.6 stitching pass
-  (always last) + `remove_kicad_stitching_vias` + ask-before-routing rule;
-  7.12 neck-down; 7.13 impedance-matched/matched-length sets; 7.14 connector
-  pin-swap advisor (consent-gated, user makes the sch change, loud exclusion
-  validation); 7.15 effort presets + plateau stopping; 7.16 benchmark harness
-  vs hand-routed boards;
-  new `pcb_settings.json` blocks; milestone **M6** + M3/M4 amendments;
-  Flow B session-start questions. The "hull ballooning / shared-vs-dedicated"
-  concern re-raised at planning time is already mitigated by landed Phase 5
-  (see its anchor; kiln SPI: bundles 313 vs naive hull 1707 mm²) — residual
-  approximations are M6 item 21.
-- **Session 2026-07-22 (3-way Sonnet burst, all coordinator-reviewed and
-  folded in): 7.11 landed, Phase 9 landed, 7.3a CLOSED.** See the 7.11 and
-  Phase 9 anchors for what landed and their consumer notes/residuals. The
-  previously-unreviewed `tests/test_global_route.py` was audited and
-  hardened by the coordinator: tests 2 (k-alternates) and 3 (bundle
-  capacity) were vacuous — assertions behind `if` guards that never fired
-  (the bundle test exercised ZERO connections: a fully-routed board has no
-  ratsnest, and a fully-unrouted bus has no Phase 5 corridor geometry, so
-  bundles only exist on a PARTIALLY routed bus). Both are now hard
-  assertions; test 3 uses a strip-alternate-segments fixture
-  (`_strip_alternate_segments`) that measurably produces bundle
-  `SPI:U1->U2`. Remaining softness (accepted): test 1 doesn't verify the
-  crossing resolved onto different layers/corridors, only that both
-  connections route.
-- **7.3a is closed** (all three closure items done: coordinator cost-formula
-  review 2026-07-21; tests reviewed+hardened and kiln acceptance write-up
-  delivered 2026-07-22 — `docs/acceptance/7.3a-kiln-global-route.md`, 7
-  sections, all measured). Machinery inventory: `infer_layer_directions`,
-  `_CoarseModel`, `_Weights` (integer milli-cost), `_astar`/
-  `_make_candidates` (k-shortest), `_collect_bundles` (Phase 5 reuse),
-  `global_route(project_path, nets=None, connections=None)`,
-  `_plane_opportunity_score` stub → 7.5.4. Kiln: 39/39 routed, 4 near-ties,
-  corridor choice agrees exactly with the Phase 5 golden bundles.
-  **Measured findings that feed 7.3b/7.5.4 (from the acceptance report —
-  read it before starting 7.3b):**
-  - Warm ≈ cold (128 vs 137 s): there is no result cache and A* itself is
-    the floor — the foreign-plane `_FULL_CELL_MILLI` degeneration diagnosis
-    stands (fix via 7.3b windowing and/or excluding foreign-plane cells);
-    runs are byte-identical (determinism confirmed on the real board).
-  - 99.40% of kiln `total_est_cost_milli` (628.8M) is `_FULL_CELL_MILLI`
-    penalty; only 0.60% is real routing cost. Weight balance is 7.5.4's job.
-  - Bundle shared-corridor double-count inflates the total +5.68% (35.7M),
-    not a flat 7× — `net_to_bundle`'s `setdefault` claims shared SPI nets
-    for the alphabetically-first bundle (U7 4×, I2C 2×, U8/U9 1×). State in
-    the eventual `route_kicad_nets` tool docs.
-  - Direction inference: F.Cu 52.77% V / B.Cu 54.52% V — both under the 60%
-    threshold, both correctly `None` (the lean is V, weaker than earlier
-    guesses). Recommendation on record: don't drop the global threshold to a
-    near-coin-flip 52%; prefer a per-layer confidence/margin rule when 7.3c
-    tuning happens.
-  - Home layers: signal nets 100% intuitive (F.Cu/B.Cu); power nets pick the
-    dedicated planes only 2/19 times because via cost dominates short
-    (<5 mm) hops — a genuine 7.5.4 design input, not a defect.
-  - Congestion truth: F.Cu worst (127/350 used cells over capacity; the
-    SPI/I2C hub fan-out cell committed 12× its 2-slot capacity);
-    In1/In2.Cu barely touched.
-  - Cost-formula review notes still open for 7.3b: (a) heuristic
-    admissibility is config-conditional (`off_direction ≥ 1`, layer-purpose
-    multipliers ≥ per-kind minimum) — add a docstring line with 7.3b;
-    (b) bundle endpoints search all-layer start/goal sets, skipping the
-    entry-via cost — 7.3b's exact geometry corrects it.
-- **Session 2026-07-23 (coordinator-reviewed): 7.3b core landed, 7.14 detection
-  landed, M6 item 17 (a)+(b) landed, M3 docs pass landed, then 7.3b step-4
-  rip-up landed.** See the 7.3b stage-2 anchor (incl. its rip-up sub-anchor),
-  the 7.14 anchor, and Phase 9 anchor for what landed + residuals. Full suite
-  146 green, 79 tools, all coordinator-verified against the tree (concurrent
-  edits to `kicad_mcp_server.py`/`kicad_pcb_tool.py` integrated cleanly).
-  Then (coordinator-implemented directly, agents being rate-limited):
-  **§7.17 one-command `route_board` minimal version LANDED** — MCP tool
-  `route_kicad_board` + `python kicad_router_tool.py route` CLI, 80 tools, 6
-  new tests, measured on kiln (Current3 routes 1.7257 mm; MOSI correctly fails
-  pending M4 planes). See §7.17 anchor, build-order 11h, Flow B step 5.
-  Then **Phase 7.5.1 zone parser + `list_kicad_zones` LANDED** (Sonnet agent,
-  coordinator-verified): 81 tools, 159-test suite green, six kiln zones parsed
-  (mainGnd multi-layer F/B/In1.Cu, safty_gnd, antenna, 3 In2.Cu planes), the
-  7.3 stopgap parser retired, and the `get_ratsnest`=39 guard holds. See the
-  7.5.1 anchor. Then **Phase 7.5.2 fill + 7.5.3 `audit_kicad_plane_islands`
-  LANDED** (Sonnet, coordinator-verified): 82 tools, 165-test suite green,
-  kiln fill_source all "kicad", 31 costed islands / 1 orphan on safty_gnd F.Cu,
-  39-guard holds. See the 7.5.2/7.5.3 anchor. Then **Phase 7.5.4 plane-aware
-  routing LANDED** (Sonnet, coordinator-verified): plane moves in the detailed
-  A* for zone-owning nets, 82 tools, full 173-test suite green (my own
-  `-p no:randomly` run — the agent's transient "172" did not reproduce),
-  signal-net parity confirmed (Current3 unchanged), 39-guard holds. See the
-  7.5.4 anchor for the residuals (estimated-fill path not wired; heuristic not
-  cost-optimal for plane states; kiln proof is synthetic).
-- **Session 2026-07-24: first real-board route (reverted by user) + benchmark.**
-  `route_board(write=True)` on the REAL kiln did 3/39 with degenerate geometry
-  (user reverted it) — see the ⭐ findings section. **Phase 7.16
-  `benchmark_kicad_autoroute` LANDED** (Sonnet, coordinator-verified): 83 tools,
-  179-test suite green; scores the router vs the hand-routed baseline (kiln:
-  human 8552.276 vs auto 8568.267, `matched_or_beat_human:false`). This is now
-  the router acceptance gate. **Then adaptive-grid window fix LANDED** (Sonnet,
-  coordinator-verified): 83 tools, 187-test suite green, node budget now fits
-  39/39 kiln connections. **BUT it exposed the real #1 blocker — the
-  `_FineWindow` O(cells × zone_edges) zone-distance perf makes real routes
-  impractically slow (route_board would now HANG on the real board).** See the
-  ⭐ findings section. **Then the zone-distance perf fix LANDED** (Sonnet,
-  coordinator-verified): spatial edge bucketing (parity-exact via
-  `_min_dist_to_edges_ref`); a zone-heavy GND_Main conn routes in 9.7 s vs never.
-  Routes now finish. **Real benchmark then RAN to completion (~10 min): 4/39
-  (10.26%), score 8568.267 vs human 8552.276 (still worse), 1 DRC violation.**
-  The 35 failures are now `unreachable_in_window` (genuine dense-board
-  pathfinding), not budget — closing that gap is Opus-class whole-board
-  optimization (7.6), not a bounded Sonnet patch. See ⭐ findings.
+- **Landed & coordinator-verified**: Phases 1–9 and 7.1 through 7.20 in
+  full — every one has a "### 7.x — LANDED" (or "## Phase N — LANDED")
+  anchor in place below with its full write-up. Current state: 94 MCP tools
+  registered, 457-test suite green (7 pre-existing failures are real-board
+  drift from the user's own continued hand-routing — see the ⭐ findings
+  section below for detail — not caused by any landed feature).
+- The ⭐ **Real-board routing findings & the hand-routed baseline** section
+  right after this one is kept in full (not trimmed) — it's the acceptance
+  narrative for the routing-capability arc (7.3b through M7) and several
+  root-cause diagnoses future work still depends on, not a redundant log.
 - **Next work when resumed (updated 2026-07-29 — M7 fully landed: 7.18,
   7.19, 7.20 all done, see their anchors).** User priority set 2026-07-29,
   in order: **(1) Phase 7.21 via placement safety (no via-in-pad, no via-via
