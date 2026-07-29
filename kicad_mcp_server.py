@@ -96,6 +96,7 @@ except Exception as exc:  # pragma: no cover - import safety
 
 try:
     from kicad_router_tool import (
+        audit_crosstalk,
         audit_plane_islands,
         benchmark_autoroute,
         create_plane,
@@ -1031,6 +1032,47 @@ class KiCadMcpServer:
                     "required": ["project_path"],
                 },
                 "handler": self._tool_audit_plane_islands,
+            },
+            "audit_kicad_crosstalk": {
+                "description": (
+                    "Phase 7.20: measure adjacent-layer PARALLEL TRACE RUNS (broadside crosstalk "
+                    "risk) on the board's existing copper. For every pair of track segments on "
+                    "STACK-ADJACENT copper layers (consecutive in the board's own layer stack - a "
+                    "non-adjacent pair has a reference plane / enough dielectric between it, so it "
+                    "is not reported) whose nets differ, the TRUE overlap length is measured by "
+                    "marching along the segment, so a crossing contributes only the crossing width "
+                    "while a broadside run contributes its full coupled length. Runs at or above "
+                    "crosstalk.min_parallel_run_mm, within crosstalk.min_spacing_mm edge-to-edge in "
+                    "XY, are reported. BOTH sides of the same-bus exemption are returned: "
+                    "'violations' (penalised) and 'exempt_runs' (nets sharing a confirmed_buses "
+                    "entry or a detect_buses candidate - running parallel is the POINT of a bus, so "
+                    "they cost nothing against each other, though they still pay against "
+                    "third-party nets). Reporting the exempt set is deliberate: a false exemption "
+                    "silently hides real crosstalk risk, and is invisible unless shown. Read-only. "
+                    "Optional overrides for each threshold; adjacent_layer_pairs overrides the "
+                    "stack adjacency itself for a stack-up what-if (e.g. kiln carries tracks only "
+                    "on F.Cu/B.Cu, three apart in its 4-layer stack, so its REAL adjacency has zero "
+                    "track-vs-track exposure - asking what the same routing would cost on a 2-layer "
+                    "stack-up is a genuine design question). The routing-TIME counterpart is the "
+                    "crosstalk cost term in route_kicad_board/route_kicad_nets, off by default "
+                    "(crosstalk.adjacent_layer_penalty_per_mm = 0.0)."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "min_spacing_mm": {"type": "number"},
+                        "min_parallel_run_mm": {"type": "number"},
+                        "penalty_per_mm": {"type": "number"},
+                        "same_bus_exempt": {"type": "boolean"},
+                        "adjacent_layer_pairs": {
+                            "type": "array",
+                            "items": {"type": "array", "items": {"type": "string"}},
+                        },
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_audit_crosstalk,
             },
             "get_kicad_drc_constraints": {
                 "description": (
@@ -2409,6 +2451,17 @@ class KiCadMcpServer:
 
     def _tool_audit_plane_islands(self, args: dict[str, Any]) -> dict[str, Any]:
         return audit_plane_islands(args["project_path"])
+
+    def _tool_audit_crosstalk(self, args: dict[str, Any]) -> dict[str, Any]:
+        pairs = args.get("adjacent_layer_pairs")
+        return audit_crosstalk(
+            args["project_path"],
+            min_spacing_mm=args.get("min_spacing_mm"),
+            min_parallel_run_mm=args.get("min_parallel_run_mm"),
+            penalty_per_mm=args.get("penalty_per_mm"),
+            same_bus_exempt=args.get("same_bus_exempt"),
+            adjacent_layer_pairs=([tuple(p) for p in pairs] if pairs else None),
+        )
 
     def _tool_get_drc_constraints(self, args: dict[str, Any]) -> dict[str, Any]:
         return get_drc_constraints(args["project_path"])
