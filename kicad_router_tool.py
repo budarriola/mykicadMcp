@@ -5879,13 +5879,21 @@ def _crosstalk_bus_groups(project_path: str | Path,
         pass
     try:
         cfg = settings.get("bus_detection", {}) or {}
-        det = _pcb.detect_buses(project_path,
-                               ic_ref_prefixes=cfg.get("ic_ref_prefixes"),
-                               extra_signatures=cfg.get("extra_signatures"))
+        det = _pcb.detect_buses(project_path, ic_ref_prefixes=cfg.get("ic_ref_prefixes"))
         for cand in det.get("candidates", []):
             nets = frozenset(str(m["net"]) for m in cand.get("nets", []) if m.get("net"))
             if len(nets) >= 2:
                 groups.append(nets)
+    except (TypeError, AttributeError):
+        # DELIBERATELY NOT swallowed. These are call-signature/programming
+        # errors, and swallowing one is precisely the "silent disable" failure
+        # 7.20 is most exposed to: it costs no test and no warning, the
+        # exemption set just quietly becomes empty and every bus starts paying
+        # a penalty it should not. (This is not hypothetical - an early draft
+        # of this function passed a kwarg `detect_buses` does not accept, and
+        # the broad `except` below hid it completely.) Data problems below stay
+        # tolerated; bugs must surface.
+        raise
     except Exception:  # netlist missing/stale - confirmed buses still apply
         pass
     # De-duplicate while preserving discovery order (determinism).
@@ -6015,6 +6023,160 @@ def _resolve_crosstalk(
     if not cells:
         return None
     return {"penalty_per_mm": penalty, "cells": cells, "exempt": exempt}
+
+
+def _parallel_overlap_mm(a: dict[str, Any], b: dict[str, Any],
+                         min_spacing_mm: float, step: float) -> float:
+    """Length of `a` that runs within `min_spacing_mm` EDGE-to-edge of `b`.
+
+    This is the EXACT quantity 7.20's `min_parallel_run_mm` is defined against -
+    how far the two traces actually stay aligned - as opposed to the aggressor's
+    own length, which is the memoryless upper bound the routing-time cost term
+    uses (see `_crosstalk_window_cells`). Measured by marching along `a`, so a
+    pair that merely CROSSES contributes only the width of the crossing (well
+    under any sane threshold) while a genuine broadside run contributes its full
+    coupled length.
+
+    Edge-to-edge (`- half_a - half_b`) is deliberate and is the one place this
+    differs from the router-time predicate, which measures from the candidate
+    NODE (a centreline point, so no `half_a` to subtract). The audit is the
+    exact/reporting path, so it uses the physically correct gap."""
+    ax1, ay1 = a["start"]["x"], a["start"]["y"]
+    ax2, ay2 = a["end"]["x"], a["end"]["y"]
+    bx1, by1 = b["start"]["x"], b["start"]["y"]
+    bx2, by2 = b["end"]["x"], b["end"]["y"]
+    reach = min_spacing_mm + float(a.get("width", 0.0)) / 2.0 + float(b.get("width", 0.0)) / 2.0
+    L = math.hypot(ax2 - ax1, ay2 - ay1)
+    if L <= 0.0:
+        return 0.0
+    n = max(1, int(math.ceil(L / step)))
+    dt = L / n
+    total = 0.0
+    for i in range(n + 1):
+        t = i / n
+        px, py = ax1 + (ax2 - ax1) * t, ay1 + (ay2 - ay1) * t
+        if _seg_point_dist(bx1, by1, bx2, by2, px, py) <= reach:
+            # Trapezoid-ish: interior samples own a full step, endpoints half.
+            total += dt if 0 < i < n else dt / 2.0
+    return min(total, L)
+
+
+def audit_crosstalk(
+    project_path: str | Path,
+    min_spacing_mm: float | None = None,
+    min_parallel_run_mm: float | None = None,
+    penalty_per_mm: float | None = None,
+    same_bus_exempt: bool | None = None,
+    adjacent_layer_pairs: list[tuple[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Phase 7.20 - measure ACTUAL adjacent-layer parallel runs on a board's
+    existing copper, with the same-bus exemption applied.
+
+    Read-only. This is the exact counterpart to the routing-time cost term: it
+    knows the real emitted geometry, so it applies `min_parallel_run_mm` to the
+    TRUE overlap length rather than to the aggressor's own length.
+
+    Both sides of the exemption are reported: `violations` are the runs that
+    would be penalised, `exempt_runs` are the runs that qualify as parallel but
+    are excused because the two nets share a bus. Reporting the exempt set is
+    the point - it is what makes a false exemption (the failure mode that
+    silently disables the feature) visible instead of invisible.
+
+    `adjacent_layer_pairs` overrides which layer pairs count as stack-adjacent
+    (default: consecutive pairs of the board's own copper stack). It exists for
+    STACK-UP WHAT-IFs: kiln, for instance, carries track copper only on F.Cu and
+    B.Cu - which are three apart in its 4-layer stack, with two plane layers
+    between them - so its real adjacency has no track-vs-track exposure at all.
+    Asking what the same physical routing would cost on a 2-layer stack-up,
+    where F.Cu and B.Cu ARE adjacent, is a real design question and the only way
+    to exercise this board's actual geometry against the term."""
+    board_path, _, _ = _pcb._resolve_project_path(project_path)
+    settings = _pcb.load_pcb_settings(project_path)["config"]
+    cfg = settings.get("crosstalk", {}) or {}
+    spacing = float(cfg.get("min_spacing_mm", 0.3) if min_spacing_mm is None else min_spacing_mm)
+    min_run = float(cfg.get("min_parallel_run_mm", 2.0)
+                    if min_parallel_run_mm is None else min_parallel_run_mm)
+    penalty = float(cfg.get("adjacent_layer_penalty_per_mm", 0.0)
+                    if penalty_per_mm is None else penalty_per_mm)
+    exempt_on = bool(cfg.get("same_bus_exempt", True)
+                     if same_bus_exempt is None else same_bus_exempt)
+
+    all_cu = [l["name"] for l in _pcb._parse_board_layers_cached(board_path)] or ["F.Cu", "B.Cu"]
+    order = {name: i for i, name in enumerate(all_cu)}
+    adjacent_pairs = ([(str(a), str(b)) for a, b in adjacent_layer_pairs]
+                      if adjacent_layer_pairs is not None
+                      else [(all_cu[i], all_cu[i + 1]) for i in range(len(all_cu) - 1)])
+
+    groups = _crosstalk_bus_groups(project_path, settings) if exempt_on else []
+
+    def bus_of(a: str, b: str) -> bool:
+        return any(a in g and b in g for g in groups)
+
+    tracks = _pcb._parse_tracks_cached(Path(board_path))
+    by_layer: dict[str, list[dict[str, Any]]] = {}
+    for s in tracks.get("segments", []):
+        if s.get("layer") in order and s.get("net"):
+            by_layer.setdefault(s["layer"], []).append(s)
+
+    step = max(0.02, min(0.1, min_run / 4.0 if min_run > 0 else 0.1))
+    violations: list[dict[str, Any]] = []
+    exempt_runs: list[dict[str, Any]] = []
+    for la, lb in adjacent_pairs:
+        A, B = by_layer.get(la, []), by_layer.get(lb, [])
+        if not A or not B:
+            continue
+        for a in A:
+            ah = float(a.get("width", 0.0)) / 2.0
+            amnx = min(a["start"]["x"], a["end"]["x"])
+            amxx = max(a["start"]["x"], a["end"]["x"])
+            amny = min(a["start"]["y"], a["end"]["y"])
+            amxy = max(a["start"]["y"], a["end"]["y"])
+            for b in B:
+                if a["net"] == b["net"]:
+                    continue
+                r = spacing + ah + float(b.get("width", 0.0)) / 2.0
+                if (max(b["start"]["x"], b["end"]["x"]) < amnx - r
+                        or min(b["start"]["x"], b["end"]["x"]) > amxx + r
+                        or max(b["start"]["y"], b["end"]["y"]) < amny - r
+                        or min(b["start"]["y"], b["end"]["y"]) > amxy + r):
+                    continue
+                ov = _parallel_overlap_mm(a, b, spacing, step)
+                if ov < min_run or ov <= 0.0:
+                    continue
+                rec = {
+                    "net_a": a["net"], "layer_a": la,
+                    "net_b": b["net"], "layer_b": lb,
+                    "overlap_mm": round(ov, 4),
+                    "penalty": round(ov * penalty, 4),
+                    "uuid_a": a.get("uuid", ""), "uuid_b": b.get("uuid", ""),
+                }
+                if bus_of(a["net"], b["net"]):
+                    rec["exempt_reason"] = "same_bus"
+                    rec["penalty"] = 0.0
+                    exempt_runs.append(rec)
+                else:
+                    violations.append(rec)
+    violations.sort(key=lambda r: (-r["overlap_mm"], r["net_a"], r["net_b"]))
+    exempt_runs.sort(key=lambda r: (-r["overlap_mm"], r["net_a"], r["net_b"]))
+    return {
+        "board": str(board_path),
+        "settings_used": {
+            "min_spacing_mm": spacing, "min_parallel_run_mm": min_run,
+            "adjacent_layer_penalty_per_mm": penalty, "same_bus_exempt": exempt_on,
+        },
+        "layer_stack": all_cu,
+        "adjacent_layer_pairs": [list(p) for p in adjacent_pairs],
+        "bus_group_count": len(groups),
+        "violations": violations,
+        "exempt_runs": exempt_runs,
+        "totals": {
+            "flagged_runs": len(violations),
+            "flagged_parallel_mm": round(sum(r["overlap_mm"] for r in violations), 4),
+            "total_penalty": round(sum(r["penalty"] for r in violations), 4),
+            "exempt_runs": len(exempt_runs),
+            "exempt_parallel_mm": round(sum(r["overlap_mm"] for r in exempt_runs), 4),
+        },
+    }
 
 
 def _crosstalk_for(ctx: dict[str, Any], win: "_FineWindow",
