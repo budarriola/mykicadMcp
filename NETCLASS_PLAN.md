@@ -165,12 +165,15 @@ For whoever (human or AI) picks this up next:
   The 35 failures are now `unreachable_in_window` (genuine dense-board
   pathfinding), not budget — closing that gap is Opus-class whole-board
   optimization (7.6), not a bounded Sonnet patch. See ⭐ findings.
-- **Next work when resumed (updated 2026-07-28 — M7 fully landed: 7.18,
-  7.19, 7.20 all done, see their anchors):** (1) Phase 7.13 impedance-matched
-  traces & matched sets — spec'd (see its section), Opus-class, not yet
-  started; this is the only substantial open item left in the plan. Still
-  open: M6 item 17 (c) Flow B stack-up-gate question, and the small 7.3b
-  "any same-net copper" termination bit.
+- **Next work when resumed (updated 2026-07-29 — M7 fully landed: 7.18,
+  7.19, 7.20 all done, see their anchors).** User priority set 2026-07-29,
+  in order: **(1) Phase 7.21 via placement safety (no via-in-pad, no via-via
+  overlap) — user-reported real-board bug, spec'd, NOT yet started, do this
+  first** (see its section right after the 7.20 anchor); (2) Phase 7.6
+  whole-board optimization; (3) M6 item 17(c) Flow B stack-up-gate question.
+  Phase 7.13 (impedance-matched traces) remains explicitly deprioritized by
+  the user — do not start it without being asked. Still open, low priority:
+  the small 7.3b "any same-net copper" termination bit.
 - Verify claims against the code (`kicad_pcb_tool.py`, `kicad_mcp_server.py`,
   `tests/`) rather than trusting this snapshot if they disagree — and then fix
   this file.
@@ -2627,6 +2630,72 @@ independent run on the merged tree — an 8th failure the subagent saw
 mid-session was confirmed a load-induced flake from too many concurrent
 route calls competing for cores, not a regression, and passes cleanly in
 isolation).
+
+---
+
+## Phase 7.21 — Via placement safety: no via-in-pad, no via-via overlap — SPEC'd 2026-07-29, not yet started
+
+**User-reported bug (real board observation): vias are landing inside pads and
+overlapping other vias.** Root-caused by reading the code directly (not
+guessed): the "same-net copper is free" exemption exists at THREE places that
+must stay parity-mirrored —
+
+1. `_FineWindow.obstacle_cells` (bulk build), `kicad_router_tool.py:4386`:
+   `if ob.net == self.net and not ob.is_edge: return via_cells, track_cells`
+2. The lazy per-cell mirror, `_lazy_build`/`_window_rejects` family starting
+   `kicad_router_tool.py:4499` (must stay byte-identical to (1) per
+   `tests/test_lazy_window.py`'s cell-for-cell parity assertion).
+3. The final pre-write DRC gate `_self_check`, `kicad_router_tool.py:5554`:
+   `if ob.net == net and not ob.is_edge: continue` — this is why the bug
+   reaches the board unflagged: the one function whose docstring promises to
+   "prove every proposed segment/via against ALL foreign copper" silently
+   never checks a via against same-net pads or same-net vias at all.
+
+This exemption is CORRECT for tracks (a route legitimately runs alongside/
+touches its own net's existing copper — that's the whole point of "same-net
+copper is free"). It is WRONG for vias specifically, in two distinct ways
+that need two distinct fixes:
+
+- **Via-in-pad**: a via must never land inside ANY footprint pad (`is_pad`),
+  same-net or foreign, UNLESS the user has opted in — this is a deliberate
+  manufacturing technique (filled/plated via-in-pad), not something the
+  router should do implicitly. New `pcb_settings.json` flag:
+  `autorouter.allow_via_in_pad` (default `false`). When `false` (default),
+  pads block vias regardless of net — i.e. drop the `ob.is_pad` carve-out
+  from the same-net exemption specifically for the via-radius check (tracks
+  keep the existing same-net-free behavior unchanged). When `true`, restore
+  today's behavior (same-net pads stay via-permeable) — an explicit opt-in,
+  not a default change.
+- **Via-via overlap**: two vias must never overlap, even same-net,
+  UNCONDITIONALLY — no config gate. Two overlapping drilled holes is never
+  physically valid, unlike via-in-pad which is a real (if niche) technique.
+  This applies at all three sites above: a same-net EXISTING via (`ob.kind ==
+  "pt"`, not `is_pad`) must still block new via placement even though it's
+  exempted for tracks.
+
+**Scope constraint — do not touch the track-vs-same-net-copper behavior.**
+The fix must only change how the exemption applies to the VIA reach/check
+(`via_cells` / the via branch of `_self_check`), never to `track_cells` / the
+segment branch — same-net tracks staying permeable is intentional and
+covered by existing tests (e.g. a route touching its own endpoint pad's
+copper must keep working). Any test that currently exercises "same-net
+track over same-net pad/via" must keep passing unchanged.
+
+**Also required**: `_nearest_blocker` (`kicad_router_tool.py:5590`) has the
+same same-net skip — decide whether a via-blocked-by-own-net-pad failure
+should now report that pad as the blocker (probably yes, for a useful
+`unreachable_in_window` diagnostic) rather than silently skipping it.
+
+**New tests needed** (none of the existing via/pad/crosstalk/plane-via test
+files cover this): a synthetic-board case where a via is forced toward a
+same-net pad and must be rejected (`allow_via_in_pad` default false) vs.
+accepted (`allow_via_in_pad: true`); a case with two same-net connections
+whose vias would coincide/overlap and must be forced apart or one of them
+must fail cleanly rather than silently stacking.
+
+**Not yet started** — spec only. Next session should pick this up before
+7.6, per explicit user priority (2026-07-29): this bug fix first, then Phase
+7.6 (whole-board optimization), then M6 item 17(c).
 
 ---
 
