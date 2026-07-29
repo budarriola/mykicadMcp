@@ -37,22 +37,28 @@ and residuals; don't rely on this snapshot for that detail.
 - **Landed & coordinator-verified**: Phases 1–9 and 7.1 through 7.20 in
   full — every one has a "### 7.x — LANDED" (or "## Phase N — LANDED")
   anchor in place below with its full write-up. Current state: 94 MCP tools
-  registered, 457-test suite green (7 pre-existing failures are real-board
+  registered, 476-test suite green (7 pre-existing failures are real-board
   drift from the user's own continued hand-routing — see the ⭐ findings
   section below for detail — not caused by any landed feature).
+  Plus a large-board-with-a-handful-of-unrouted-connections test fixture
+  (`generate_large_board_few_unrouted`, `tests/test_large_board_few_
+  unrouted.py`, 2026-07-29 user request) — see its own module docstring, not
+  a numbered phase.
 - The ⭐ **Real-board routing findings & the hand-routed baseline** section
   right after this one is kept in full (not trimmed) — it's the acceptance
   narrative for the routing-capability arc (7.3b through M7) and several
   root-cause diagnoses future work still depends on, not a redundant log.
 - **Next work when resumed (updated 2026-07-29 — M7 fully landed: 7.18,
-  7.19, 7.20 all done, see their anchors).** User priority set 2026-07-29,
-  in order: **(1) Phase 7.21 via placement safety (no via-in-pad, no via-via
-  overlap) — user-reported real-board bug, spec'd, NOT yet started, do this
-  first** (see its section right after the 7.20 anchor); (2) Phase 7.6
-  whole-board optimization; (3) M6 item 17(c) Flow B stack-up-gate question.
-  Phase 7.13 (impedance-matched traces) remains explicitly deprioritized by
-  the user — do not start it without being asked. Still open, low priority:
-  the small 7.3b "any same-net copper" termination bit.
+  7.19, 7.20 all done; Phase 7.21 via placement safety also LANDED same day,
+  see their anchors).** User priority set 2026-07-29, in order: **(1) Phase
+  7.22 bus-first direct routing pass — spec'd, NOT yet started, do this
+  next** (see its section right after the 7.21 anchor — queued behind 7.21 to
+  avoid two concurrent worktree agents editing the same hot `route_nets`
+  functions; that's no longer a concern now that 7.21 is merged); (2) Phase
+  7.6 whole-board optimization; (3) M6 item 17(c) Flow B stack-up-gate
+  question. Phase 7.13 (impedance-matched traces) remains explicitly
+  deprioritized by the user — do not start it without being asked. Still
+  open, low priority: the small 7.3b "any same-net copper" termination bit.
 - Verify claims against the code (`kicad_pcb_tool.py`, `kicad_mcp_server.py`,
   `tests/`) rather than trusting this snapshot if they disagree — and then fix
   this file.
@@ -2512,7 +2518,7 @@ isolation).
 
 ---
 
-## Phase 7.21 — Via placement safety: no via-in-pad, no via-via overlap — SPEC'd 2026-07-29, not yet started
+## Phase 7.21 — Via placement safety: no via-in-pad, no via-via overlap — LANDED 2026-07-29 (anchor)
 
 **User-reported bug (real board observation): vias are landing inside pads and
 overlapping other vias.** Root-caused by reading the code directly (not
@@ -2565,16 +2571,49 @@ same same-net skip — decide whether a via-blocked-by-own-net-pad failure
 should now report that pad as the blocker (probably yes, for a useful
 `unreachable_in_window` diagnostic) rather than silently skipping it.
 
-**New tests needed** (none of the existing via/pad/crosstalk/plane-via test
-files cover this): a synthetic-board case where a via is forced toward a
-same-net pad and must be rejected (`allow_via_in_pad` default false) vs.
-accepted (`allow_via_in_pad: true`); a case with two same-net connections
-whose vias would coincide/overlap and must be forced apart or one of them
-must fail cleanly rather than silently stacking.
+**LANDED 2026-07-29** (Opus subagent, worktree-isolated, coordinator-reviewed:
+full diff read directly against the spec above plus an independent full-suite
+run on the merged tree, not just a report review). `_same_net_blocks_via(ob,
+allow_via_in_pad)` (new, `kicad_router_tool.py` ~3959) is the single source of
+truth both fixes route through: a same-net PAD blocks vias unless
+`allow_via_in_pad` is set; a same-net EXISTING VIA blocks vias unconditionally
+(no knob). All three parity-critical sites updated (`_FineWindow.obstacle_cells`
++ its `__init__`, the lazy mirror `_lazy_build`/`_lazy_cell_blocked`/
+`add_obstacle`, and `_self_check`, which gained an `allow_via_in_pad` arg and
+now runs its via loop against same-net via-blockers while skipping the segment
+loop for them — tracks stay untouched). Also fixed: `_prefilter_window_obstacles`
+(would have silently dropped same-net via-blockers before the window ever saw
+them, defeating the fix upstream) and `_nearest_blocker`. New setting
+`autorouter.allow_via_in_pad: false` in `DEFAULT_PCB_SETTINGS`
+(`kicad_pcb_tool.py`). Threaded as `ctx["allow_via_in_pad"]` through
+`_route_one_candidate`, `_route_wide_lazy`, `_route_hierarchical`, and
+`route_nets`, same picklable-bool pattern as 7.3d/7.19. 19 new tests
+(`tests/test_via_placement_safety.py`), including end-to-end synthetic-board
+reproductions of the exact reported bug (pre-fix: vias placed dead-centre in
+both endpoint pads; a second connection's vias landing at 0.0 mm pad
+distance). Full suite: 457→476 passed, same 7 pre-existing kiln board-drift
+failures, unaffected (confirmed by the coordinator's own independent run on
+the merged tree, not just the subagent's report).
 
-**Not yet started** — spec only. Next session should pick this up before
-7.6, per explicit user priority (2026-07-29): this bug fix first, then Phase
-7.6 (whole-board optimization), then M6 item 17(c).
+**Judgment call on record (coordinator reviewed and accepted):**
+`_nearest_blocker` does NOT merge the same-net via-blocker into the primary
+ranking — the spec's "probably yes" turned out to break
+`test_human_copper_is_never_ripped` (a connection's own goal pad is a
+same-net via-blocker at ~0 distance by construction, so merging would bury
+the real foreign-copper blocker on nearly every failure). Implemented
+additively instead: the primary pick stays byte-identical to pre-7.21
+(nearest FOREIGN obstacle), with a same-net via-blocker surfaced alongside
+under a new `same_net_via_blocker` key, promoted to primary only when there
+is no foreign obstacle at all. `_crosstalk_window_cells` and
+`_feasibility_screen` were deliberately left untouched (verified track-only /
+scheduling-heuristic-only, not via-relevant).
+
+**Honest residual**: the via-on-via rule is proven at unit level (window +
+`_self_check`) and behaviorally (the router steps around a pre-existing
+same-net via end-to-end), but NOT covered by a test forcing two NEWLY-placed
+vias to collide — congestion cost already separates them even on pre-fix
+code, so such a test would have been green-on-broken; none was shipped rather
+than fake one.
 
 ---
 
