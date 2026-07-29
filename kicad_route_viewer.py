@@ -408,6 +408,7 @@ class RouteViewerApp:
         # so the user can review the final board at their own pace.
         self.auto_close = bool(auto_close)
         self._close_scheduled = False
+        self._close_after_id: str | None = None
 
         self.root = tk.Tk()
         self.root.title(f"Route progress - {self.board_path.name}")
@@ -537,7 +538,7 @@ class RouteViewerApp:
             # itself rather than sitting there unattended after completion.
             self._close_scheduled = True
             self.status_var.set(self.status_var.get() + " - closing")
-            self.root.after(_AUTO_CLOSE_DELAY_MS, self.root.destroy)
+            self._close_after_id = self.root.after(_AUTO_CLOSE_DELAY_MS, self.root.destroy)
 
     def _draw_score_sparkline(self) -> None:
         self.score_canvas.delete("all")
@@ -566,13 +567,34 @@ class RouteViewerApp:
             # Re-derive from scratch each poll (cheap - JSONL files here are
             # small) rather than tracking a byte offset, so the viewer is
             # correct even if it opened mid-run (replays the whole file).
-            new_state = ProgressState().replay(events)
+            #
             # Diff old vs new by re-applying only from a fresh state each
             # time keeps this simple and correct at the cost of redrawing
             # geometry that survived unchanged - acceptable at this file size.
             self.state = ProgressState()
             self._item_ids.clear()
             self.canvas.delete("all")
+            self.score_canvas.delete("all")
+            # A truncated-and-not-yet-repopulated file (route_nets resets it at
+            # the START of a new run, before that run's own header event lands)
+            # must not leave the PREVIOUS run's status text on screen - without
+            # this, an empty `events` list here (nothing to call `_apply_event`
+            # for) left the label reading something like "12/39 connections -
+            # done" from the run before, even though the canvas was correctly
+            # cleared - a misleading "did it hang?" moment for anyone watching.
+            self.status_var.set("waiting for progress events...")
+            # A pending auto-close from a run that just got superseded by a
+            # NEW run's truncation must be cancelled, not merely forgotten -
+            # otherwise it still fires on its original schedule and can kill
+            # the window mid-way through the run this poll just started
+            # tracking.
+            if self._close_after_id is not None:
+                try:
+                    self.root.after_cancel(self._close_after_id)
+                except Exception:
+                    pass
+                self._close_after_id = None
+            self._close_scheduled = False
             for event in events:
                 self._apply_event(event)
             self._last_size = size
