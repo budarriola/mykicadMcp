@@ -34,10 +34,10 @@ its own dedicated "LANDED" anchor section elsewhere in this file — go read
 the phase's own anchor for what shipped, tool/test counts at that landing,
 and residuals; don't rely on this snapshot for that detail.
 
-- **Landed & coordinator-verified**: Phases 1–9 and 7.1 through 7.20 in
+- **Landed & coordinator-verified**: Phases 1–9 and 7.1 through 7.22 in
   full — every one has a "### 7.x — LANDED" (or "## Phase N — LANDED")
   anchor in place below with its full write-up. Current state: 94 MCP tools
-  registered, 476-test suite green (7 pre-existing failures are real-board
+  registered, 501-test suite green (7 pre-existing failures are real-board
   drift from the user's own continued hand-routing — see the ⭐ findings
   section below for detail — not caused by any landed feature).
   Plus a large-board-with-a-handful-of-unrouted-connections test fixture
@@ -49,16 +49,16 @@ and residuals; don't rely on this snapshot for that detail.
   narrative for the routing-capability arc (7.3b through M7) and several
   root-cause diagnoses future work still depends on, not a redundant log.
 - **Next work when resumed (updated 2026-07-29 — M7 fully landed: 7.18,
-  7.19, 7.20 all done; Phase 7.21 via placement safety also LANDED same day,
-  see their anchors).** User priority set 2026-07-29, in order: **(1) Phase
-  7.22 bus-first direct routing pass — spec'd, NOT yet started, do this
-  next** (see its section right after the 7.21 anchor — queued behind 7.21 to
-  avoid two concurrent worktree agents editing the same hot `route_nets`
-  functions; that's no longer a concern now that 7.21 is merged); (2) Phase
-  7.6 whole-board optimization; (3) M6 item 17(c) Flow B stack-up-gate
-  question. Phase 7.13 (impedance-matched traces) remains explicitly
-  deprioritized by the user — do not start it without being asked. Still
-  open, low priority: the small 7.3b "any same-net copper" termination bit.
+  7.19, 7.20 all done; Phase 7.21 via placement safety and Phase 7.22
+  bus-first direct routing also LANDED same day, see their anchors).** User
+  priority set 2026-07-29, in order: **(1) Phase 7.6 whole-board
+  optimization — next up** (7.21 and 7.22 are both now merged, so nothing
+  blocks this); (2) M6 item 17(c) Flow B stack-up-gate question. Phase 7.13
+  (impedance-matched traces) remains explicitly deprioritized by the user —
+  do not start it without being asked. Still open, low priority: the small
+  7.3b "any same-net copper" termination bit, and reassessing whether 7.22's
+  `bus_first_direct_corridor_mm` default should flip once 7.6 exists (see
+  its anchor's honest tradeoff note).
 - Verify claims against the code (`kicad_pcb_tool.py`, `kicad_mcp_server.py`,
   `tests/`) rather than trusting this snapshot if they disagree — and then fix
   this file.
@@ -2617,7 +2617,7 @@ than fake one.
 
 ---
 
-## Phase 7.22 — Bus-first direct routing pass — SPEC'd 2026-07-29, not yet started
+## Phase 7.22 — Bus-first direct routing pass — LANDED 2026-07-29 (anchor)
 
 **User directive (2026-07-29), verbatim intent:** "when routing start with the
 busses in the most direct line, they can be riped up and optimized later."
@@ -2661,16 +2661,69 @@ Two distinct changes, both in `route_nets`'s worklist, not the global-route
    would defeat the "route buses directly now, fix it up later" intent and
    duplicate work 7.6 already owns.
 
-**Sequencing note (coordinator, 2026-07-29):** spec'd but intentionally
-queued behind 7.21 — both would touch `kicad_router_tool.py`'s core
-`route_nets` worklist/window machinery, and 7.21 is already in flight with a
-subagent as of this writing. Land and merge 7.21 first to avoid two
-concurrent worktree edits colliding in the same hot functions, then take up
-7.22 before Phase 7.6 (per the same 2026-07-29 priority ordering — this
-directly affects what geometry Phase 7.6 will have to optimize on top of, so
-it belongs before, not after, that work).
+**LANDED 2026-07-29** (Opus subagent, worktree-isolated, branched after 7.21
+merged; coordinator-reviewed: full diff read directly plus an independent
+full-suite run on the merged tree). Ordering: `autorouter.bus_first` (default
+**True** — this IS the deliverable, per the user's directive) sorts every
+bus-member net (from `_bus_member_nets`, flattening the SAME
+`_crosstalk_bus_groups` resolution 7.20 already computes — resolved once and
+shared with the crosstalk block, so the worklist and the cost model can
+never disagree about what a bus is) strictly before every non-member net,
+with the existing `(-priority, airline_length_mm, net)` key preserved
+verbatim as the tie-break inside and after that group. Self-inerting: a
+bus-less board has an empty member set and takes the literal pre-7.22 sort.
 
-**Not yet started** — spec only.
+**Directness — the investigation resolved the spec's open design question
+decisively, not just "picked one":** option (a) is not merely insufficient,
+it is structurally impossible — `deviation_mm` (Phase 6) has **zero**
+references anywhere in `kicad_router_tool.py`; it exists only as a post-hoc
+scoring metric in `kicad_pcb_tool.py`'s `get_trace_cost`, never something the
+router's A* is steered by. The actual empty-board bowing comes from
+`_direction_factor`'s `off_direction` term (against-axis runs cost 2×, 45°
+diagonals are always neutral) — measured on a bus fixture with NO copper on
+the board at all, a 12.0 mm airline routed as 16.971 mm (exactly 12·√2).
+Landed as option (b): `_straight_line_corridor` (new) + `autorouter.
+bus_first_direct_corridor_mm` (default **0.0**, off) — a corridor around the
+straight pad-to-pad line, reusing the existing `off_corridor` weight (no new
+cost term, `_build_fine_cost`/`_build_cost_arrays`/numpy/GPU tiers
+untouched), swapped in at the FIRST routing attempt only (`use_corridor`
+already scopes this — every rip-up re-route runs corridor-free, so a
+ripped-up bus net re-routes normally, not pinned back to its airline).
+Measured at `bus_first_direct_corridor_mm: 0.6` on a 1-destination fixture:
+58.148 mm/4 vias → exactly 55.000 mm/0 vias, and faster (1.36s → 0.48s).
+
+**Honest tradeoff on record (why the directness knob ships OFF, unlike
+ordering):** on a denser 3-destination fixture the same knob improves
+geometry (ratio 1.1082 → 1.0547, vias 18 → 8) but 3 of 12 connections stop
+routing (`unreachable_in_window`, blocked by another bus net's now-dead-
+straight copper ~1.0 mm away — a `same_net_via_blocker` against its own pad,
+correctly refused per the just-landed 7.21), rip-up spent 3 iterations/7
+rips without recovering them, and runtime went 21s → 214s. This is exactly
+the deferred-conflict tradeoff the user's directive accepted ("ripped up and
+optimized later" implies Phase 7.6 is the eventual reconciler, not yet
+built) — the subagent deliberately did not add anything to mitigate it, since
+that would be 7.6's job, not 7.22's. Reassess whether to flip this knob's
+default once Phase 7.6 exists.
+
+**Point 3 verified directly, not just claimed:** `_straight_line_corridor`
+is a pure function of the connection's own two endpoints only — no obstacle
+list, no placement state, no congestion field, no reservation — and
+`test_direct_corridor_ignores_already_placed_copper` asserts this by
+scanning the function body. No conflict-avoidance/lookahead logic exists
+anywhere in the landed diff.
+
+**Honest residual:** `_route_hierarchical` (the rare last-resort tier) is
+deliberately not wired for the directness knob, mirroring 7.12's neck-down
+precedent — a bus net that only routes via that fallback lands on the coarse
+global-stage path, not its airline.
+
+20 new tests (`tests/test_bus_first_routing.py`): both tie-break directions,
+both bus-membership sources, and inertness proven as a full byte-identical
+geometry digest (not just net order) when there are no detected/confirmed
+buses, plus a monkeypatch proving `_straight_line_corridor` is never even
+called at the shipped default. Full suite: 481→501 passed, same 7
+pre-existing kiln board-drift failures, unaffected (confirmed by the
+coordinator's own independent run on the merged tree).
 
 ---
 
