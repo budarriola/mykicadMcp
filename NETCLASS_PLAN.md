@@ -165,14 +165,12 @@ For whoever (human or AI) picks this up next:
   The 35 failures are now `unreachable_in_window` (genuine dense-board
   pathfinding), not budget — closing that gap is Opus-class whole-board
   optimization (7.6), not a bounded Sonnet patch. See ⭐ findings.
-- **Next work when resumed (updated 2026-07-28 — M7's 7.18 and 7.19 both
-  landed, see their anchors):** (1) Phase 7.20 adjacent-layer crosstalk
-  avoidance — branch its worktree fresh from current `main` (do not reuse an
-  older worktree — see the M7 sequencing note on why 7.18's dispatch predated
-  the M5 merge and needed an integration pass as a result). (2) Phase 7.13
-  impedance-matched traces & matched sets — spec'd (see its section),
-  Opus-class, not yet started. Still open: M6 item 17 (c) Flow B stack-up-gate
-  question, and the small 7.3b "any same-net copper" termination bit.
+- **Next work when resumed (updated 2026-07-28 — M7 fully landed: 7.18,
+  7.19, 7.20 all done, see their anchors):** (1) Phase 7.13 impedance-matched
+  traces & matched sets — spec'd (see its section), Opus-class, not yet
+  started; this is the only substantial open item left in the plan. Still
+  open: M6 item 17 (c) Flow B stack-up-gate question, and the small 7.3b
+  "any same-net copper" termination bit.
 - Verify claims against the code (`kicad_pcb_tool.py`, `kicad_mcp_server.py`,
   `tests/`) rather than trusting this snapshot if they disagree — and then fix
   this file.
@@ -703,14 +701,19 @@ router work):
   (Opus subagent, worktree-isolated, coordinator-reviewed — full diff read,
   independent full-suite run, AND an independent wall-clock spot-check on
   the real kiln board; see its anchor for the honest wall-clock finding).
-  398→435 passed, same 7 pre-existing failures. **The only clearly-open
-  items remaining anywhere in the plan are Phase 7.20, Phase 7.13
-  impedance-matched traces** (spec'd, not started) **and assorted
-  low-priority residuals** (viewer cancel-flag/decision banner, portfolio
-  replicas, hybrid GPU/CPU scheduling, driving `torch` as a second GPU array
-  module, the small 7.3b "any same-net copper" termination bit, and
-  real-hardware GPU verification — no cupy/torch installed in this
-  environment).
+  398→435 passed, same 7 pre-existing failures.
+  (26) ✅ **Phase 7.20 adjacent-layer crosstalk avoidance LANDED 2026-07-28**
+  (Opus subagent, worktree-isolated, coordinator-reviewed — cost-model
+  integration read directly, independent full-suite run on the merged tree;
+  see its anchor). 435→457 passed, same 7 pre-existing failures. **This
+  closes milestone M7 in full** — all three phases the user requested this
+  session (7.18, 7.19, 7.20) are landed. **The only clearly-open item
+  remaining anywhere in the plan is Phase 7.13 impedance-matched traces**
+  (spec'd, not started) **and assorted low-priority residuals** (viewer
+  cancel-flag/decision banner, portfolio replicas, hybrid GPU/CPU scheduling,
+  driving `torch` as a second GPU array module, the small 7.3b "any same-net
+  copper" termination bit, and real-hardware GPU verification — no
+  cupy/torch installed in this environment).
 
 ## How to work this plan (living document — keep it current)
 
@@ -2567,54 +2570,63 @@ a dramatic end-to-end speedup; a board with more mid-difficulty congested
 routing (neither trivially easy nor topologically impossible) would show it
 more.
 
-## Phase 7.20 — Adjacent-layer parallel-trace (crosstalk) avoidance (added 2026-07-28 at user request)
+## Phase 7.20 — Adjacent-layer parallel-trace (crosstalk) avoidance — LANDED 2026-07-28 (anchor)
 
-User priority: avoid routing a trace parallel and closely spaced to another
-net's trace on a directly adjacent copper layer, unless the two nets are part
-of the same confirmed bus (where running parallel is expected/desired — see
-Phase 3/Flow A's `confirmed_buses`).
+(Opus subagent, worktree-isolated, coordinator-reviewed: read the cost-model
+integration directly and ran the full suite independently on the merged
+tree. **This closes milestone M7 in full** — all three user-requested
+phases (7.18, 7.19, 7.20) are now landed.)
 
-- **New `pcb_settings.json` block** `crosstalk`: `{enabled: true,
-  adjacent_layer_penalty_per_mm: <cost/mm>, min_parallel_run_mm: <threshold
-  before the penalty engages — a short incidental overlap is not crosstalk>,
-  min_spacing_mm: <XY offset within which two layers' traces count as
-  "aligned">, same_bus_exempt: true}`. `enabled: false`-equivalent default
-  (penalty 0) so an untuned project is byte-identical to today.
-- **Cost term.** During detailed A*, when a candidate cell/segment on layer L
-  has existing copper (this run's own placements + already-routed board
-  copper) directly on the STACK-ADJACENT layer (ordinal-adjacent per
-  `get_kicad_board_layers`, not just "any other layer" — a non-adjacent layer
-  pair has a reference plane or enough dielectric between them that this
-  doesn't apply) within `min_spacing_mm` in XY, and that copper's net is
-  DIFFERENT from the net being routed AND the two nets are not members of the
-  same `confirmed_buses` entry (board-local JSON) or the same `detect_buses`
-  candidate, accrue `adjacent_layer_penalty_per_mm` for the overlapping run
-  length once it exceeds `min_parallel_run_mm`. Same-bus members must incur
-  NO penalty against each other (that's the exemption) but still incur it
-  against a third-party net's copper on the adjacent layer.
-- **Exemption correctness is the hard part**: a false exemption silently
-  disables the feature for real risk, and a false penalty makes normal bus
-  routing artificially expensive. Test both directions explicitly — two
-  confirmed SPI members routing directly above/below each other must be
-  penalty-free; an SPI net and an unrelated GPIO net doing the same must not
-  be.
-- Gate: real-kiln measurement (which existing adjacent-layer parallel runs
-  get penalized, board score before/after with the term at a nonzero weight),
-  parity at the default (penalty 0, byte-identical to pre-7.20 routing), and
-  new tests for the adjacency-detection, spacing threshold, run-length
-  threshold, and same-bus exemption (both directions) individually. Delegate:
-  Opus (new cost term in the same router core).
+New `pcb_settings.json` block `crosstalk`: `{enabled: true,
+adjacent_layer_penalty_per_mm: 0.0, min_spacing_mm: 0.3, min_parallel_run_mm:
+2.0, same_bus_exempt: true}`. Inert by construction at the default
+(`penalty_per_mm` 0.0) — `_resolve_crosstalk` returns `None` rather than a
+zero-weighted payload, and both `_build_fine_cost` (cpu) and
+`_build_cost_arrays` (numpy/gpu) branch on `crosstalk is None` to execute the
+exact pre-7.20 arithmetic, not `+0.0`. During detailed A*, a planar move
+landing within `min_spacing_mm` of a *different*, non-bus-exempt net's track
+copper (this run's own placements + already-routed board copper) on a
+stack-adjacent copper layer accrues `adjacent_layer_penalty_per_mm × dist_mm`
+— priced in the same position/shape as the existing `off_corridor`/
+`away_from_home_per_mm` terms, so the surcharge scales with run length
+without the A* state needing to remember any length itself, and both
+backends stay bit-identical by construction (same summand order).
+`min_parallel_run_mm` is applied to the AGGRESSOR SEGMENT'S OWN LENGTH at
+routing time (the only reading a per-cell term can express — the true
+"how long do these two paths stay aligned" doesn't exist until the path
+does); the exact overlap-length semantics live in the new read-only
+`audit_kicad_crosstalk` tool, which measures real emitted geometry.
 
-**Sequencing note (coordinator, 2026-07-28):** all three of 7.18/7.19/7.20
-touch `kicad_router_tool.py`'s cost model and/or `_FineWindow`/`_fine_search`
-call sites — the same surface M5 just changed. Land them ONE AT A TIME
-(worktree branched from the CURRENT `main` at dispatch time, reviewed and
-merged before the next starts), not as three parallel delegations, to avoid
-three-way conflicts in the hottest file in the codebase. Order per the user's
-stated priority: 7.18 first (**LANDED 2026-07-28, see its anchor** — its
-worktree was dispatched before the M5 merge landed and needed an explicit
-integration pass as a result; branch remaining items from `main` freshly, not
-from an older worktree, to avoid repeating that), then 7.19, then 7.20.
+**Same-bus exemption** draws on both `confirmed_buses` (board-local JSON)
+and `detect_buses` candidates, so a board that hasn't been walked through
+Flow A still gets sane defaults rather than the feature being actively
+harmful on first use. Failure direction is deliberate: any problem reading
+either exemption source degrades to FEWER exemptions (more nets penalized),
+never more — the safe direction for a crosstalk check, since a false
+exemption silently hides real risk while a false penalty is merely
+conservative. `audit_kicad_crosstalk` reports both `violations` and
+`exempt_runs` explicitly, so a false exemption would be visible in the
+output rather than invisible.
+
+**Honest real-kiln finding:** kiln's own stack-up has **zero track-vs-track
+adjacency** — F.Cu and B.Cu (its only two track layers) are three layers
+apart with two plane layers (In1.Cu, In2.Cu) between them, so the term has
+nothing to flag on this board's real geometry as routed. `audit_kicad_
+crosstalk`'s `adjacent_layer_pairs` parameter exists for exactly this case —
+a stack-up what-if ("what would this same routing cost on a 2-layer board
+where F.Cu/B.Cu ARE adjacent?") against the same real geometry, which is how
+the feature was actually exercised/validated on kiln. The exemption logic
+itself is verified with kiln's real confirmed/detectable buses (SPI
+`/MainControler/`, I2C `/MainControler/`, SPI `/SaftyProcessor/`), not only
+synthetic fixtures.
+
+New MCP tool `audit_kicad_crosstalk` (94 tools, was 92). 22 new tests in
+`tests/test_crosstalk.py`. Full suite: 435→457 passed, same 7 pre-existing
+board-drift failures unaffected (confirmed by the coordinator's own
+independent run on the merged tree — an 8th failure the subagent saw
+mid-session was confirmed a load-induced flake from too many concurrent
+route calls competing for cores, not a regression, and passes cleanly in
+isolation).
 
 ---
 
@@ -3067,19 +3079,19 @@ touched by this work, no write occurred).
     equidistant-trunk splitting.
 
 **M7 — Fill/via engineering, route-search speed, crosstalk avoidance (added
-2026-07-28 at user request):**
-22. Phase 7.18 multi-layer plane fill & via-mediated connectivity — **LANDED
-    2026-07-28** (see its anchor: 7.18.1 attachment-choice ranking behind
+2026-07-28 at user request) — FULLY LANDED 2026-07-28, all three items:**
+22. Phase 7.18 multi-layer plane fill & via-mediated connectivity — **LANDED**
+    (see its anchor: 7.18.1 attachment-choice ranking behind
     `plane.multilayer_attachment_choice`, 7.18.2 cross-layer continuity audit,
     7.18.3 return-path-aware via placement behind `plane.return_path_bonus`).
     Nothing remains in this item.
-23. Phase 7.19 lightweight route cost estimation — **LANDED 2026-07-28** (see
-    its anchor: `_GoalDistanceField` heuristic behind
+23. Phase 7.19 lightweight route cost estimation — **LANDED** (see its
+    anchor: `_GoalDistanceField` heuristic behind
     `autorouter.goal_field_heuristic`, candidate pre-ranking + fallback
     behind `autorouter.candidate_fallback`). Nothing remains in this item.
-24. Phase 7.20 adjacent-layer parallel-trace (crosstalk) avoidance — see its
-    section; Opus; land third, after 7.19 merges (all three touch the same
-    router-core surface — see the sequencing note in Phase 7.20's section).
+24. Phase 7.20 adjacent-layer parallel-trace (crosstalk) avoidance —
+    **LANDED** (see its anchor: `crosstalk` block in `pcb_settings.json`,
+    new `audit_kicad_crosstalk` tool). Nothing remains in this item.
 
 **Every milestone:** docs for its tools (`docs/mcp-tools/10-…`/`11-…`), README +
 CLAUDE.md tool count/group sync, `.gitignore`/requirements entries when that
