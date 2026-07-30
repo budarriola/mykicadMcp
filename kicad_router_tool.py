@@ -7167,6 +7167,24 @@ def _route_one_candidate(
         out.update({"routed": True, "segments": wsegments, "vias": wvias, "win": wwin})
         return out
 
+    # LAST RESORT TIER 3 (Phase 7.23 zone-territory soft routing) - OPT-IN, and
+    # strictly the last thing tried: the whole `_route_attempts` ladder, the
+    # hierarchical tier and the whole-board lazy tier have all failed by the
+    # time control reaches here, so no connection that routes today can ever
+    # see this call and `allow_zone_soft_route=False` (the default) skips it
+    # outright. Scoped to `candidate_index == 0` so exactly ONE candidate is
+    # produced per connection even with 7.19.2's alternate-candidate fallback
+    # enabled. This does NOT route the connection: it records a SPECULATIVE
+    # candidate on `out` and falls through to the ordinary failure report
+    # below. `route_nets` verifies it against a real kicad-cli refill before it
+    # is allowed anywhere near the board (see `_route_zone_soft`).
+    if candidate_index == 0 and ctx.get("allow_zone_soft_route"):
+        soft = _route_zone_soft(ctx, conn, net, net_kind, from_xy, to_xy,
+                                start_layers, goal_layers, active_obstacles,
+                                congestion, home_layer, plane_layers, goal_planes)
+        if soft is not None:
+            out["zone_soft"] = soft
+
     if not any_built:
         # every attempted window exceeded the node budget - the pathological
         # large window (nothing was ever searched).
@@ -7322,6 +7340,441 @@ def _route_wide_lazy(
                                        "cols": win.cols, "rows": win.rows,
                                        "nodes": win.cols * win.rows * n_layers}
     return rec_updates, segments, vias, win
+
+
+# --------------------------------------------------------------------------- #
+# Phase 7.23 — zone-territory SOFT routing (opt-in `allow_zone_soft_route`).
+#
+# THE BUG THIS FIXES. On a from-scratch board most `unreachable_in_window` /
+# `self_check_failed` failures are a signal pad with a filled foreign GND/power
+# zone at `distance_mm: 0.0` and `owner: null` — nothing rippable, because the
+# obstacle is the ZONE'S OWN FILL POLYGON, not any track/via. Real KiCad does
+# not have this problem: when you draw a trace and refill, the fill algorithm
+# recomputes clearance around EVERY copper item present at fill time, including
+# the trace you just drew. The pour was never a fixed shape a trace has to
+# dodge — it is supposed to YIELD. Treating a zone's stale, pre-trace fill as a
+# permanent hard obstacle is backwards for exactly this case (and correct for
+# every other one, which is why nothing here changes for tracks/vias/pads).
+#
+# WHAT THIS TIER DOES, AND WHAT IT REFUSES TO DO. It re-runs the search with the
+# foreign zone FILLS treated as non-blocking for this net; every other obstacle
+# (pads, tracks, vias, Edge.Cuts, same-net rules, netclass clearance) still
+# blocks exactly as before. If the resulting copper conflicts with ANY of those
+# real hard obstacles the tier declines outright — a connection is only ever a
+# candidate when 100% of what stands in its way is foreign zone fill.
+#
+# AND IT DOES NOT TRUST ITSELF. A candidate produced here is NOT routed: it is
+# handed back to `route_nets`, which collects every candidate from the whole
+# call, writes them to a SCRATCH copy of the board, has KICAD-CLI refill the
+# zones authoritatively (`refill_zones_with_kicad`), reads the REAL refilled
+# polygons back, and only then measures whether the candidate's copper actually
+# clears the new fill. Candidates that don't are rejected and stay `failed`
+# (`zone_soft_route_rejected`, with the measured gap). Deliberately NOT done:
+# modelling KiCad's thermal-relief/clearance fill maths in Python — that
+# estimate is the source of this bug, not its fix. kicad-cli is the ground
+# truth here, exactly as it already is for plane-via writes.
+# --------------------------------------------------------------------------- #
+
+def _is_soft_zone_obstacle(ob: "_Obst", net: str) -> bool:
+    """True for the ONLY obstacle kind Phase 7.23 may treat as non-blocking: a
+    FOREIGN (`ob.net != net`), board-owned (`owner is None` — a zone fill is
+    never autorouter-placed) copper ZONE FILL. Everything else — pads
+    (`is_pad`), tracks/vias (`kind in ("seg", "pt")`), Edge.Cuts (`is_edge`),
+    and this net's own fill — is excluded and keeps blocking unconditionally,
+    with or without the flag."""
+    return (ob.kind == "zone" and ob.owner is None
+            and not ob.is_edge and ob.net != net)
+
+
+def _zone_fill_obstacles(board_path: Path, routable: set[str],
+                         all_cu: list[str]) -> list["_Obst"]:
+    """Zone-fill `_Obst`s ONLY, rebuilt from a board's current `filled_polygon`
+    blocks. Used to re-read a SCRATCH board's fills after kicad-cli refilled
+    them, so the Phase 7.23 verification measures against KiCad's authoritative
+    post-trace fill rather than the stale pre-trace one. Deliberately a narrow
+    subset of `_collect_obstacles` (no tracks/pads/edges): the verification's
+    only open question is the zone-clearance term."""
+    fills = _zone_fill_index_cached(board_path)
+    obs: list[_Obst] = []
+    for net_name, fill_list in fills.items():
+        for zf in fill_list:
+            if zf["layer"] not in routable:
+                continue
+            obs.append(_Obst("zone", net_name, frozenset([zf["layer"]]), 0.0,
+                             zf["pts"][0][0], zf["pts"][0][1],
+                             zf["pts"][0][0], zf["pts"][0][1],
+                             raster=zf.get("raster"), pts=zf["pts"]))
+    return obs
+
+
+def _min_dist_seg_to_poly(ax: float, ay: float, bx: float, by: float,
+                          pts: list[tuple[float, float]]) -> float:
+    """Minimum distance from segment A-B to a fill polygon (0.0 where the
+    segment is INSIDE the fill). Sampled at the same 0.1 mm pitch
+    `_Obst.seg_within` already uses for its zone test, so the measured number
+    and the router's own boolean clearance test agree about the same geometry
+    instead of two subtly different discretizations."""
+    length = math.hypot(bx - ax, by - ay)
+    nsamp = max(2, int(length / 0.1) + 1)
+    best = math.inf
+    for i in range(nsamp + 1):
+        t = i / nsamp
+        d = _dist_point_poly(ax + t * (bx - ax), ay + t * (by - ay), pts)
+        if d < best:
+            best = d
+        if best <= 0.0:
+            return 0.0
+    return best
+
+
+def _zone_clearance_gaps(net: str, segments: list[dict[str, Any]],
+                         vias: list[dict[str, Any]], zone_obs: list["_Obst"],
+                         rules: dict[str, Any], via_radius: float) -> list[dict[str, Any]]:
+    """MEASURED clearance shortfalls of proposed copper against foreign zone
+    fills. One record per (copper item, zone) pair whose true edge-to-edge
+    distance is below the netclass clearance, carrying both the required and
+    the measured number so a rejection can say by how much it missed.
+
+    Empty list == this copper genuinely clears every foreign fill it was
+    measured against. Same-net fills are skipped (a net's route legitimately
+    touches its own pour). NOTE the deliberate absence of the `via_transparent`
+    anti-pad exemption `_self_check` applies: this runs against fills KiCad has
+    ALREADY refilled with the candidate copper in place, so a real anti-pad is
+    real geometry here and shows up as real clearance — exempting it would be
+    assuming the very thing this check exists to prove."""
+    clearance = rules["clearance"]
+    track_width = rules["track_width"]
+    gaps: list[dict[str, Any]] = []
+    for ob in zone_obs:
+        if ob.net == net or not ob.pts:
+            continue
+        layer = sorted(ob.layers)[0] if ob.layers else ""
+        for s in segments:
+            if s["layer"] not in ob.layers:
+                continue
+            need = s.get("width", track_width) / 2.0 + clearance
+            measured = _min_dist_seg_to_poly(s["x1"], s["y1"], s["x2"], s["y2"], ob.pts)
+            if measured < need - 1e-6:
+                gaps.append({"kind": "segment", "layer": s["layer"],
+                             "zone_net": ob.net, "zone_layer": layer,
+                             "required_mm": round(need, 4),
+                             "measured_mm": round(measured, 4),
+                             "gap_mm": round(measured - need, 4)})
+        for v in vias:
+            need = via_radius + clearance
+            measured = _dist_point_poly(v["x"], v["y"], ob.pts)
+            if measured < need - 1e-6:
+                gaps.append({"kind": "via", "layer": None,
+                             "zone_net": ob.net, "zone_layer": layer,
+                             "required_mm": round(need, 4),
+                             "measured_mm": round(measured, 4),
+                             "gap_mm": round(measured - need, 4)})
+    return gaps
+
+
+def _route_zone_soft(
+    ctx: dict[str, Any], conn: dict[str, Any], net: str, net_kind: str,
+    from_xy: tuple[float, float], to_xy: tuple[float, float],
+    start_layers: list[str], goal_layers: set[str],
+    active_obstacles: list["_Obst"], congestion: dict[tuple[int, int, str], int],
+    home_layer: str | None,
+    plane_layers: dict[str, list[dict[str, Any]]] | None,
+    goal_planes: dict[str, list[dict[str, Any]]] | None,
+) -> dict[str, Any] | None:
+    """Phase 7.23 last-resort SPECULATIVE search with foreign zone fills soft.
+
+    Returns None (the overwhelmingly common answer, and the answer for every
+    connection whose blockers are not 100% foreign zone fill) or a candidate
+    dict — NEVER a routed connection. The caller records the candidate and
+    `route_nets` decides its fate after a kicad-cli-verified refill; nothing
+    here is ever emitted on its own authority.
+
+    The three gates, in order:
+      1. There must BE a foreign zone fill in the way (else this tier is just
+         the wide-lazy tier again, which already ran and failed).
+      2. The search + `_finalize_core` self-check must pass against the HARD
+         obstacle set (every pad/track/via/edge/same-net rule at full netclass
+         clearance) — softening zone fill never softens anything else.
+      3. Re-checking the SAME copper against the FULL obstacle set (fills
+         included) must produce violations that are *exclusively* foreign zone
+         fills. One violation against a pad, track, via or edge and this tier
+         declines: that connection is blocked by something a refill will not
+         move, so it fails normally, exactly as it does today.
+
+    Determinism: a pure function of its inputs, over a fixed whole-board window
+    at a `_choose_grid`-chosen grid, using the same A*/backtrace as every other
+    tier — no randomness, no worker-count dependence."""
+    soft = [ob for ob in active_obstacles if _is_soft_zone_obstacle(ob, net)]
+    if not soft:
+        return None  # gate 1: nothing to soften - this tier has nothing to add
+    soft_ids = {id(ob) for ob in soft}
+    hard = [ob for ob in active_obstacles if id(ob) not in soft_ids]
+
+    board_bbox = ctx["board_bbox"]
+    board_min = ctx["board_min"]
+    routable_layers = ctx["routable_layers"]
+    layer_types = ctx["layer_types"]
+    grid = ctx["grid"]
+    rules = ctx["rules"]
+    track_half = ctx["track_half"]
+    via_radius = ctx["via_radius"]
+    backend = ctx["backend"]
+    pad_escape_aware = bool(ctx.get("pad_escape_direction_aware", False))
+    allow_via_in_pad = bool(ctx.get("allow_via_in_pad", False))
+    ml_attach = bool(ctx.get("multilayer_attachment", False))
+    goal_field = bool(ctx.get("goal_field_heuristic", False))
+    return_path = (ctx.get("return_path_by_net") or {}).get(net)
+
+    minx = board_bbox[0] - grid
+    miny = board_bbox[1] - grid
+    maxx = board_bbox[2] + grid
+    maxy = board_bbox[3] + grid
+    span_x, span_y = maxx - minx, maxy - miny
+    if span_x <= 0 or span_y <= 0:
+        return None
+    n_layers = max(1, len(routable_layers))
+    win_grid = _choose_grid(span_x, span_y, n_layers, grid, ctx["max_grid_mm"],
+                            _MAX_LAZY_WINDOW_NODES)
+    win = _FineWindow(minx, miny, maxx, maxy, win_grid, routable_layers,
+                      layer_types, net, lazy=True,
+                      allow_via_in_pad=allow_via_in_pad)
+    if win.cols * win.rows * n_layers > _MAX_LAZY_WINDOW_NODES:
+        return None
+    win.build(hard, track_half, via_radius, rules["clearance"], rules["edge_clearance"])
+
+    s_cell = win.nearest_free(from_xy[0], from_xy[1], start_layers,
+                              toward_xy=to_xy if pad_escape_aware else None) or win.cell_of(*from_xy)
+    g_cell = win.nearest_free(to_xy[0], to_xy[1], list(goal_layers),
+                              toward_xy=from_xy if pad_escape_aware else None) or win.cell_of(*to_xy)
+    win_cong = _project_congestion(win, congestion, board_min[0], board_min[1], grid)
+    # No corridor, same reasoning as the wide-lazy tier: the point of a
+    # last-resort tier is to find a path the global stage never contemplated.
+    path = _fine_search(backend, win, net_kind, ctx["weights"], ctx["layer_purpose"],
+                        ctx["directions"], s_cell, start_layers, g_cell, goal_layers,
+                        home_layer, None, win_cong, plane_layers, goal_planes,
+                        ctx["plane_step"], ctx["attachment_via_cost"],
+                        ml_attach, return_path, goal_field,
+                        _crosstalk_for(ctx, win, hard, net),
+                        _settings=ctx.get("gpu_settings"))
+    if path is None:
+        return None
+
+    # Gate 2: exact clearance against everything EXCEPT the softened fills.
+    rec_updates, segments, vias, _violations = _finalize_core(
+        ctx, net, win, path, from_xy, to_xy, hard,
+        max(span_x, span_y), plane_layers, conn)
+    if rec_updates is None:
+        return None
+
+    # Gate 3: what does this copper actually conflict with, fills included?
+    full_violations = _self_check(net, segments, vias, active_obstacles, rules,
+                                  via_radius, allow_via_in_pad)
+    for v in full_violations:
+        if not (v.get("against_kind") == "zone" and v.get("owner") is None
+                and not v.get("against_is_pad") and v.get("against_net") != net):
+            return None  # a REAL hard blocker in the mix - tier does not apply
+
+    # Which fills does it actually intrude on? Measured against the CURRENT
+    # (stale, pre-trace) polygons - reporting only; the accept/reject decision
+    # is made later against kicad-cli's refilled ones.
+    stale_gaps = _zone_clearance_gaps(net, segments, vias, soft, rules, via_radius)
+    zones: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for g in stale_gaps:
+        key = (g["zone_net"], g["zone_layer"])
+        if key not in seen:
+            seen.add(key)
+            zones.append({"net": g["zone_net"], "layer": g["zone_layer"]})
+    zones.sort(key=lambda z: (z["net"], z["layer"]))
+
+    rec_updates = dict(rec_updates)
+    rec_updates["zone_soft_route"] = {
+        "zones": zones,
+        "window": {"grid_mm": round(win_grid, 6), "cols": win.cols, "rows": win.rows},
+    }
+    return {"rec_updates": rec_updates, "segments": segments, "vias": vias,
+            "zones": zones, "net": net,
+            "stale_zone_violations": len(stale_gaps)}
+
+
+# Bound on the scratch-refill fixed-point loop below. Each round rejects at
+# least one candidate, so the loop terminates in at most `len(candidates)`
+# rounds anyway; this caps the number of (slow) kicad-cli invocations for a
+# pathological board and is reported honestly when it bites.
+_ZONE_SOFT_MAX_VERIFY_ROUNDS = 6
+
+
+def _zone_soft_candidate_blocks(cand: dict[str, Any], rules: dict[str, Any],
+                                routable_layers: list[str], all_cu: list[str],
+                                prefix: str) -> list[str]:
+    """The `(segment)`/`(via)` board-text blocks for one candidate, built by the
+    SAME `_segment_block`/`_via_block` writers `route_nets`'s real emit path
+    uses - so what kicad-cli refills around on the scratch copy is byte-for-byte
+    the copper that would be written for real."""
+    blocks: list[str] = []
+    net = cand["net"]
+    for i, s in enumerate(cand["segments"]):
+        blocks.append(_segment_block(s, net, s.get("width", rules["track_width"]),
+                                     f"{prefix}-seg-{i}"))
+    top, bottom = routable_layers[0], routable_layers[-1]
+    if all_cu:
+        top, bottom = all_cu[0], all_cu[-1]
+    for i, v in enumerate(cand["vias"]):
+        blocks.append(_via_block(v, net, rules["via_diameter"], rules["via_drill"],
+                                 top, bottom, f"{prefix}-via-{i}"))
+    return blocks
+
+
+def _verify_zone_soft_candidates(
+    project_path: str | Path, board_path: Path,
+    candidates: dict[int, dict[str, Any]],
+    base_obstacles: list["_Obst"], placement_obstacles: list["_Obst"],
+    rules: dict[str, Any], via_radius: float, track_half: float,
+    routable_layers: list[str], routable_set: set[str], all_cu: list[str],
+    allow_via_in_pad: bool,
+) -> dict[str, Any]:
+    """Phase 7.23 acceptance gate: decide which speculative zone-soft candidates
+    may touch the real board. Three stages, in this order:
+
+    STAGE 1 (conflict filter, no kicad-cli). Candidates were each searched
+    against a snapshot that did not include the OTHER candidates (the
+    speculative pass searches against base obstacles only, by design). Walk them
+    in canonical owner order and self-check each against base copper + every
+    committed placement + every candidate already accepted in this walk, with
+    the foreign zone fills softened. A candidate that collides with real copper
+    here is rejected before kicad-cli is ever invoked.
+
+    STAGE 2 (authoritative refill). Copy the project to scratch, append every
+    surviving candidate's copper, and let `refill_zones_with_kicad` recompute
+    the pours WITH that copper present - the one thing Python must not
+    estimate. Read the refilled polygons back and MEASURE each candidate's
+    clearance against them (`_zone_clearance_gaps`). Anything short is rejected
+    with its measured gap.
+
+    STAGE 3 (fixed point). Rejecting a candidate changes the fill (less copper
+    for KiCad to clear around means the pour grows back), so the surviving set
+    must be re-verified against a refill computed for exactly that set. Repeat
+    until a round rejects nothing. Bounded by `_ZONE_SOFT_MAX_VERIFY_ROUNDS`;
+    if the bound bites, every still-unverified candidate is REJECTED rather
+    than accepted on a stale measurement.
+
+    No kicad-cli on the machine => stage 2 cannot run => every candidate is
+    rejected with `reason: "kicad-cli not found"`, the same auto-skip
+    `refill_zones_with_kicad` already does. Never silently accepted."""
+    accepted: dict[int, dict[str, Any]] = {}
+    rejected: dict[int, dict[str, Any]] = {}
+
+    # ---- stage 1: conflict filter -----------------------------------------
+    running: list[_Obst] = list(base_obstacles) + list(placement_obstacles)
+    for owner in sorted(candidates):
+        cand = candidates[owner]
+        net = cand["net"]
+        hard = [ob for ob in running if not _is_soft_zone_obstacle(ob, net)]
+        conflicts = _self_check(net, cand["segments"], cand["vias"], hard,
+                                rules, via_radius, allow_via_in_pad)
+        if conflicts:
+            rejected[owner] = {
+                "reason": "conflicts_with_placed_copper",
+                "detail": ("the speculative candidate was searched against a board "
+                           "snapshot without the other connections' copper and "
+                           "collides with it once they are all present"),
+                "violations": conflicts[:4],
+            }
+            continue
+        accepted[owner] = cand
+        running.extend(_obstacles_from_emit(net, cand["segments"], cand["vias"],
+                                            track_half, via_radius, routable_layers,
+                                            owner))
+
+    report: dict[str, Any] = {
+        "attempted": len(candidates),
+        "conflict_rejected": len(rejected),
+        "verify_rounds": 0,
+        "skipped": False,
+        "reason": None,
+    }
+    if not accepted:
+        report["accepted"] = 0
+        report["rejected"] = len(rejected)
+        return {"accepted": accepted, "rejected": rejected, "report": report}
+
+    # ---- stage 2/3: kicad-cli-verified refill ------------------------------
+    if _find_kicad_cli() is None:
+        report["skipped"] = True
+        report["reason"] = "kicad-cli not found"
+        for owner, cand in accepted.items():
+            rejected[owner] = {
+                "reason": "kicad-cli not found",
+                "detail": ("zone-soft routing requires kicad-cli to refill the zones "
+                           "authoritatively before a candidate can be trusted; without "
+                           "it the candidate is refused, never assumed safe"),
+            }
+        report["accepted"] = 0
+        report["rejected"] = len(rejected)
+        return {"accepted": {}, "rejected": rejected, "report": report}
+
+    rounds = 0
+    with tempfile.TemporaryDirectory() as td:
+        while accepted:
+            rounds += 1
+            if rounds > _ZONE_SOFT_MAX_VERIFY_ROUNDS:
+                for owner, cand in accepted.items():
+                    rejected[owner] = {
+                        "reason": "verification_did_not_converge",
+                        "detail": (f"the surviving-candidate set still changed after "
+                                   f"{_ZONE_SOFT_MAX_VERIFY_ROUNDS} refill rounds; refusing "
+                                   "to accept on a measurement taken for a different set"),
+                    }
+                accepted = {}
+                break
+            scratch = _copy_project_to_scratch(project_path, Path(td) / f"round{rounds}")
+            scratch_board = scratch / board_path.name
+            text = _pcb._read_text(scratch_board)
+            for owner in sorted(accepted):
+                for block in _zone_soft_candidate_blocks(
+                        accepted[owner], rules, routable_layers, all_cu, f"zs{owner:05d}"):
+                    text = _pcb._append_top_level_block(text, block)
+            with scratch_board.open("w", encoding="utf-8", newline="") as handle:
+                handle.write(text)
+            _pcb._invalidate_board_cache(scratch_board)
+            refill = refill_zones_with_kicad(scratch_board)
+            if not refill.get("refilled"):
+                for owner in list(accepted):
+                    rejected[owner] = {
+                        "reason": "refill_failed",
+                        "detail": f"kicad-cli refill did not succeed: {refill}",
+                    }
+                accepted = {}
+                break
+            zone_obs = _zone_fill_obstacles(scratch_board, routable_set, all_cu)
+            round_rejects: list[int] = []
+            for owner in sorted(accepted):
+                cand = accepted[owner]
+                gaps = _zone_clearance_gaps(cand["net"], cand["segments"], cand["vias"],
+                                            zone_obs, rules, via_radius)
+                if gaps:
+                    worst = min(gaps, key=lambda g: g["gap_mm"])
+                    rejected[owner] = {
+                        "reason": "zone_soft_route_rejected",
+                        "detail": ("KiCad's own refill did NOT yield enough clearance around "
+                                   "this copper - the candidate is refused, not written"),
+                        "clearance_gap_mm": worst["gap_mm"],
+                        "measured_mm": worst["measured_mm"],
+                        "required_mm": worst["required_mm"],
+                        "against_zone_net": worst["zone_net"],
+                        "against_zone_layer": worst["zone_layer"],
+                        "gaps": gaps[:4],
+                    }
+                    round_rejects.append(owner)
+            if not round_rejects:
+                break
+            for owner in round_rejects:
+                accepted.pop(owner, None)
+
+    report["verify_rounds"] = rounds
+    report["accepted"] = len(accepted)
+    report["rejected"] = len(rejected)
+    return {"accepted": accepted, "rejected": rejected, "report": report}
 
 
 # --------------------------------------------------------------------------- #
@@ -7654,7 +8107,12 @@ def _worker_route_speculative(item: tuple[int, dict[str, Any]]) -> tuple[int, di
     assert ctx is not None
     out = _route_one(ctx, conn, ctx["base_obstacles"], {}, use_corridor=True)
     return owner, {"routed": out["routed"], "net": out["net"],
-                   "segments": out["segments"], "vias": out["vias"], "rec": out["rec"]}
+                   "segments": out["segments"], "vias": out["vias"], "rec": out["rec"],
+                   # Phase 7.23: None unless `allow_zone_soft_route` is on AND
+                   # this connection exhausted every tier with foreign zone fill
+                   # as its only blocker. Plain dicts/lists/floats - picklable,
+                   # so a pool worker returns exactly what the serial path does.
+                   "zone_soft": out.get("zone_soft")}
 
 
 def _resolve_workers(settings: dict[str, Any]) -> int:
@@ -7700,7 +8158,8 @@ def _run_independent_routes(
         for owner, conn in items:
             out = _route_one(ctx, conn, ctx["base_obstacles"], {}, use_corridor=True)
             results[owner] = {"routed": out["routed"], "net": out["net"],
-                              "segments": out["segments"], "vias": out["vias"], "rec": out["rec"]}
+                              "segments": out["segments"], "vias": out["vias"],
+                              "rec": out["rec"], "zone_soft": out.get("zone_soft")}
         return results
     try:
         worker_ctx = dict(ctx)
@@ -7724,7 +8183,8 @@ def _run_independent_routes(
         for owner, conn in items:
             out = _route_one(ctx, conn, ctx["base_obstacles"], {}, use_corridor=True)
             results[owner] = {"routed": out["routed"], "net": out["net"],
-                              "segments": out["segments"], "vias": out["vias"], "rec": out["rec"]}
+                              "segments": out["segments"], "vias": out["vias"],
+                              "rec": out["rec"], "zone_soft": out.get("zone_soft")}
     return results
 
 
@@ -8013,6 +8473,7 @@ def route_nets(
     max_ripup_iterations: int | None = None,
     refill_zones: bool = False,
     allow_hand_copper_ripup: bool = False,
+    allow_zone_soft_route: bool = False,
 ) -> dict[str, Any]:
     """Phase 7.3b detailed (fine, windowed) routing.
 
@@ -8095,6 +8556,39 @@ def route_nets(
     board text via the same uuid-block-delete surgery `unroute_nets` already
     uses for autorouter-owned copper, so the write stays DRC-consistent with
     what was reported.
+
+    `allow_zone_soft_route` (default False - PHASE 7.23): when True, a
+    connection that has exhausted EVERY routing tier (the whole
+    `_route_attempts` ladder, the hierarchical tier, the whole-board lazy tier)
+    gets one more, strictly last-resort attempt in which FOREIGN ZONE FILLS are
+    treated as non-blocking for that net - and nothing else is. See
+    `_route_zone_soft`: pads, tracks, vias, Edge.Cuts, same-net via rules and
+    netclass clearance all still apply in full, and the tier declines outright
+    unless 100% of what the connection collides with is foreign zone fill. The
+    physical justification is that KiCad's fill algorithm recomputes clearance
+    around every copper item present at fill time, so a pour is supposed to
+    YIELD to a trace drawn after it was last filled - treating the stale fill as
+    permanent is what wrongly sealed these pads.
+
+    Nothing found this way is trusted. Every candidate from the whole call is
+    collected, written to a SCRATCH copy of the board, refilled by KICAD-CLI
+    (`refill_zones_with_kicad` - the authority, never a Python re-implementation
+    of KiCad's fill maths), and the REAL refilled polygons are then measured
+    against the candidate's copper (`_verify_zone_soft_candidates`). Only
+    candidates KiCad's own refill actually clears become routed; the rest stay
+    `failed` with `failure.reason == "zone_soft_route_rejected"` and the
+    measured `clearance_gap_mm`. With no kicad-cli on the machine every
+    candidate is rejected (`zone_soft_route.reason: "kicad-cli not found"`) -
+    the auto-skip is a refusal, never an assumption of safety. Accepted
+    candidates are reported under `zone_soft_routed` (uuids/net/zones touched),
+    the same audit-before-`write=True` shape `human_copper_ripped` uses, and a
+    write that includes any of them ALWAYS refills the real board (the fill must
+    catch up - that is the entire premise of the tier), regardless of
+    `refill_zones`. This is a PER-CALL argument, not a persisted
+    `pcb_settings.json` field, for the same reason `allow_hand_copper_ripup` is:
+    it is materially more speculative than ordinary routing, so permission is
+    asked fresh every invocation. Default False means every existing
+    caller/test gets byte-identical behavior - the tier is never even entered.
 
     Still simplified vs. the full spec (documented honestly): pad escape lands
     on the nearest free grid node rather than a pad-direction-aware exact stub.
@@ -8475,6 +8969,11 @@ def route_nets(
         # companion via-on-via rule is UNCONDITIONAL and needs no knob. Small
         # picklable bool, so a spawned worker gates identically to the parent.
         "allow_via_in_pad": allow_via_in_pad,
+        # Phase 7.23 zone-territory soft routing. Default False = the tier is
+        # never entered at all (`_route_one_candidate` short-circuits on this
+        # key), so an unflagged call is byte-identical to before it existed.
+        # Small picklable bool, so a spawned worker gates identically.
+        "allow_zone_soft_route": bool(allow_zone_soft_route),
         # Phase 7.22 bus-first directness. `frozenset()` / 0.0 at the shipped
         # default, which makes `_route_one_candidate`'s `direct_corridor_mm`
         # 0.0 for every connection and leaves the corridor choice on its
@@ -8534,6 +9033,12 @@ def route_nets(
     if allow_hand_copper_ripup:
         hand_copper_pool = {ob.uuid: ob for ob in obstacles if _is_hand_copper_obstacle(ob)}
     human_copper_ripped: list[dict[str, Any]] = []
+    # Phase 7.23: owner -> speculative zone-soft candidate, harvested from every
+    # TERMINAL failure site below (both the speculative pass and the serial
+    # worklist). Empty dict unless `allow_zone_soft_route` is on. These are NOT
+    # placements - the connection stays failed until `_verify_zone_soft_candidates`
+    # proves it against a real kicad-cli refill, after the worklist finishes.
+    zone_soft_candidates: dict[int, dict[str, Any]] = {}
 
     def _hand_copper_record(ob: "_Obst", ripped_for_net: str) -> dict[str, Any]:
         return {
@@ -8711,6 +9216,8 @@ def route_nets(
             # empty, this is a no-op and behavior is unchanged.)
             if not (allow_hand_copper_ripup and hand_copper_pool):
                 failures[owner] = res["rec"]
+                if res.get("zone_soft"):
+                    zone_soft_candidates[owner] = res["zone_soft"]
                 if progress_enabled:
                     _emit_connection_progress(owner, res["net"], False, None, None, None)
             continue
@@ -8911,23 +9418,100 @@ def route_nets(
 
         if not did_rip:
             failures[owner] = core["rec"]
+            if core.get("zone_soft"):
+                zone_soft_candidates[owner] = core["zone_soft"]
             if progress_enabled:
                 _emit_connection_progress(owner, core["net"], False, None, None, None)
+
+    # ---- Phase 7.23 zone-soft acceptance gate ------------------------------ #
+    # Runs ONCE, after the worklist has settled, so the conflict filter sees the
+    # final placement set. Every candidate here belongs to a connection that is
+    # currently FAILED; a candidate is only promoted to a placement if kicad-cli's
+    # own refill proves its copper clears the refilled pours. Anything else stays
+    # failed, with `zone_soft_route_rejected` and the measured gap.
+    zone_soft_accepted: dict[int, dict[str, Any]] = {}
+    zone_soft_report: dict[str, Any] | None = None
+    if allow_zone_soft_route and zone_soft_candidates:
+        placement_obstacles = [ob for pl in placements.values() for ob in pl["obstacles"]]
+        verdict = _verify_zone_soft_candidates(
+            project_path, board_path, zone_soft_candidates, obstacles,
+            placement_obstacles, rules, via_radius, track_half,
+            routable_layers, routable_set, all_cu, allow_via_in_pad)
+        zone_soft_accepted = verdict["accepted"]
+        zone_soft_report = verdict["report"]
+        for owner in sorted(zone_soft_accepted):
+            cand = zone_soft_accepted[owner]
+            rec = dict(failures.get(owner) or {})
+            # `failure`/`self_check` are set to the ROUTED shape (None / the
+            # passing record from `_finalize_core`), not deleted - an accepted
+            # connection must be indistinguishable in shape from any other
+            # routed one, so a consumer never has to special-case it.
+            rec["failure"] = None
+            rec.update(cand["rec_updates"])
+            # Placed directly rather than through `_place`: this owner already
+            # emitted its terminal per-connection progress event when it failed,
+            # and `_place` would emit a second one (double-counting the viewer's
+            # connections-done). Nothing else in `_place` applies here - the
+            # worklist is over, so no later connection needs these obstacles.
+            placements[owner] = {
+                "segments": cand["segments"], "vias": cand["vias"], "rec": rec,
+                "net": cand["net"],
+                "obstacles": _obstacles_from_emit(cand["net"], cand["segments"],
+                                                  cand["vias"], track_half, via_radius,
+                                                  routable_layers, owner),
+            }
+            failures.pop(owner, None)
+        for owner, info in sorted(verdict["rejected"].items()):
+            rec = failures.get(owner)
+            if rec is None:
+                continue
+            # One canonical reason for every refusal path (conflict, missing
+            # kicad-cli, failed/non-converged refill, measured shortfall), with
+            # the specific cause preserved underneath - so a caller can filter on
+            # a single reason string and still see exactly why.
+            rec["failure"] = {
+                "reason": "zone_soft_route_rejected",
+                "detail": info.get("detail", ""),
+                "zone_soft_reject": info,
+                "previous_failure": (rec.get("failure") or {}).get("reason"),
+            }
+            if "clearance_gap_mm" in info:
+                rec["failure"]["clearance_gap_mm"] = info["clearance_gap_mm"]
 
     # Assemble outputs in canonical owner order.
     out_conns: list[dict[str, Any]] = []
     emit_segments: list[tuple[str, dict[str, Any], str]] = []  # (net, seg, uuid)
     emit_vias: list[tuple[str, dict[str, Any], str]] = []
     routed_count = 0
+    # Phase 7.23 audit trail, mirroring `human_copper_ripped`'s shape: one record
+    # per ACCEPTED zone-soft connection, naming the board uuids of the copper it
+    # contributed and the zone(s) whose territory it routes through. Built here
+    # because this is where uuids are minted (write=False previews the same
+    # record without touching the board, same convention as human_copper_ripped).
+    zone_soft_routed: list[dict[str, Any]] = []
     for owner in range(n_conns):
         pl = placements.get(owner)
         if pl is not None:
             out_conns.append(pl["rec"])
             routed_count += 1
+            owner_uuids: list[str] = []
             for s in pl["segments"]:
-                emit_segments.append((pl["net"], s, str(_uuid.uuid4())))
+                uid = str(_uuid.uuid4())
+                owner_uuids.append(uid)
+                emit_segments.append((pl["net"], s, uid))
             for v in pl["vias"]:
-                emit_vias.append((pl["net"], v, str(_uuid.uuid4())))
+                uid = str(_uuid.uuid4())
+                owner_uuids.append(uid)
+                emit_vias.append((pl["net"], v, uid))
+            if owner in zone_soft_accepted:
+                cand = zone_soft_accepted[owner]
+                zone_soft_routed.append({
+                    "net": pl["net"],
+                    "uuids": owner_uuids,
+                    "zones": cand.get("zones", []),
+                    "segment_count": len(pl["segments"]),
+                    "via_count": len(pl["vias"]),
+                })
         elif owner in failures:
             out_conns.append(failures[owner])
         else:
@@ -8997,8 +9581,12 @@ def route_nets(
     # Plane-crossing vias/traces need KiCad to cut the real anti-pad/clearance
     # void in the pours (the `via_transparent` model assumes it). Opt-in so byte-
     # exact tests and the no-via case stay untouched; auto-skips without kicad-cli.
+    # Phase 7.23: a write that includes zone-soft copper ALWAYS refills, opt-in
+    # or not. The whole premise of that tier is that the pour yields to the new
+    # trace on the next fill; leaving the real board with stale fills would ship
+    # exactly the overlap the scratch-copy verification proved KiCad removes.
     refill = None
-    if written and refill_zones:
+    if written and (refill_zones or zone_soft_routed):
         refill = refill_zones_with_kicad(board_path)
 
     if progress_enabled:
@@ -9035,6 +9623,19 @@ def route_nets(
         # only if the board text changed out from under this call, same
         # honesty convention as `unroute_nets`'s `removed` vs `candidates`).
         "human_copper_ripped": human_copper_ripped,
+        "allow_zone_soft_route": allow_zone_soft_route,
+        # PHASE 7.23 audit trail: empty unless `allow_zone_soft_route=True` AND
+        # a candidate survived the kicad-cli-verified refill. Each record names
+        # the net, the board uuids of its copper, and the zone(s) whose fill it
+        # routes through - review this BEFORE trusting `write=True`, exactly as
+        # with `human_copper_ripped`.
+        "zone_soft_routed": zone_soft_routed,
+        # None unless the tier actually produced candidates; otherwise the
+        # accounting for this call - how many were attempted, how many were
+        # rejected by the conflict filter vs. by the real refill measurement,
+        # how many refill rounds it took, and whether it was skipped entirely
+        # (`reason: "kicad-cli not found"`).
+        "zone_soft_route": zone_soft_report,
         "connections": out_conns,
         "summary": {
             "total_connections": len(out_conns),
@@ -9048,6 +9649,7 @@ def route_nets(
             "congestion_escalations": congestion_escalations,
             "human_copper_ripped_count": len(human_copper_ripped),
             "human_copper_removed_from_board": hand_copper_removed,
+            "zone_soft_routed_count": len(zone_soft_routed),
         },
     }
     if progress_enabled:
@@ -9279,6 +9881,7 @@ def route_board(
     effort: str = "balanced",
     allow_while_open: bool = False,
     allow_hand_copper_ripup: bool = False,
+    allow_zone_soft_route: bool = False,
     optimize: bool = False,
 ) -> dict[str, Any]:
     """Phase 7.17 - the ONE command to route the board (CLI + MCP).
@@ -9332,6 +9935,17 @@ def route_board(
     `allow_hand_copper_ripup` (default False) is passed straight through to
     `route_nets` - see its docstring. Left off, this call is byte-identical to
     before the flag existed: human-placed copper is never a rip-up candidate.
+
+    `allow_zone_soft_route` (default False, PHASE 7.23) is likewise passed
+    straight through to `route_nets` - see its docstring for the full contract.
+    In one line: a connection whose ONLY remaining blocker is a foreign zone's
+    filled polygon gets one last-resort search with that fill treated as
+    non-blocking, and the candidate is then proven against a REAL kicad-cli zone
+    refill on a scratch copy before it is allowed onto the board. Accepted
+    routes are listed in `zone_soft_routed`; refused ones stay failed with
+    `zone_soft_route_rejected` and the measured clearance gap. Left off, this
+    call is byte-identical to before the flag existed - the tier is never
+    entered.
     """
     effort = (effort or "balanced").lower()
     if effort not in _EFFORT_RIPUP:
@@ -9352,6 +9966,7 @@ def route_board(
         allow_while_open=allow_while_open,
         max_ripup_iterations=max_ripup,
         allow_hand_copper_ripup=allow_hand_copper_ripup,
+        allow_zone_soft_route=allow_zone_soft_route,
     )
     d_summary = detailed.get("summary", {})
 
@@ -9395,6 +10010,9 @@ def route_board(
         "ripup": detailed.get("ripup", {}),
         "allow_hand_copper_ripup": allow_hand_copper_ripup,
         "human_copper_ripped": detailed.get("human_copper_ripped", []),
+        "allow_zone_soft_route": allow_zone_soft_route,
+        "zone_soft_routed": detailed.get("zone_soft_routed", []),
+        "zone_soft_route": detailed.get("zone_soft_route"),
         "connections": detailed.get("connections", []),
         "detailed_result": detailed,   # full route_nets result for callers who want it
         "optimize": optimize,
@@ -9835,6 +10453,21 @@ def _cli_print_route_report(report: dict[str, Any]) -> None:
         for r in hand_ripped:
             print(f"    - {r['kind']} uuid={r['uuid']} net={r['net']} "
                   f"layers={r['layers']} for net={r['ripped_for_net']}")
+    zone_soft = report.get("zone_soft_routed") or []
+    if zone_soft:
+        print(f"  ZONE-SOFT ROUTED ({len(zone_soft)}, allow_zone_soft_route=True, each "
+              f"verified against a real kicad-cli zone refill):")
+        for r in zone_soft:
+            zones = ", ".join(f"{z['net']}@{z['layer']}" for z in r.get("zones", [])) or "(none)"
+            print(f"    - {r['net']}: {r['segment_count']} seg / {r['via_count']} via "
+                  f"through zone territory {zones}")
+    zs_report = report.get("zone_soft_route")
+    if zs_report:
+        line = (f"  zone-soft: attempted={zs_report.get('attempted')} "
+                f"accepted={zs_report.get('accepted')} rejected={zs_report.get('rejected')}")
+        if zs_report.get("skipped"):
+            line += f"  SKIPPED ({zs_report.get('reason')})"
+        print(line)
     for c in report.get("connections", []):
         if c.get("routed"):
             print(f"    [OK]   {c['net']}: {c.get('length_mm')} mm, "
@@ -9881,6 +10514,12 @@ def main(argv: list[str] | None = None) -> int:
                          help="opt in (default off) to letting rip-up remove hand-routed "
                               "track/via copper (never pads/zones/edges) when it is the "
                               "blocker; reported in the report's human_copper_ripped list")
+    p_route.add_argument("--allow-zone-soft-route", action="store_true",
+                         help="opt in (default off) to the Phase 7.23 last-resort tier that "
+                              "routes through a foreign zone's fill territory when that fill is "
+                              "the ONLY blocker; every candidate is proven against a real "
+                              "kicad-cli zone refill on a scratch board before it can be "
+                              "written (see zone_soft_routed; refusals stay failed)")
     p_route.add_argument("--optimize", action="store_true",
                          help="opt in (default off) to running the Phase 7.6 whole-board "
                               "optimizer after detailed routing, driven to converged/"
@@ -9904,6 +10543,7 @@ def main(argv: list[str] | None = None) -> int:
             effort=args.effort,
             allow_while_open=args.allow_while_open,
             allow_hand_copper_ripup=args.allow_hand_copper_ripup,
+            allow_zone_soft_route=args.allow_zone_soft_route,
             optimize=args.optimize,
         )
         if args.json:

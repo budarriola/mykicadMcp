@@ -198,6 +198,8 @@ hierarchical placement will not emit necks (rare in practice).
   from the failed path (never human-routed copper by default), reschedules the ripped connections,
   and re-attempts them. Bounded by `pcb_settings.json`'s `max_ripup_iterations`. Off-by-default
   ripup of hand-routed copper is gated by separate `allow_hand_copper_ripup` flag.
+- **Zone-territory soft routing (Phase 7.23, opt-in `allow_zone_soft_route`)** — see the section
+  below. Off by default; when off, nothing about a run differs from before the flag existed.
 - **Plane-aware routing (Phase 7.5.4, Partial)** — For power/ground nets that own a filled zone,
   the router recognizes moves onto the net's own plane fill as low-cost traversal and can terminate
   on any point already inside that net's own fill (not just the exact `to` point). On-plane moves
@@ -211,7 +213,90 @@ touching the board. **Always preview first.**
 
 **Args:** `project_path`, `nets` (optional array; omit to route all unrouted connections), `connections`
 (optional explicit connection list from `get_ratsnest`), `write` (default false), `allow_while_open`
-(default false), `max_ripup_iterations` (default from pcb_settings.json; bounds rip-up iterations)
+(default false), `max_ripup_iterations` (default from pcb_settings.json; bounds rip-up iterations),
+`allow_hand_copper_ripup` (default false), `allow_zone_soft_route` (default false — see below)
+
+### `allow_zone_soft_route` — zone-territory soft routing (Phase 7.23)
+
+**The problem.** On a from-scratch board most `unreachable_in_window` / `self_check_failed`
+failures are a signal-net pad with a filled foreign GND/power zone at `distance_mm: 0.0` and
+`owner: null`. Nothing is rippable, because the obstacle is the **zone's own fill polygon**, not a
+track or a via — and `allow_hand_copper_ripup` deliberately never touches zone fills. Real KiCad
+does not have this problem: refilling recomputes clearance around *every* copper item present at
+fill time, including a trace drawn after the pour was last filled. The pour is supposed to yield;
+treating its stale, pre-trace fill as permanent is what seals these pads.
+
+**What the flag does.** After a connection has exhausted **every** other tier (the whole
+`_route_attempts` grid/margin ladder, the hierarchical multi-window tier, and the whole-board lazy
+tier), it gets one last-resort search in which foreign zone **fills** are treated as non-blocking
+for that net — and nothing else is. Pads, tracks, vias, Edge.Cuts, same-net via rules and full
+netclass clearance all still apply. The tier **declines outright** unless 100% of what the
+resulting copper collides with is foreign zone fill: one collision with a pad, track, via or edge
+and the connection fails exactly as it does today. A connection that already routes can never
+reach this code path, so `allow_zone_soft_route: false` (the default) is byte-identical to before
+the flag existed.
+
+**Nothing found this way is trusted.** Candidates are collected across the whole call and then:
+
+1. **Conflict filter** — each candidate is re-checked, in canonical order, against every committed
+   placement plus every candidate already accepted (the speculative pass searched against a
+   board snapshot that did not include them).
+2. **Authoritative refill** — survivors are written to a **scratch copy** of the board, and
+   **real `kicad-cli`** refills the zones with that copper present. KiCad's fill maths is never
+   re-implemented in Python; that estimate is the source of the bug, not its fix.
+3. **Measurement** — the refilled polygons are read back and each candidate's copper is measured
+   against them at netclass clearance. Rejecting a candidate changes the fill, so this repeats to
+   a fixed point (bounded; a non-converging set is rejected, never accepted on a stale measurement).
+
+Only candidates KiCad's own refill actually clears become routed. Everything else stays `failed`
+with `failure.reason: "zone_soft_route_rejected"`, the measured `clearance_gap_mm`, and the
+specific cause under `failure.zone_soft_reject`. **With no `kicad-cli` on the machine every
+candidate is refused** (`zone_soft_route.reason: "kicad-cli not found"`) — the auto-skip is a
+refusal, never an assumption of safety.
+
+Accepted routes are listed in `zone_soft_routed` (net, board `uuids`, and the `zones` whose
+territory the copper runs through) with a count in `summary.zone_soft_routed_count` — the same
+audit-before-`write=true` contract `human_copper_ripped` uses. A write that includes zone-soft
+copper **always** refills the real board, whether or not `refill_zones` was requested: the fill has
+to catch up with the new trace, which is the entire premise of the tier.
+
+This is a **per-call** opt-in, not a `pcb_settings.json` field — it is materially more speculative
+than ordinary routing, so permission is asked fresh on every invocation.
+
+```json
+{
+  "allow_zone_soft_route": true,
+  "zone_soft_routed": [
+    {"net": "/MainControler/CLK", "uuids": ["8bc2...", "1f9a..."],
+     "zones": [{"net": "GND_Main", "layer": "F.Cu"}],
+     "segment_count": 2, "via_count": 0}
+  ],
+  "zone_soft_route": {
+    "attempted": 4, "conflict_rejected": 1, "accepted": 1,
+    "rejected": 3, "verify_rounds": 2, "skipped": false, "reason": null
+  }
+}
+```
+
+A refused connection, for contrast:
+
+```json
+{
+  "net": "/Power/VBUS", "routed": false,
+  "failure": {
+    "reason": "zone_soft_route_rejected",
+    "clearance_gap_mm": -0.113,
+    "zone_soft_reject": {
+      "reason": "zone_soft_route_rejected",
+      "measured_mm": 0.212, "required_mm": 0.325,
+      "against_zone_net": "GND_Main", "against_zone_layer": "F.Cu"
+    },
+    "previous_failure": "unreachable_in_window"
+  }
+}
+```
+
+CLI: `python kicad_router_tool.py route <project> --allow-zone-soft-route [--write]`.
 
 **Example output (excerpt — single routed connection):**
 ```json
@@ -347,7 +432,14 @@ copper and records ownership for undo.
 **CLI usage:** `python kicad_router_tool.py route <project> [--write] [--nets ...] [--effort quick|balanced|best] [--optimize]`
 
 **Args:** `project_path`, `nets` (optional array of net names; omit to route all unrouted),
-`write` (default false), `effort` (default "balanced"), `allow_while_open` (default false)
+`write` (default false), `effort` (default "balanced"), `allow_while_open` (default false),
+`allow_hand_copper_ripup` (default false), `allow_zone_soft_route` (default false),
+`optimize` (default false)
+
+Both `allow_hand_copper_ripup` and `allow_zone_soft_route` are passed straight through to
+`route_kicad_nets` and are reported back on this tool's result too (`human_copper_ripped` /
+`zone_soft_routed` + `zone_soft_route`) — see the `allow_zone_soft_route` section above for the
+full contract. Left off (the default), this call is byte-identical to before either flag existed.
 
 **Example output (excerpt):**
 ```json

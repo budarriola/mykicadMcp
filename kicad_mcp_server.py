@@ -1143,7 +1143,17 @@ class KiCadMcpServer:
                     "setting, since it is materially more destructive than ripping the autorouter's own "
                     "prior placements (the default behavior). Every piece ripped is reported in "
                     "human_copper_ripped (uuid/net/kind/layer/geometry) - review that BEFORE trusting "
-                    "write=true."
+                    "write=true. allow_zone_soft_route (default false, Phase 7.23) opts in to a "
+                    "LAST-RESORT tier for a connection that has exhausted every other tier and whose "
+                    "only remaining blocker is a foreign zone's FILLED POLYGON (owner: null - nothing "
+                    "rippable): the search is retried with that fill treated as non-blocking (pads, "
+                    "tracks, vias, Edge.Cuts and netclass clearance all still block), then every "
+                    "candidate is written to a SCRATCH copy, refilled by real kicad-cli, and measured "
+                    "against the actual refilled polygons - only what KiCad's own refill clears is "
+                    "accepted (reported in zone_soft_routed: net/uuids/zones). Refused candidates stay "
+                    "failed with failure.reason zone_soft_route_rejected and the measured "
+                    "clearance_gap_mm; with no kicad-cli on the machine EVERY candidate is refused "
+                    "(zone_soft_route.reason 'kicad-cli not found'), never assumed safe."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -1169,6 +1179,21 @@ class KiCadMcpServer:
                                 "track/via copper when it is the blocker. Never removes pads, zone "
                                 "fills, or Edge.Cuts even when true. See human_copper_ripped in the "
                                 "report for exactly what was/would be removed."
+                            ),
+                        },
+                        "allow_zone_soft_route": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": (
+                                "Opt in (per-call, default off) to the Phase 7.23 last-resort tier: "
+                                "a connection blocked ONLY by a foreign zone's filled polygon is "
+                                "re-searched with that fill treated as non-blocking (a pour is "
+                                "supposed to yield to a trace on the next refill). Every candidate is "
+                                "then proven on a scratch board that real kicad-cli has refilled - "
+                                "only candidates whose copper actually clears the refilled pour are "
+                                "accepted (zone_soft_routed); the rest stay failed with "
+                                "zone_soft_route_rejected. No kicad-cli means every candidate is "
+                                "refused. Review zone_soft_routed BEFORE trusting write=true."
                             ),
                         },
                         "optimize": {
@@ -1201,7 +1226,11 @@ class KiCadMcpServer:
                     "unroute_kicad_nets). Note: on plane-filled layers only pour-free channels route (full "
                     "plane-aware routing and PathFinder rip-up are later phases; window-doubling retry only). "
                     "write=false (default) previews per-connection routed/length/vias/layers/self-check/failures "
-                    "without touching the board - always preview first. Writes ONLY to the given project's board."
+                    "without touching the board - always preview first. Writes ONLY to the given project's board. "
+                    "allow_zone_soft_route (default false, Phase 7.23) adds a last-resort tier for a connection "
+                    "whose ONLY blocker is a foreign zone's filled polygon; candidates are proven against a real "
+                    "kicad-cli refill on a scratch board and reported under zone_soft_route / zone_soft_routed, "
+                    "with refusals staying failed as zone_soft_route_rejected."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -1223,6 +1252,23 @@ class KiCadMcpServer:
                                 "track/via copper (never pads/zone fills/Edge.Cuts) when it is the "
                                 "blocker. See the result's human_copper_ripped list for exactly what "
                                 "was/would be removed."
+                            ),
+                        },
+                        "allow_zone_soft_route": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": (
+                                "Opt in (per-call, default off) to the Phase 7.23 last-resort tier: "
+                                "when a connection has exhausted every routing tier and 100% of what "
+                                "blocks it is a foreign zone's FILLED POLYGON (owner: null, nothing "
+                                "rippable), retry the search with that fill non-blocking - pads, "
+                                "tracks, vias, Edge.Cuts and netclass clearance still block in full. "
+                                "Candidates are never trusted: they are written to a scratch copy, "
+                                "refilled by real kicad-cli, and measured against the actual refilled "
+                                "polygons; only what KiCad's own refill clears is accepted (see "
+                                "zone_soft_routed), everything else stays failed with "
+                                "zone_soft_route_rejected + clearance_gap_mm. Without kicad-cli every "
+                                "candidate is refused, never assumed safe."
                             ),
                         },
                     },
@@ -2498,6 +2544,7 @@ class KiCadMcpServer:
             effort=str(args.get("effort", "balanced")),
             allow_while_open=bool(args.get("allow_while_open", False)),
             allow_hand_copper_ripup=bool(args.get("allow_hand_copper_ripup", False)),
+            allow_zone_soft_route=bool(args.get("allow_zone_soft_route", False)),
             optimize=bool(args.get("optimize", False)),
         )
 
@@ -2511,6 +2558,7 @@ class KiCadMcpServer:
             allow_while_open=bool(args.get("allow_while_open", False)),
             max_ripup_iterations=int(mri) if mri is not None else None,
             allow_hand_copper_ripup=bool(args.get("allow_hand_copper_ripup", False)),
+            allow_zone_soft_route=bool(args.get("allow_zone_soft_route", False)),
         )
 
     def _tool_unroute_nets(self, args: dict[str, Any]) -> dict[str, Any]:
