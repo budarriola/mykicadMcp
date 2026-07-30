@@ -37,28 +37,28 @@ and residuals; don't rely on this snapshot for that detail.
 - **Landed & coordinator-verified**: Phases 1–9 and 7.1 through 7.22 in
   full — every one has a "### 7.x — LANDED" (or "## Phase N — LANDED")
   anchor in place below with its full write-up. Current state: 94 MCP tools
-  registered, 501-test suite green (7 pre-existing failures are real-board
+  registered, 513-test suite green (7 pre-existing failures are real-board
   drift from the user's own continued hand-routing — see the ⭐ findings
   section below for detail — not caused by any landed feature).
   Plus a large-board-with-a-handful-of-unrouted-connections test fixture
   (`generate_large_board_few_unrouted`, `tests/test_large_board_few_
   unrouted.py`, 2026-07-29 user request) — see its own module docstring, not
-  a numbered phase.
+  a numbered phase. Also: `route_board(optimize=True)` now wires the 7.6
+  optimizer into the one-command orchestrator (LANDED 2026-07-30, see the
+  follow-up under the 7.6 anchor) — 7.6 itself is NOT a pending item, only
+  this wiring was.
 - The ⭐ **Real-board routing findings & the hand-routed baseline** section
   right after this one is kept in full (not trimmed) — it's the acceptance
   narrative for the routing-capability arc (7.3b through M7) and several
   root-cause diagnoses future work still depends on, not a redundant log.
-- **Next work when resumed (updated 2026-07-29 — M7 fully landed: 7.18,
-  7.19, 7.20 all done; Phase 7.21 via placement safety and Phase 7.22
-  bus-first direct routing also LANDED same day, see their anchors).** User
-  priority set 2026-07-29, in order: **(1) Phase 7.6 whole-board
-  optimization — next up** (7.21 and 7.22 are both now merged, so nothing
-  blocks this); (2) M6 item 17(c) Flow B stack-up-gate question. Phase 7.13
-  (impedance-matched traces) remains explicitly deprioritized by the user —
-  do not start it without being asked. Still open, low priority: the small
-  7.3b "any same-net copper" termination bit, and reassessing whether 7.22's
-  `bus_first_direct_corridor_mm` default should flip once 7.6 exists (see
-  its anchor's honest tradeoff note).
+- **Next work when resumed (updated 2026-07-30).** Only one item left in the
+  user's 2026-07-29 priority queue: **M6 item 17(c) Flow B stack-up-gate
+  question.** Phase 7.13 (impedance-matched traces) remains explicitly
+  deprioritized by the user — do not start it without being asked. Still
+  open, low priority: the small 7.3b "any same-net copper" termination bit,
+  and reassessing whether 7.22's `bus_first_direct_corridor_mm` default
+  should flip now that 7.6 is wired into `route_board` (see 7.22's anchor's
+  honest tradeoff note).
 - Verify claims against the code (`kicad_pcb_tool.py`, `kicad_mcp_server.py`,
   `tests/`) rather than trusting this snapshot if they disagree — and then fix
   this file.
@@ -1587,54 +1587,52 @@ it is now — left alone since an existing test
 (`test_route_board_pipeline_hooks_declared_not_faked`) asserts that exact
 string and changing it is a docs/plan judgment call, not a code one.
 
-**Follow-up SPEC'd 2026-07-30 (user request, coordinator-clarified after
-correcting an earlier mis-scoped priority question — 7.6 itself was already
-done, this is the actual open item near it): wire `optimize_kicad_board`
-into `route_board` as an opt-in step, not a default-behavior change.**
+**Follow-up LANDED 2026-07-30** (Opus subagent, worktree-isolated,
+coordinator-reviewed: full diff read directly plus an independent full-suite
+run on the merged tree — user request, coordinator-clarified after correcting
+an earlier mis-scoped priority question, since 7.6 itself was already done
+and this was the actual open item near it). `route_board` gained `optimize:
+bool = False`. Left off (the default), the call is verbatim pre-wiring —
+`test_route_board_pipeline_hooks_declared_not_faked`'s default-path assertion
+passes unchanged and was extended, not loosened, to also cover the
+`optimize=True` path. When `optimize=True`, `_run_optimizer_stage` starts a
+fresh `optimize_board` session AFTER detailed routing (and after the write,
+if any) and drives it chunk-by-chunk (`_ROUTE_BOARD_OPTIMIZE_CHUNK=5`) until
+non-`running`; `awaiting_decision` (a 7.7 AI near-tie or a MANDATORY 7.14
+pin-swap pause) STOPS the loop rather than resuming (a plain resume
+auto-defers the pending decision — the loop's `while` condition structurally
+excludes that state, and the write step below is separately gated on only
+`("converged", "budget_exhausted")`), surfacing `pending_decision` under the
+report's new `optimizer` key and leaving the session open for
+`get_kicad_route_session`/`decide_kicad_route`. `effort` passes straight
+through to `optimize_board`'s identically-named preset.
 
-- New `route_board` param `optimize: bool = False`. Default OFF, so
-  `test_route_board_pipeline_hooks_declared_not_faked`'s default-path
-  assertion (`pipeline["whole_board_optimization"].startswith("not_
-  implemented")`) keeps passing unchanged — update that test to ALSO cover
-  the `optimize=True` path (assert the hook reports something like `"done"`
-  or `"ran"` there), rather than loosening the default-path guard.
-- When `optimize=True`: after detailed routing (and after `write` if
-  `write=True` — the optimizer needs a real board state to snapshot into its
-  scratch copy), start a NEW `optimize_board` session on the just-routed
-  project and loop calling it (same `session_id`) until the state is
-  anything other than `"running"` — i.e. drive it to `converged` or
-  `budget_exhausted`. Do **NOT** attempt to auto-resolve `awaiting_decision`
-  — a synchronous one-shot orchestrator call cannot interactively pause a
-  human, so on `awaiting_decision` stop the loop, surface the full session
-  state (including `pending_decision`) in `route_board`'s report, and leave
-  the session open (resumable later via `get_kicad_route_session`/
-  `decide_kicad_route` exactly as any other session). This must be true
-  regardless of `pin_swap.enabled` / `ai_decisions.enabled` — route_board
-  must never silently accept a mandatory pin-swap pause or an AI-decision
-  pause on the caller's behalf.
-- Map `route_board`'s existing `effort` (`quick`/`balanced`/`best`) straight
-  through to `optimize_board`'s own identically-named `effort` preset — do
-  not invent a second effort vocabulary. Be aware `best` maps to an 8-hour
-  `time_budget_s` in the optimizer (per 7.15) — that is almost certainly too
-  long for a single synchronous orchestrator call; decide (and document the
-  decision) whether `route_board` should cap it with its own bound when
-  `optimize=True`, or whether that's acceptable given the caller explicitly
-  asked for `effort="best"`. Judgment call, not prescribed — but must not be
-  silently unbounded without at least a documented reason.
-- `route_board`'s `write` flag must still govern whether ANYTHING is
-  persisted — a `write=False` + `optimize=True` call previews the routed
-  AND optimized state without touching the real board (the optimizer
-  session itself is scratch-only until its own internal `write=True`, so
-  this should fall out naturally — verify with a test, don't assume).
-- Update the pipeline report's `whole_board_optimization` string to reflect
-  what actually happened (`"not_implemented"` when `optimize` is omitted/
-  False, something honest and specific — not just `"done"` — when it ran,
-  distinguishing `converged`/`budget_exhausted`/`awaiting_decision`).
-- New tests needed: `optimize=False` (default) unchanged from today;
-  `optimize=True` runs and reports a real session id + final state;
-  `awaiting_decision` surfaces correctly and does NOT get silently resolved;
-  `write=False` with `optimize=True` touches nothing on the real board;
-  the effort→optimizer-effort mapping.
+**Judgment call on record:** `effort="best"`'s 8-hour `time_budget_s` (7.15)
+is capped at `_ROUTE_BOARD_OPTIMIZE_TIME_CAP_S = 900.0` (15 min) for a
+`route_board` call specifically — reasoning written in-code next to the
+constant: `optimize_kicad_board` is chunked/resumable so 8 hours is fine
+there, but `route_board` is one synchronous call every caller (MCP tool,
+CLI, `benchmark_autoroute`'s timed loop) would otherwise block on for a
+working day. The cap only ever LOWERS a budget (`min(resolved, cap)`) —
+`quick`/`balanced` (300s default) are unaffected — and a capped run says so
+explicitly in `notes`, naming the session id so the full-length run can be
+resumed directly via `optimize_kicad_board`. Bounded-and-loud, not
+unbounded-and-silent.
+
+`pipeline["whole_board_optimization"]` stays the exact pinned
+`"not_implemented (Phase 7.6, M4)"` string when `optimize` is omitted/False;
+otherwise `_optimizer_pipeline_status` distinguishes `"done: converged
+(...)"` / `"done: budget_exhausted (...)"` / `"paused: awaiting_decision
+(...)"` explicitly (never a single generic "done"). MCP schema
+(`route_kicad_board`'s `optimize` param) and CLI (`--optimize` on `route`)
+both updated to match; `docs/mcp-tools/11-autorouter.md` updated (whole-board
+optimization removed from the "NOT YET IMPLEMENTED" list; stitching
+remains). 12 new tests (`tests/test_route_board_optimize.py`), including
+fixtures pinning that `awaiting_decision` is never silently auto-resolved
+(reusing 7.7's `min_score_spread: 1e9` pause harness) and that `write=False`
+leaves the real board byte-identical. Full suite: 501→513 passed, same 7
+pre-existing kiln board-drift failures, unaffected (confirmed by the
+coordinator's own independent run on the merged tree).
 
 ### 7.7 — LANDED 2026-07-27 (reference anchor; no work remains here)
 
