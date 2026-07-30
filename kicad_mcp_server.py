@@ -1123,11 +1123,20 @@ class KiCadMcpServer:
                     "pipeline (it duplicates no routing logic - route_kicad_nets already runs that whole "
                     "pipeline). Reports what was unrouted before, then routed/failed counts, routed length, "
                     "vias, and rip-up stats. `effort` (quick|balanced|best) currently tunes rip-up "
-                    "aggressiveness only (quick=single pass; balanced=config default; best=aggressive) and "
-                    "gains meaning when the 7.6 optimizer lands. Plane-aware routing (7.5), whole-board "
-                    "optimization (7.6), and stitching (7.5.6) are declared TODO pipeline hooks (M4), not yet "
-                    "wired - the report's `pipeline` block says so; the signature will not change when they "
-                    "land. write=false (default) previews without touching the board; reversible via "
+                    "aggressiveness (quick=single pass; balanced=config default; best=aggressive) and, when "
+                    "optimize=true, is passed straight through to the optimizer's identically-named preset. "
+                    "optimize=false (default) is byte-for-byte the pre-wiring behavior; optimize=true adds a "
+                    "4th stage after detailed routing (and after the write, if any): a fresh "
+                    "optimize_kicad_board session driven chunk by chunk until it reports converged or "
+                    "budget_exhausted, reported under the result's `optimizer` key and in "
+                    "pipeline.whole_board_optimization. If the optimizer hits awaiting_decision (a 7.7 AI "
+                    "near-tie or a MANDATORY 7.14 pin-swap pause) route_board STOPS and surfaces the pending "
+                    "decision - it never answers it for you; the session stays open for "
+                    "get_kicad_route_session / decide_kicad_route. effort=best's 8-hour optimizer budget is "
+                    "clamped to a synchronous-call-sized cap (reported in notes). Plane-aware routing (7.5) "
+                    "and stitching (7.5.6) are still declared TODO pipeline hooks (M4), not yet "
+                    "wired - the report's `pipeline` block says so. write=false (default) previews without "
+                    "touching the board (including the optimizer stage, which is scratch-only); reversible via "
                     "unroute_kicad_nets. allow_hand_copper_ripup (default false) opts in to letting "
                     "rip-up remove hand-routed track/via copper (never footprint pads, zone fills, or "
                     "Edge.Cuts) when it is the actual blocker - a per-call opt-in, not a persisted "
@@ -1160,6 +1169,16 @@ class KiCadMcpServer:
                                 "track/via copper when it is the blocker. Never removes pads, zone "
                                 "fills, or Edge.Cuts even when true. See human_copper_ripped in the "
                                 "report for exactly what was/would be removed."
+                            ),
+                        },
+                        "optimize": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": (
+                                "Opt in (per-call, default off) to running the Phase 7.6 whole-board "
+                                "optimizer after detailed routing, driven to converged/budget_exhausted. "
+                                "An awaiting_decision pause is surfaced under `optimizer`, never "
+                                "auto-answered. Nothing is persisted unless write is also true."
                             ),
                         },
                     },
@@ -2479,6 +2498,7 @@ class KiCadMcpServer:
             effort=str(args.get("effort", "balanced")),
             allow_while_open=bool(args.get("allow_while_open", False)),
             allow_hand_copper_ripup=bool(args.get("allow_hand_copper_ripup", False)),
+            optimize=bool(args.get("optimize", False)),
         )
 
     def _tool_route_nets(self, args: dict[str, Any]) -> dict[str, Any]:

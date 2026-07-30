@@ -9139,6 +9139,139 @@ def unroute_nets(
 _EFFORT_RIPUP: dict[str, int | None] = {"quick": 0, "balanced": None, "best": 20}
 
 
+# --------------------------------------------------------------------------- #
+# Phase 7.6-into-7.17 wiring: `route_board(optimize=True)` drives the whole-board
+# optimizer (`kicad_optimizer_tool.optimize_board`) as an OPT-IN pipeline stage.
+#
+# JUDGMENT CALL (the spec leaves this to the implementer, so here is the
+# reasoning, in the code, next to the decision):
+#
+#   `effort="best"` maps - inside the optimizer, per Phase 7.15 - to an 8-hour
+#   ("overnight") `time_budget_s`. `optimize_kicad_board` is a chunked,
+#   resumable, session-based tool, so an 8-hour ceiling is perfectly reasonable
+#   THERE: a caller drives it call by call and can stop whenever it likes.
+#   `route_board` is the opposite shape - ONE synchronous call that returns a
+#   report - so inheriting an 8-hour ceiling would mean a single MCP/CLI
+#   invocation that can block for a working day with no intermediate return
+#   value. Every caller of this orchestrator (the MCP tool, the CLI, and
+#   `benchmark_autoroute`, which calls `route_board` in a timed loop) would be
+#   wedged for the duration.
+#
+#   So: option (b) - `route_board` CAPS the optimizer's session time budget with
+#   its own bound when it starts the session. The cap only ever LOWERS a budget
+#   (`min(resolved, cap)`), so `quick`/`balanced` - whose resolved budgets come
+#   from `optimizer.time_budget_s` (300s by default) and are already well under
+#   it - are completely unaffected and behave exactly as `optimize_kicad_board`
+#   would. Only a budget that exceeds the cap (in practice: `best`'s 8 hours, or
+#   a hand-edited `pcb_settings.json`) is clamped, and when that happens the
+#   report says so explicitly in `optimizer_time_budget_capped` + `notes`, so a
+#   caller who genuinely wants the overnight run knows to run
+#   `optimize_kicad_board` directly (or resume the very session this call
+#   leaves behind - the session id is in the report) instead of being silently
+#   short-changed. Bounded-and-loud beats unbounded-and-silent.
+_ROUTE_BOARD_OPTIMIZE_TIME_CAP_S = 900.0   # 15 minutes of optimizer per route_board call
+
+# Iterations per `optimize_board` call. The session's own `max_iterations` /
+# `time_budget_s` are what actually terminate the run; this is only the chunk
+# size of the driving loop (a chunked run and an unbroken run decide
+# identically - Phase 7.6's checkpoint guarantee - so this number cannot change
+# the outcome, only the number of round trips).
+_ROUTE_BOARD_OPTIMIZE_CHUNK = 5
+
+# Hard ceiling on driving-loop round trips, so a hypothetical optimizer bug that
+# never leaves `running` cannot hang this orchestrator forever.
+_ROUTE_BOARD_OPTIMIZE_MAX_CALLS = 5000
+
+
+def _run_optimizer_stage(project_path: str | Path, effort: str, write: bool,
+                         allow_while_open: bool) -> dict[str, Any]:
+    """Drive a fresh `optimize_board` session to a NON-`running` state and
+    return `{report, calls, capped, ...}`.
+
+    Loop contract (the load-bearing part):
+      * loops only `while state == "running"`;
+      * on `awaiting_decision` it STOPS - it never calls `optimize_board` again
+        on that session, because a plain resume auto-resolves an outstanding
+        decision as `defer` (see `optimize_board`'s timeout-to-defer block).
+        That would be `route_board` silently answering a question - including a
+        MANDATORY 7.14 pin-swap question - on the caller's behalf, which the
+        spec forbids outright. The session is left open and resumable via
+        `get_kicad_route_session` / `decide_kicad_route`;
+      * the optimizer's own `write` is only ever True on a FINAL, separate,
+        zero-work call made after a terminal state is reached (and only when
+        `route_board(write=True)`), so `route_board`'s `write` flag remains the
+        one and only thing that persists anything.
+    """
+    import kicad_optimizer_tool as _opt   # local: _opt imports THIS module (cycle)
+
+    optimizer_cfg = _pcb.load_pcb_settings(project_path)["config"].get("optimizer", {})
+    resolved = _opt._resolve_effort_knobs(optimizer_cfg, effort, None, None, None)
+    budget = float(resolved["time_budget_s"])
+    capped = budget > _ROUTE_BOARD_OPTIMIZE_TIME_CAP_S
+    time_budget_s = min(budget, _ROUTE_BOARD_OPTIMIZE_TIME_CAP_S)
+
+    report = _opt.optimize_board(
+        project_path,
+        effort=effort,                 # straight through - no second vocabulary
+        time_budget_s=time_budget_s,
+        max_iterations_per_call=_ROUTE_BOARD_OPTIMIZE_CHUNK,
+        allow_while_open=allow_while_open,
+        write=False,
+    )
+    calls = 1
+    while report["state"] == "running" and calls < _ROUTE_BOARD_OPTIMIZE_MAX_CALLS:
+        report = _opt.optimize_board(
+            project_path,
+            session_id=report["session_id"],
+            max_iterations_per_call=_ROUTE_BOARD_OPTIMIZE_CHUNK,
+            allow_while_open=allow_while_open,
+            write=False,
+        )
+        calls += 1
+
+    # Persist the optimizer's result ONLY on an explicit route_board(write=True)
+    # AND only from a terminal state. `awaiting_decision` is deliberately absent
+    # from this tuple: resuming such a session (which is what a write call would
+    # do) would auto-defer the pending decision.
+    if write and report["state"] in ("converged", "budget_exhausted"):
+        report = _opt.optimize_board(
+            project_path,
+            session_id=report["session_id"],
+            max_iterations_per_call=0,
+            allow_while_open=allow_while_open,
+            write=True,
+        )
+
+    return {
+        "report": report,
+        "calls": calls,
+        "effort_time_budget_s": budget,
+        "applied_time_budget_s": time_budget_s,
+        "time_budget_capped": capped,
+    }
+
+
+def _optimizer_pipeline_status(report: dict[str, Any]) -> str:
+    """The honest one-liner for `pipeline["whole_board_optimization"]` - it must
+    distinguish converged / budget_exhausted / awaiting_decision, never collapse
+    them into a single "done"."""
+    state = report["state"]
+    common = (f"session={report['session_id']} iterations={report['iteration']} "
+              f"score {report['initial_score']['total']} -> {report['current_score']['total']}")
+    if state == "converged":
+        return (f"done: converged (Phase 7.6 optimizer, stop_reason="
+                f"{report.get('stop_reason')}; {common})")
+    if state == "budget_exhausted":
+        return (f"done: budget_exhausted (Phase 7.6 optimizer hit its "
+                f"{report.get('stop_reason')} bound; {common})")
+    if state == "awaiting_decision":
+        pending = report.get("pending_decision") or {}
+        return (f"paused: awaiting_decision (Phase 7.6/7.7 optimizer needs a human answer to "
+                f"decision {pending.get('decision_id')}; NOT auto-resolved - answer with "
+                f"decide_kicad_route or resume with optimize_kicad_board; {common})")
+    return f"stopped: state={state} (Phase 7.6 optimizer; {common})"  # pragma: no cover
+
+
 def route_board(
     project_path: str | Path,
     nets: list[str] | None = None,
@@ -9146,6 +9279,7 @@ def route_board(
     effort: str = "balanced",
     allow_while_open: bool = False,
     allow_hand_copper_ripup: bool = False,
+    optimize: bool = False,
 ) -> dict[str, Any]:
     """Phase 7.17 - the ONE command to route the board (CLI + MCP).
 
@@ -9165,12 +9299,35 @@ def route_board(
     Higher efforts become meaningfully different when the 7.6 optimizer lands;
     that is stated honestly in the report's `notes`.
 
-    Plane-aware routing (7.5), whole-board optimization (7.6), and the stitching
-    pass (7.5.6) are NOT wired yet - the report's `pipeline` block marks them as
-    the M4 TODO hooks they are; the signature will not change when they land.
+    Plane-aware routing (7.5) and the stitching pass (7.5.6) are NOT wired yet -
+    the report's `pipeline` block marks them as the M4 TODO hooks they are.
+
+    `optimize` (default False) opts in to a THIRD stage: after detailed routing
+    (and after the write, if any - the optimizer snapshots a real board state
+    into its own scratch copy, so it must see the routed board), a fresh
+    `optimize_board` session is started on this project and driven, chunk by
+    chunk, until it reports something other than `running` - i.e. `converged` or
+    `budget_exhausted`. Left off (the default), NOTHING about this call differs
+    from before the flag existed, down to the `pipeline` report strings.
+
+    On `awaiting_decision` (7.7 AI decision or a 7.14 MANDATORY pin-swap pause)
+    the loop STOPS rather than resuming - a plain resume would auto-defer the
+    question, and a synchronous orchestrator must never answer a human's
+    question on their behalf. The full session state (including
+    `pending_decision`) is surfaced under `optimizer` and the session is left
+    open: answer it with `decide_kicad_route` / inspect it with
+    `get_kicad_route_session`, then continue with `optimize_kicad_board`.
+
+    `effort` is passed straight through to `optimize_board`'s identically-named
+    preset (no second effort vocabulary), with its resolved time budget clamped
+    by `_ROUTE_BOARD_OPTIMIZE_TIME_CAP_S` - see that constant's comment for the
+    reasoning about `effort="best"`'s 8-hour budget.
 
     `write=False` (default) previews without touching the board; `write=True` is
-    the explicit apply. Reversible with `unroute_nets` / `unroute_kicad_nets`.
+    the explicit apply. That flag governs persistence for the optimizer stage
+    too: the optimizer session is scratch-only unless it is itself told to
+    write, and `route_board` only tells it to when `write=True`. Reversible with
+    `unroute_nets` / `unroute_kicad_nets`.
 
     `allow_hand_copper_ripup` (default False) is passed straight through to
     `route_nets` - see its docstring. Left off, this call is byte-identical to
@@ -9198,6 +9355,30 @@ def route_board(
     )
     d_summary = detailed.get("summary", {})
 
+    # Stage 4 (opt-in) - whole-board optimization (Phase 7.6), AFTER the write,
+    # so the session snapshots the board that was actually just routed.
+    optimizer_stage: dict[str, Any] | None = None
+    optimizer_notes: list[str] = []
+    if optimize:
+        optimizer_stage = _run_optimizer_stage(project_path, effort, write, allow_while_open)
+        opt_report = optimizer_stage["report"]
+        if optimizer_stage["time_budget_capped"]:
+            optimizer_notes.append(
+                f"optimizer time budget capped at {optimizer_stage['applied_time_budget_s']}s by "
+                f"route_board (effort={effort} resolves to "
+                f"{optimizer_stage['effort_time_budget_s']}s, too long for one synchronous call) - "
+                f"resume session {opt_report['session_id']} with optimize_kicad_board for the "
+                "full-length run.")
+        if opt_report["state"] == "awaiting_decision":
+            optimizer_notes.append(
+                f"optimizer PAUSED on decision {(opt_report.get('pending_decision') or {}).get('decision_id')} "
+                "and route_board did NOT answer it; the session is still open - use "
+                "decide_kicad_route (or optimize_kicad_board to defer) to continue.")
+            if write:
+                optimizer_notes.append(
+                    "optimizer results were NOT written (a paused session has no final state); "
+                    "the routing stage's write is unaffected.")
+
     return {
         "command": "route_board",
         "board_path": detailed.get("board_path"),
@@ -9216,20 +9397,36 @@ def route_board(
         "human_copper_ripped": detailed.get("human_copper_ripped", []),
         "connections": detailed.get("connections", []),
         "detailed_result": detailed,   # full route_nets result for callers who want it
+        "optimize": optimize,
+        # Full `optimize_board` session report (session_id, state,
+        # pending_decision, score curve, moves, diff...) - None when the stage
+        # did not run, so `optimize=False` callers see the pre-7.6-wiring shape
+        # plus two inert keys and nothing else.
+        "optimizer": optimizer_stage["report"] if optimizer_stage else None,
         "pipeline": {
             "ratsnest": "done",
             "global_route": "done",
             "detailed_route": "done",
             "rip_up": "disabled (effort=quick)" if max_ripup == 0 else "active",
             "plane_aware_routing": "partial (Phase 7.5.4 landed for power nets; heuristic not cost-optimal)",
-            "whole_board_optimization": "not_implemented (Phase 7.6, M4)",
+            # Unchanged, verbatim, whenever the opt-in stage did not run.
+            "whole_board_optimization": (
+                _optimizer_pipeline_status(optimizer_stage["report"]) if optimizer_stage
+                else "not_implemented (Phase 7.6, M4)"),
             "stitching": "not_implemented (Phase 7.5.6, M4)",
         },
         "notes": [
             "Minimal route_board (Phase 7.17): ratsnest -> global -> detailed only; "
-            "planes/optimizer/stitching are M4 TODO hooks and do not run yet.",
+            "planes/optimizer/stitching are M4 TODO hooks and do not run yet."
+            if not optimize else
+            "route_board (Phase 7.17 + 7.6 wiring): ratsnest -> global -> detailed -> "
+            "whole-board optimizer (optimize=True); planes/stitching are still M4 TODO hooks.",
             "effort currently maps only to rip-up aggressiveness "
-            "(quick=0, balanced=config default, best=20).",
+            "(quick=0, balanced=config default, best=20)."
+            if not optimize else
+            f"effort={effort} maps to rip-up aggressiveness AND is passed straight through "
+            "to the optimizer's identically-named preset.",
+            *optimizer_notes,
         ],
     }
 
@@ -9645,6 +9842,16 @@ def _cli_print_route_report(report: dict[str, Any]) -> None:
         else:
             reason = (c.get("failure") or {}).get("reason", "unknown")
             print(f"    [FAIL] {c['net']}: {reason}")
+    opt = report.get("optimizer")
+    if opt:
+        print(f"  optimizer: state={opt['state']} session={opt['session_id']} "
+              f"iterations={opt['iteration']} "
+              f"score {opt['initial_score']['total']} -> {opt['current_score']['total']} "
+              f"(written={opt.get('written')})")
+        if opt["state"] == "awaiting_decision":
+            pending = opt.get("pending_decision") or {}
+            print(f"    PAUSED on decision {pending.get('decision_id')} - NOT auto-answered; "
+                  f"answer with decide_kicad_route on session {opt['session_id']}")
     pipe = report.get("pipeline", {})
     todo = [k for k, v in pipe.items() if str(v).startswith("not_implemented")]
     if todo:
@@ -9674,6 +9881,11 @@ def main(argv: list[str] | None = None) -> int:
                          help="opt in (default off) to letting rip-up remove hand-routed "
                               "track/via copper (never pads/zones/edges) when it is the "
                               "blocker; reported in the report's human_copper_ripped list")
+    p_route.add_argument("--optimize", action="store_true",
+                         help="opt in (default off) to running the Phase 7.6 whole-board "
+                              "optimizer after detailed routing, driven to converged/"
+                              "budget_exhausted (a pin-swap/AI pause is surfaced, never "
+                              "auto-answered)")
     p_route.add_argument("--json", action="store_true", help="print the raw JSON report")
 
     p_unroute = sub.add_parser("unroute", help="delete autorouter-owned copper (undo)")
@@ -9692,6 +9904,7 @@ def main(argv: list[str] | None = None) -> int:
             effort=args.effort,
             allow_while_open=args.allow_while_open,
             allow_hand_copper_ripup=args.allow_hand_copper_ripup,
+            optimize=args.optimize,
         )
         if args.json:
             print(json.dumps(report, indent=2))

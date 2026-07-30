@@ -86,6 +86,14 @@ def test_route_board_pipeline_hooks_declared_not_faked(scratch_board):
     # plane_aware_routing is now honestly "partial" (7.5.4 landed for power
     # nets; heuristic is not cost-optimal) - the other two hooks are still
     # fully unimplemented and must stay reported that way.
+    #
+    # NOTE (7.6 wiring): whole_board_optimization is only "not_implemented" on
+    # this DEFAULT path - `route_board(optimize=True)` now really runs the
+    # Phase 7.6 optimizer and reports what happened. That opt-in path is
+    # covered in `tests/test_route_board_optimize.py` (on a small synthetic
+    # project, not this 39-connection board); this assertion is deliberately
+    # left untouched, since its job is to catch a hook being "enabled" without
+    # anyone asking for it.
     assert pipe["plane_aware_routing"].startswith("partial")
     for hook in ("whole_board_optimization", "stitching"):
         assert pipe[hook].startswith("not_implemented")
