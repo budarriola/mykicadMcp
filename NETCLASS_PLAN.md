@@ -1587,6 +1587,55 @@ it is now — left alone since an existing test
 (`test_route_board_pipeline_hooks_declared_not_faked`) asserts that exact
 string and changing it is a docs/plan judgment call, not a code one.
 
+**Follow-up SPEC'd 2026-07-30 (user request, coordinator-clarified after
+correcting an earlier mis-scoped priority question — 7.6 itself was already
+done, this is the actual open item near it): wire `optimize_kicad_board`
+into `route_board` as an opt-in step, not a default-behavior change.**
+
+- New `route_board` param `optimize: bool = False`. Default OFF, so
+  `test_route_board_pipeline_hooks_declared_not_faked`'s default-path
+  assertion (`pipeline["whole_board_optimization"].startswith("not_
+  implemented")`) keeps passing unchanged — update that test to ALSO cover
+  the `optimize=True` path (assert the hook reports something like `"done"`
+  or `"ran"` there), rather than loosening the default-path guard.
+- When `optimize=True`: after detailed routing (and after `write` if
+  `write=True` — the optimizer needs a real board state to snapshot into its
+  scratch copy), start a NEW `optimize_board` session on the just-routed
+  project and loop calling it (same `session_id`) until the state is
+  anything other than `"running"` — i.e. drive it to `converged` or
+  `budget_exhausted`. Do **NOT** attempt to auto-resolve `awaiting_decision`
+  — a synchronous one-shot orchestrator call cannot interactively pause a
+  human, so on `awaiting_decision` stop the loop, surface the full session
+  state (including `pending_decision`) in `route_board`'s report, and leave
+  the session open (resumable later via `get_kicad_route_session`/
+  `decide_kicad_route` exactly as any other session). This must be true
+  regardless of `pin_swap.enabled` / `ai_decisions.enabled` — route_board
+  must never silently accept a mandatory pin-swap pause or an AI-decision
+  pause on the caller's behalf.
+- Map `route_board`'s existing `effort` (`quick`/`balanced`/`best`) straight
+  through to `optimize_board`'s own identically-named `effort` preset — do
+  not invent a second effort vocabulary. Be aware `best` maps to an 8-hour
+  `time_budget_s` in the optimizer (per 7.15) — that is almost certainly too
+  long for a single synchronous orchestrator call; decide (and document the
+  decision) whether `route_board` should cap it with its own bound when
+  `optimize=True`, or whether that's acceptable given the caller explicitly
+  asked for `effort="best"`. Judgment call, not prescribed — but must not be
+  silently unbounded without at least a documented reason.
+- `route_board`'s `write` flag must still govern whether ANYTHING is
+  persisted — a `write=False` + `optimize=True` call previews the routed
+  AND optimized state without touching the real board (the optimizer
+  session itself is scratch-only until its own internal `write=True`, so
+  this should fall out naturally — verify with a test, don't assume).
+- Update the pipeline report's `whole_board_optimization` string to reflect
+  what actually happened (`"not_implemented"` when `optimize` is omitted/
+  False, something honest and specific — not just `"done"` — when it ran,
+  distinguishing `converged`/`budget_exhausted`/`awaiting_decision`).
+- New tests needed: `optimize=False` (default) unchanged from today;
+  `optimize=True` runs and reports a real session id + final state;
+  `awaiting_decision` surfaces correctly and does NOT get silently resolved;
+  `write=False` with `optimize=True` touches nothing on the real board;
+  the effort→optimizer-effort mapping.
+
 ### 7.7 — LANDED 2026-07-27 (reference anchor; no work remains here)
 
 Implemented directly on top of the 7.6 core in `kicad_optimizer_tool.py` (Opus
