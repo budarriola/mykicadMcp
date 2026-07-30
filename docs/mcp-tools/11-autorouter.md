@@ -303,11 +303,37 @@ single comprehensive report. No routing logic of its own — it calls existing f
 - `"balanced"` — default strategy (KiCad's pcb_settings config)
 - `"best"` — aggressive rip-up (`max_ripup_iterations=20`)
 
-Higher efforts become more meaningful when Phase 7.6 (whole-board optimizer) lands; that is
-documented honestly in the report's `notes`.
+When `optimize=true`, the same `effort` value is ALSO passed straight through to
+`optimize_kicad_board`'s identically-named preset (no second effort vocabulary).
+
+**`optimize` (default `false`) — the Phase 7.6 whole-board optimizer, opt in:**
+
+With `optimize=false` (the default) this call is exactly what it was before the flag existed,
+down to the `pipeline` report strings — no optimizer session is created at all.
+
+With `optimize=true` a 4th stage runs after detailed routing (and after the write, if any — the
+optimizer snapshots a real board state into its own scratch copy): a fresh `optimize_kicad_board`
+session is started and driven chunk by chunk until it reports something other than `running`,
+i.e. `converged` or `budget_exhausted`. The full session report lands under the result's
+`optimizer` key, and `pipeline.whole_board_optimization` says which of the outcomes happened.
+
+If the optimizer hits `awaiting_decision` — a Phase 7.7 AI near-tie or a MANDATORY Phase 7.14
+pin-swap pause — `route_kicad_board` **stops and surfaces the pending decision; it never answers
+it for you** (a plain resume would auto-defer it). The session stays open: inspect it with
+`get_kicad_route_session` and answer it with `decide_kicad_route`, then continue with
+`optimize_kicad_board`.
+
+`effort="best"` maps to an 8-hour optimizer time budget (Phase 7.15), which is far too long for
+one synchronous orchestrator call, so `route_kicad_board` clamps the session's time budget to its
+own 15-minute cap and says so in `notes` (with the session id, so the full-length run can be
+resumed via `optimize_kicad_board`). The clamp only ever lowers a budget, so `quick`/`balanced`
+are unaffected.
+
+`write` remains the only thing that persists anything: `write=false, optimize=true` previews the
+routed AND optimized result while leaving the real board byte-identical (the optimizer session is
+scratch-only until it is itself told to write).
 
 **NOT YET IMPLEMENTED (Marked as M4 Hooks):**
-- Whole-board optimization (Phase 7.6)
 - Stitching pass (Phase 7.5.6)
 
 Plane-aware routing (Phase 7.5.4) is ACTIVE for power/ground nets; see `route_kicad_nets` for details.
@@ -318,7 +344,7 @@ stages so callers know what's actually running.
 **write=false** (default) previews the full result without touching the board; `write=true` emits
 copper and records ownership for undo.
 
-**CLI usage:** `python kicad_router_tool.py route <project> [--write] [--nets ...] [--effort quick|balanced|best]`
+**CLI usage:** `python kicad_router_tool.py route <project> [--write] [--nets ...] [--effort quick|balanced|best] [--optimize]`
 
 **Args:** `project_path`, `nets` (optional array of net names; omit to route all unrouted),
 `write` (default false), `effort` (default "balanced"), `allow_while_open` (default false)
