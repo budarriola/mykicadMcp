@@ -51,14 +51,18 @@ and residuals; don't rely on this snapshot for that detail.
   right after this one is kept in full (not trimmed) — it's the acceptance
   narrative for the routing-capability arc (7.3b through M7) and several
   root-cause diagnoses future work still depends on, not a redundant log.
-- **Next work when resumed (updated 2026-07-30).** Only one item left in the
-  user's 2026-07-29 priority queue: **M6 item 17(c) Flow B stack-up-gate
-  question.** Phase 7.13 (impedance-matched traces) remains explicitly
-  deprioritized by the user — do not start it without being asked. Still
-  open, low priority: the small 7.3b "any same-net copper" termination bit,
-  and reassessing whether 7.22's `bus_first_direct_corridor_mm` default
-  should flip now that 7.6 is wired into `route_board` (see 7.22's anchor's
-  honest tradeoff note).
+- **Next work when resumed (updated 2026-07-30).** The user's 2026-07-29
+  priority queue is now fully drained: M6 item 17(c) was the last item and
+  is **DEFERRED** (user decision 2026-07-30 — it depends on Phase 7.13's
+  decision/recording mechanism, and 7.13 is itself deprioritized; see item
+  17(c)'s note and the "Pre-route stack-up gate" note for detail). No
+  standing next item — **ask the user what to prioritize next** rather than
+  picking one. Phase 7.13 (impedance-matched traces) remains explicitly
+  deprioritized — do not start it without being asked. Still open, low
+  priority: the small 7.3b "any same-net copper" termination bit, and
+  reassessing whether 7.22's `bus_first_direct_corridor_mm` default should
+  flip now that 7.6 is wired into `route_board` (see 7.22's anchor's honest
+  tradeoff note).
 - Verify claims against the code (`kicad_pcb_tool.py`, `kicad_mcp_server.py`,
   `tests/`) rather than trusting this snapshot if they disagree — and then fix
   this file.
@@ -2841,6 +2845,16 @@ asks whether to pause until impedance control / stack-up is configured (same
 gate + recorded answer as 7.13's missing-profile case; stored in the
 board-local JSON). The tool already computes and reports the flag.
 
+**Deliberately DEFERRED 2026-07-30 (user decision):** this item was designed
+to share its decision/recording mechanism with Phase 7.13's missing-profile
+case, but 7.13 (impedance-matched traces) is itself explicitly deprioritized
+and not started — building 17(c) standalone now would mean inventing a
+throwaway mechanism now and a real one later, or coupling this item to
+machinery that doesn't exist. Coordinator asked; user chose to leave this
+fully deferred until 7.13 is actually taken up, rather than build a
+standalone minimal gate ahead of it. No code work should be attempted here
+without the user raising it again (ideally alongside 7.13 itself).
+
 ---
 
 ## Implementation strategy — subagents
@@ -3206,8 +3220,12 @@ touched by this work, no write occurred).
     total critical nets 13→15. Known residual (out of scope, flagged): small
     rectangular-pad inductors (kiln L2/L3, `L_7.3x7.3`) still undershoot their
     real courtyard since no courtyard graphics are parsed — a true courtyard
-    parser would close this. **Still open: (c)** the Flow B session-start
-    stack-up-gate question (the tool already reports `stack_up_gate` per net).
+    parser would close this. **(c)** the Flow B session-start stack-up-gate
+    question (the tool already reports `stack_up_gate` per net) — **DEFERRED
+    2026-07-30 (user decision)**: depends on Phase 7.13's decision/recording
+    mechanism, and 7.13 itself is deprioritized/not started; see the note
+    under "Pre-route stack-up gate" a few sections up. Not to be picked up
+    standalone without the user raising it again.
 18. Phase 7.13 impedance-matched sets (coupled pair routing + length-matching
     meanders + profiles/assignments) — after 7.3b; Opus.
 19. Phase 7.14 connector pin-swap advisor — **FULLY LANDED 2026-07-27** (see
