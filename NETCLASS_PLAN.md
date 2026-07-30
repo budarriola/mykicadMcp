@@ -55,17 +55,194 @@ and residuals; don't rely on this snapshot for that detail.
   priority queue is now fully drained: M6 item 17(c) was the last item and
   is **DEFERRED** (user decision 2026-07-30 — it depends on Phase 7.13's
   decision/recording mechanism, and 7.13 is itself deprioritized; see item
-  17(c)'s note and the "Pre-route stack-up gate" note for detail). No
-  standing next item — **ask the user what to prioritize next** rather than
-  picking one. Phase 7.13 (impedance-matched traces) remains explicitly
-  deprioritized — do not start it without being asked. Still open, low
-  priority: the small 7.3b "any same-net copper" termination bit, and
-  reassessing whether 7.22's `bus_first_direct_corridor_mm` default should
-  flip now that 7.6 is wired into `route_board` (see 7.22's anchor's honest
-  tradeoff note).
+  17(c)'s note and the "Pre-route stack-up gate" note for detail). Phase
+  7.13 (impedance-matched traces) remains explicitly deprioritized — do not
+  start it without being asked. Still open, low priority: the small 7.3b
+  "any same-net copper" termination bit, and reassessing whether 7.22's
+  `bus_first_direct_corridor_mm` default should flip now that 7.6 is wired
+  into `route_board` (see 7.22's anchor's honest tradeoff note).
+  **Phase 7.23 (zone-territory soft routing) LANDED 2026-07-30** — see its
+  anchor below for the full write-up; it closes the "zone-shape editing"
+  gap this bullet used to flag as the from-scratch board's dominant
+  blocker. **Not yet done: re-run `route_board` on `kilnCtl_AutoRouteTest`
+  with `allow_zone_soft_route=True`** to measure how much of the
+  273/278-unrouted gap it actually closes — ask the user before doing this
+  proactively, since it touches the shared scratch board and is the natural
+  next verification step, not yet requested.
 - Verify claims against the code (`kicad_pcb_tool.py`, `kicad_mcp_server.py`,
   `tests/`) rather than trusting this snapshot if they disagree — and then fix
   this file.
+
+## ⭐ From-scratch full-board benchmark on `kilnCtl_AutoRouteTest` (2026-07-30)
+
+A separate scratch clone of the project (`kilnCtl_AutoRouteTest`, sibling
+directory to this repo, same commit history) exists specifically as a
+from-scratch routing testbed: placement and all six zone pours are present
+but almost nothing is routed yet (`get_kicad_ratsnest` at the start of this
+session: 278 unrouted connections / 139 unrouted nets / 36 fully-routed nets
+— contrast with the real `kiln.kicad_pcb`, which the 2026-07-27 audit found
+had only 1 unrouted connection left after the user's own hand-routing).
+This is a materially different regime than everything the routing-capability
+arc above was tuned and measured against.
+
+**Result: `route_kicad_board(write=True, effort=best)` routed only 5 of 278
+connections (3.677 mm copper, 3 vias).** Tried both `balanced` and `best`
+effort, before and after a `kicad-cli pcb drc --refill-zones --save-board`
+refresh of the zone fills (in case stale fills were the cause) — none of
+these moved the needle (5-6/278 every time; effort tunes rip-up
+aggressiveness, and there was almost nothing rippable since almost nothing
+routed on the first pass). This was NOT the `window_too_large` /
+`unreachable_in_window`-from-budget-limits problem the 2026-07-24 findings
+above describe and already fixed (adaptive grid, zone-distance perf, the
+finer-grid ladder, plane-via anti-pads) — those fixes are all still active
+and did not help here.
+
+**Root cause, sampled directly from the failure records (`kicad_router_tool.py`
+self-check / A* obstacle model, not a new bug):** the overwhelming majority of
+failures are short (1.5–2 mm airline) SIGNAL-net hops whose pads sit
+immediately adjacent to a filled GND/power zone with **zero rippable
+obstacle in the way** —
+- `unreachable_in_window` (464→468 of the failures): `nearest_blocker` is a
+  zone (e.g. `GND_Main` on F.Cu) at `distance_mm: 0.0`, at every grid
+  resolution down to 0.05 mm, within the full 60 mm window margin.
+- `self_check_failed` (78–82 of the failures): A* does find a path, but it
+  skims the zone closer than the net class clearance (0.3 mm); the violation
+  record has `"against_kind": "zone"`, `"owner": null` — i.e. NOT rip-up
+  eligible (rip-up demotion, phase 9's item, only ever applies to
+  autorouter-owned or hand-routed TRACK/VIA copper, never to a zone
+  polygon — zones can only be *reshaped* via `propose_kicad_plane` /
+  `modify_kicad_plane`, and only for autorouter-owned zones, never the six
+  hand-made kiln zones).
+
+In other words: on a board with no pre-existing hand-routed corridors, most
+signal pads under/beside a filled plane have no legal escape channel at
+all, and nothing in the pipeline (adaptive grid, hierarchical windowing,
+rip-up, plane-via anti-pads) can create one, because none of those tools
+edit a zone's own polygon. This is exactly the gap the 2026-07-27 real-board
+audit flagged as "a structurally different, bigger feature (zone-shape
+editing, not track/via rip-up) ... not started" for the single remaining
+`U6-BIAS` net on the real board — this session's from-scratch run shows
+that gap is the DOMINANT failure mode (not a rare residual) whenever a
+board hasn't already had its corridors carved out by hand. **Confirmed
+harmless changes kept on `kilnCtl_AutoRouteTest`:** the zone refill (fresh,
+authoritative fills; `kiln.kicad_pcb.prerefill.bak` left alongside as a
+restore point) and the 5-connection `write=True` route both landed with
+**zero new DRC violations** (kicad-cli reported 27 violations before and
+after, unconnected-item count dropped 276→275→ further after the route).
+
+**If pursued, the shape of the fix** would be a new capability — call it
+zone keepout carving / auto-notching: when a signal net's only legal path
+requires touching a foreign plane's territory, cut a small clearance notch
+into that plane's polygon (bounded, reversible via the zone's own
+`autorouter_owned` tracking the same way `create_kicad_plane`/
+`modify_kicad_plane` already do) rather than only ever treating the fill as
+a hard obstacle. This is scoped as a NEW item, not a fix to any existing
+phase; per the plan's standing rule, do not start it without the user's
+go-ahead.
+
+## Phase 7.23 — Zone-territory soft routing + kicad-cli-verified refill — LANDED 2026-07-30 (Opus subagent, worktree-isolated, coordinator independently re-ran both the new test file and the full suite before merging)
+
+**Problem this fixes** (see the finding above): most `unreachable_in_window` /
+`self_check_failed` failures on a from-scratch board are a signal-net pad
+with a filled foreign GND/power zone at `distance_mm: 0.0` and `owner: null`
+— nothing rippable, because the *zone's own fill polygon* is the obstacle,
+not any track/via. Real KiCad workflow doesn't have this problem: when you
+draw a trace and refill, the fill algorithm recomputes clearance around
+**every** copper item present at fill time, including the trace you just
+drew — the pour was never a fixed shape the trace has to dodge, it is
+supposed to yield. Our router has been treating a zone's *stale, pre-trace*
+fill as a permanent hard obstacle, which is backwards for this case (it is
+correctly a hard obstacle for a normal `unreachable_in_window` search against
+*other tracks/vias/pads*, which is why nothing here changes for those).
+
+**Design — do not hand-roll KiCad's fill/clearance algorithm; use kicad-cli as
+the authority (the ENABLER already proven 2026-07-24), the same way
+`refill_zones_with_kicad` already does for plane-via writes:**
+
+1. New **last-resort tier**, gated strictly behind full `_route_attempts`
+   ladder + hierarchical-tier exhaustion (same gating discipline as Phase
+   7.13's hierarchical tier — never engages for a connection that already
+   routes today, so default-off behavior is byte-identical). Only fires when
+   every remaining obstacle in the failure is a **foreign zone fill**
+   (`against_kind == "zone"`, `owner is None`) — any hard obstacle (pad,
+   track, via, Edge.Cuts) still fails normally, no change.
+2. For those connections, re-run the window search with that specific zone's
+   fill polygon treated as *non-blocking* for this net (still keep the
+   zone's own **outline** as courtesy-only info, not a hard bound — KiCad's
+   refill works within the outline anyway) — same clearance/self-check logic
+   otherwise, so the candidate still must clear all *other* real copper.
+3. Collect every such speculative candidate across the whole `route_board`
+   call; do **NOT** trust the in-Python self-check for the zone-clearance
+   term. Instead, on a **scratch copy** of the board: write all candidates,
+   run `refill_zones_with_kicad` (already implemented,
+   `kicad_router_tool.py:9480`), then read back the refilled zone polygons
+   and confirm each candidate's copper actually has clearance from the new
+   fill (a cheap geometry check now that the fill is authoritative, not
+   estimated).
+4. Only candidates that pass step 3 are eligible to write to the real board;
+   any that don't are rejected and stay `failed` (reason
+   `zone_soft_route_rejected`, with the real clearance gap reported) — never
+   silently accepted on the Python-only self-check.
+5. New per-call opt-in flag, default `False`: `allow_zone_soft_route` (same
+   convention as `allow_hand_copper_ripup` — this is materially more
+   speculative than ordinary routing, so ask every call, not a persisted
+   setting). Reports `zone_soft_routed` (uuids/nets) on the result, the same
+   audit-before-`write=True` pattern the hand-copper-ripup flag uses. Auto-
+   skips (reports `reason: "kicad-cli not found"`) when kicad-cli isn't on
+   the machine, exactly like `refill_zones_with_kicad` already does.
+
+**Correctness gates (non-negotiable, same as every prior phase):** flag-off
+is byte-identical to today (proven by a parity test); a connection this tier
+accepts must show **zero new DRC violations** on a real `kicad-cli pcb drc`
+run of the resulting board (measured, not assumed); determinism across
+worker counts; full existing suite stays green. **Do not** attempt to model
+KiCad's thermal-relief/clearance fill math in pure Python as an alternative —
+that was tried implicitly by the existing estimated-fill fallback and is
+exactly the source of this bug; kicad-cli is the ground truth here.
+
+**Landed as designed**, with a few deviations the implementer noted (all more
+conservative than the spec, none loosening a correctness gate): the tier runs
+after the whole-board lazy tier too (strictly later, not just after the
+hierarchical tier); eligibility is decided by re-checking the candidate's
+copper against the full obstacle set rather than trusting the failure
+record's single `nearest_blocker` (no reliable full blocker list exists on a
+failure record); verification deliberately does NOT apply the `_self_check`
+`via_transparent` anti-pad exemption (a real post-refill anti-pad is real
+geometry, exempting it would assume the thing being proven); a write
+containing any zone-soft copper always refills the real board regardless of
+the `refill_zones` flag (the whole premise is that the fill must catch up).
+New per-call opt-in flag `allow_zone_soft_route` (default `False`, same
+ask-every-call convention as `allow_hand_copper_ripup`) on both
+`route_nets`/`route_kicad_nets` and `route_board`/`route_kicad_board` (CLI +
+MCP schemas); reports `zone_soft_routed` (accepted, audit shape mirrors
+`human_copper_ripped`) and `zone_soft_route` (attempt/accept/reject
+accounting) on the result; refusals stay `failed` with
+`reason: "zone_soft_route_rejected"` and the measured `clearance_gap_mm`.
+0 new MCP tools (params added to two existing tools). 18 new tests
+(`tests/test_zone_soft_route.py`, synthetic fixtures, incl. a real
+kicad-cli DRC-delta test proving zero new violations on accepted copper, and
+three parity tests proving flag-off is byte-identical, incl. one that
+monkeypatches the new tier to raise so the default path provably never
+reaches it). Suite 513→531 passed, same 7 pre-existing real-kiln-board-drift
+failures (zone/ratsnest counts), 7 skipped — both the new file and the full
+suite independently re-run by the coordinator, not just taken on the
+subagent's word.
+
+**Residuals, honestly recorded:** verification measures at netclass
+clearance, so a zone configured with a tighter clearance override could see
+a candidate rejected that KiCad's own DRC would actually pass — conservative
+direction only (false-reject, never false-accept). Candidates are only
+produced for `candidate_index == 0`, so an alternate 7.19.2 candidate-
+fallback path never gets one. Up to 6 kicad-cli refill rounds
+(`_ZONE_SOFT_MAX_VERIFY_ROUNDS`) when candidates keep rejecting each other;
+non-convergence rejects rather than accepts.
+
+**Not yet re-benchmarked against `kilnCtl_AutoRouteTest`** (the from-scratch
+board that surfaced this bug) with the new flag turned on — that's the
+natural next verification step if the user wants to see how much of the
+273/278-unrouted gap this closes, but has not been run yet.
+
+---
 
 ## ⭐ Real-board routing findings & the hand-routed baseline (2026-07-24)
 
