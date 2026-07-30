@@ -73,6 +73,64 @@ and residuals; don't rely on this snapshot for that detail.
   `tests/`) rather than trusting this snapshot if they disagree — and then fix
   this file.
 
+## Phase 7.24 — Direct-line fast path (user-requested 2026-07-30, IN PROGRESS)
+
+**Motivation:** the from-scratch benchmark above showed a lot of the router's
+time and complexity goes into building a full grid window + running A* for
+connections that are, geometrically, trivial — the sampled failures earlier
+in this session were mostly 1.5–2 mm airline hops. User request: before doing
+any of that, just try drawing a straight line (or a simple one-bend
+Manhattan path) directly between the two pad points and see if it's already
+legal — much cheaper than a grid+A* search, and should be a big win on the
+common easy case.
+
+**Design (opt-in, new tier 0, runs BEFORE the global stage / grid pipeline):**
+- New flag, default `False` (same ask-every-call convention as
+  `allow_hand_copper_ripup`/`allow_zone_soft_route`) — call it
+  `direct_route_first`. Default off means every existing test and caller
+  gets byte-identical behavior; this is a pure speed feature, not a
+  correctness one, and changing the DEFAULT geometry of thousands of already-
+  passing connections would break this codebase's parity guarantees across
+  every prior landing.
+- For each connection, before spending anything on `_choose_grid`/`_FineWindow`/
+  `_fine_search`: try (a) a single same-layer straight segment between
+  `from_xy`/`to_xy`, then if that fails (b) the two orientations of an
+  L-shaped one-bend Manhattan path (via one intermediate corner). Test each
+  candidate with the SAME exact-clearance self-check every other tier uses
+  (`_self_check` against the real hard obstacle set — pads/tracks/vias/edges/
+  zones at full netclass clearance; no via-transparency or zone-soft leniency
+  here, this tier is about SPEED on already-legal geometry, not about finding
+  new corridors). No grid, no A*, no window build — just geometric distance
+  tests, so this should be one to two orders of magnitude cheaper per
+  connection than the existing pipeline.
+- On a pass, accept immediately — same emit path as any other tier, this
+  connection never touches the rest of `_route_attempts`. On failure (direct
+  line and both L-bends all collide with something), fall through to the
+  existing pipeline completely unchanged — this tier only ever short-circuits
+  the EASY case, it never gives up on a connection the existing pipeline
+  would have solved.
+- Cross-layer connections (different `home_layer` between endpoints) are out
+  of scope for the straight-line/L-bend geometry itself (no via placement
+  logic here) — skip tier 0 for those and fall through immediately, don't
+  try to invent a via-drop heuristic in the same pass.
+
+**Correctness gates (same bar as every other tier):** default off is
+byte-identical (parity test); an accepted direct/L-bend route must pass the
+exact same `_self_check` clearance test as any other emitted copper (no
+special-cased leniency — if it wouldn't pass the existing self-check, it
+doesn't get accepted here either); determinism across worker counts; full
+suite stays green. This tier is pure speed/ordering, so unlike 7.23 there is
+no need for a kicad-cli round-trip — a straight legal trace at full clearance
+is just as legal as one the grid pipeline would have found, nothing about it
+is speculative.
+
+**Scope note:** moderate complexity (geometry + tier gating, not obstacle-
+model surgery) — delegate to a Sonnet-class subagent, worktree-isolated,
+coordinator reviews (diff read + independent test run) before merging, same
+process as every other landing in this file.
+
+---
+
 ## ⭐ From-scratch full-board benchmark on `kilnCtl_AutoRouteTest` (2026-07-30)
 
 A separate scratch clone of the project (`kilnCtl_AutoRouteTest`, sibling
