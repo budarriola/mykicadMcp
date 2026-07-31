@@ -1153,7 +1153,15 @@ class KiCadMcpServer:
                     "accepted (reported in zone_soft_routed: net/uuids/zones). Refused candidates stay "
                     "failed with failure.reason zone_soft_route_rejected and the measured "
                     "clearance_gap_mm; with no kicad-cli on the machine EVERY candidate is refused "
-                    "(zone_soft_route.reason 'kicad-cli not found'), never assumed safe."
+                    "(zone_soft_route.reason 'kicad-cli not found'), never assumed safe. "
+                    "direct_route_first (default false, Phase 7.24) opts in to a tier-0 fast path "
+                    "that runs BEFORE any grid/window search, for every same-layer connection: try "
+                    "a straight segment then two one-bend Manhattan L-shapes directly between the "
+                    "exact endpoints, each proven against the same exact-clearance self-check every "
+                    "other tier uses (no leniency); a pass is accepted immediately at a fraction of "
+                    "the ordinary pipeline's cost, a miss falls through to it unchanged. Cross-layer "
+                    "connections skip this tier entirely (no via-drop heuristic). Reported under "
+                    "direct_route_first_count."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -1196,6 +1204,23 @@ class KiCadMcpServer:
                                 "refused. Review zone_soft_routed BEFORE trusting write=true."
                             ),
                         },
+                        "direct_route_first": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": (
+                                "Opt in (per-call, default off) to the Phase 7.24 tier-0 fast path: "
+                                "before any grid/window search, every same-layer connection first "
+                                "tries a straight segment then two one-bend Manhattan L-shapes "
+                                "directly between its exact endpoints, proven against the same "
+                                "exact-clearance self-check every other tier uses (no leniency). A "
+                                "pass is accepted immediately - far cheaper than a windowed A* search "
+                                "- and this connection never touches the grid pipeline at all; a miss "
+                                "(all 3 candidates collide with something) falls through to the "
+                                "ordinary pipeline completely unchanged. Cross-layer connections (no "
+                                "layer both endpoints already reach) skip this tier entirely - no "
+                                "via-drop heuristic here. See direct_route_first_count in the report."
+                            ),
+                        },
                         "optimize": {
                             "type": "boolean",
                             "default": False,
@@ -1230,7 +1255,12 @@ class KiCadMcpServer:
                     "allow_zone_soft_route (default false, Phase 7.23) adds a last-resort tier for a connection "
                     "whose ONLY blocker is a foreign zone's filled polygon; candidates are proven against a real "
                     "kicad-cli refill on a scratch board and reported under zone_soft_route / zone_soft_routed, "
-                    "with refusals staying failed as zone_soft_route_rejected."
+                    "with refusals staying failed as zone_soft_route_rejected. direct_route_first (default false, "
+                    "Phase 7.24) adds a tier-0 fast path that runs BEFORE any grid/window search: every "
+                    "same-layer connection first tries a straight segment then two one-bend Manhattan L-shapes "
+                    "directly between its exact endpoints, proven against the same exact-clearance self-check "
+                    "every other tier uses; a pass is accepted immediately, a miss falls through to the ordinary "
+                    "pipeline unchanged. Cross-layer connections skip this tier entirely."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -1269,6 +1299,22 @@ class KiCadMcpServer:
                                 "zone_soft_routed), everything else stays failed with "
                                 "zone_soft_route_rejected + clearance_gap_mm. Without kicad-cli every "
                                 "candidate is refused, never assumed safe."
+                            ),
+                        },
+                        "direct_route_first": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": (
+                                "Opt in (per-call, default off) to the Phase 7.24 tier-0 fast path: "
+                                "before any grid/window search, every same-layer connection first "
+                                "tries a straight segment then two one-bend Manhattan L-shapes "
+                                "directly between its exact endpoints, proven against the same "
+                                "exact-clearance self-check every other tier uses (no leniency). A "
+                                "pass is accepted immediately - far cheaper than a windowed A* search "
+                                "- and this connection never touches the grid pipeline at all; a miss "
+                                "falls through to the ordinary pipeline completely unchanged. "
+                                "Cross-layer connections (no layer both endpoints already reach) skip "
+                                "this tier entirely - no via-drop heuristic here."
                             ),
                         },
                     },
@@ -2545,6 +2591,7 @@ class KiCadMcpServer:
             allow_while_open=bool(args.get("allow_while_open", False)),
             allow_hand_copper_ripup=bool(args.get("allow_hand_copper_ripup", False)),
             allow_zone_soft_route=bool(args.get("allow_zone_soft_route", False)),
+            direct_route_first=bool(args.get("direct_route_first", False)),
             optimize=bool(args.get("optimize", False)),
         )
 
@@ -2559,6 +2606,7 @@ class KiCadMcpServer:
             max_ripup_iterations=int(mri) if mri is not None else None,
             allow_hand_copper_ripup=bool(args.get("allow_hand_copper_ripup", False)),
             allow_zone_soft_route=bool(args.get("allow_zone_soft_route", False)),
+            direct_route_first=bool(args.get("direct_route_first", False)),
         )
 
     def _tool_unroute_nets(self, args: dict[str, Any]) -> dict[str, Any]:

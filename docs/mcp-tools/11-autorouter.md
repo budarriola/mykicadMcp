@@ -200,6 +200,8 @@ hierarchical placement will not emit necks (rare in practice).
   ripup of hand-routed copper is gated by separate `allow_hand_copper_ripup` flag.
 - **Zone-territory soft routing (Phase 7.23, opt-in `allow_zone_soft_route`)** — see the section
   below. Off by default; when off, nothing about a run differs from before the flag existed.
+- **Direct-line fast path (Phase 7.24, opt-in `direct_route_first`)** — see the section below. Off
+  by default; when off, nothing about a run differs from before the flag existed.
 - **Plane-aware routing (Phase 7.5.4, Partial)** — For power/ground nets that own a filled zone,
   the router recognizes moves onto the net's own plane fill as low-cost traversal and can terminate
   on any point already inside that net's own fill (not just the exact `to` point). On-plane moves
@@ -214,7 +216,8 @@ touching the board. **Always preview first.**
 **Args:** `project_path`, `nets` (optional array; omit to route all unrouted connections), `connections`
 (optional explicit connection list from `get_ratsnest`), `write` (default false), `allow_while_open`
 (default false), `max_ripup_iterations` (default from pcb_settings.json; bounds rip-up iterations),
-`allow_hand_copper_ripup` (default false), `allow_zone_soft_route` (default false — see below)
+`allow_hand_copper_ripup` (default false), `allow_zone_soft_route` (default false — see below),
+`direct_route_first` (default false — see below)
 
 ### `allow_zone_soft_route` — zone-territory soft routing (Phase 7.23)
 
@@ -342,6 +345,65 @@ CLI: `python kicad_router_tool.py route <project> --allow-zone-soft-route [--wri
 }
 ```
 
+### `direct_route_first` — direct-line fast path (Phase 7.24)
+
+**The problem.** A lot of the detailed router's time and complexity goes into building a full
+grid window and running a windowed A* for connections that are, geometrically, trivial — many
+real-board failures/successes turn out to be short airline hops with nothing in the way. Building
+a `_FineWindow` and searching it is one to two orders of magnitude more expensive than answering
+the much simpler question "is a straight line (or one Manhattan bend) between these two exact
+points already legal?".
+
+**What the flag does.** This is a **tier 0** — it runs *before* `_choose_grid`/`_FineWindow`/the
+windowed A*, for **every** same-layer connection (not just ones that would otherwise fail). For
+each connection it tries, in order:
+
+1. **Straight** — one segment directly from `from_xy` to `to_xy`.
+2. **L-bend, corner at `(from_xy.x, to_xy.y)`** — two segments via that waypoint.
+3. **L-bend, corner at `(to_xy.x, from_xy.y)`** — two segments via the other waypoint.
+
+Each candidate is proven against the **exact same `_self_check` clearance rules** every other tier
+uses — full netclass clearance against every real hard obstacle (pads, tracks, vias, edges, zones).
+There is **no leniency of any kind** here (unlike Phase 7.23's zone-soft tier): this is a pure speed
+optimization on already-legal geometry, not a search for a new corridor. The first candidate that
+clears the self-check is accepted immediately, in the same emit shape every tier uses — that
+connection never touches the grid/A* pipeline at all.
+
+**Cross-layer connections are out of scope.** A connection whose two endpoints share no common
+routable layer (so the ordinary pipeline would need to drop a via) skips this tier entirely — no
+via-drop heuristic is implemented here — and falls straight through to the normal pipeline
+unchanged.
+
+**On a miss, nothing changes.** If all 3 candidates collide with something, the connection falls
+through completely to the ordinary `_route_attempts` grid/margin ladder, exactly as if the flag
+were off. This tier can only ever turn an easy case into a cheaper route — it never makes a
+connection worse, and it never causes a connection the existing pipeline would have solved to fail.
+`direct_route_first: false` (the default) is therefore byte-identical to before the flag existed.
+
+Connections routed this way carry a `direct_route_first: {"kind": "straight" | "l_bend_from_x_to_y"
+| "l_bend_to_x_from_y"}` field on their per-connection record, and the run's `summary` reports how
+many connections took the tier-0 path under `direct_route_first_count`.
+
+This is a **per-call** opt-in, not a `pcb_settings.json` field (same convention as
+`allow_hand_copper_ripup`/`allow_zone_soft_route`).
+
+```json
+{
+  "direct_route_first": true,
+  "connections": [
+    {
+      "net": "/MainControler/CLK", "routed": true, "length_mm": 15.25,
+      "via_count": 0, "layers": ["F.Cu"], "segment_count": 1,
+      "direct_route_first": {"kind": "straight"},
+      "self_check": {"passed": true, "violation_count": 0}
+    }
+  ],
+  "summary": {"direct_route_first_count": 1}
+}
+```
+
+CLI: `python kicad_router_tool.py route <project> --direct-route-first [--write]`.
+
 ## `unroute_kicad_nets`
 
 **The Undo for `route_kicad_nets`**
@@ -434,12 +496,13 @@ copper and records ownership for undo.
 **Args:** `project_path`, `nets` (optional array of net names; omit to route all unrouted),
 `write` (default false), `effort` (default "balanced"), `allow_while_open` (default false),
 `allow_hand_copper_ripup` (default false), `allow_zone_soft_route` (default false),
-`optimize` (default false)
+`direct_route_first` (default false), `optimize` (default false)
 
-Both `allow_hand_copper_ripup` and `allow_zone_soft_route` are passed straight through to
-`route_kicad_nets` and are reported back on this tool's result too (`human_copper_ripped` /
-`zone_soft_routed` + `zone_soft_route`) — see the `allow_zone_soft_route` section above for the
-full contract. Left off (the default), this call is byte-identical to before either flag existed.
+`allow_hand_copper_ripup`, `allow_zone_soft_route`, and `direct_route_first` are all passed
+straight through to `route_kicad_nets` and are reported back on this tool's result too
+(`human_copper_ripped` / `zone_soft_routed` + `zone_soft_route` / `direct_route_first_count`) — see
+the `allow_zone_soft_route` and `direct_route_first` sections above for the full contracts. Left
+off (the default), this call is byte-identical to before any of these flags existed.
 
 **Example output (excerpt):**
 ```json

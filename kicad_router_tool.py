@@ -6881,6 +6881,119 @@ def _prerank_candidates(gconn: dict[str, Any] | None,
     return out
 
 
+# --------------------------------------------------------------------------- #
+# Phase 7.24 — direct-line fast path (opt-in `direct_route_first`, TIER 0).
+#
+# WHY. Most connections that end up going through a full grid build + windowed
+# A* are, geometrically, trivial — the from-scratch benchmark that motivated
+# this phase found a lot of failures were 1.5-2 mm airline hops with nothing
+# in the way. Building a `_FineWindow` and running `_fine_search` for those is
+# one to two orders of magnitude more expensive than it needs to be: a straight
+# line (or a one-bend Manhattan detour) between the two exact endpoints is
+# either already legal or it isn't, and answering that question is a handful
+# of `_self_check` geometry tests against the real obstacle list — no grid, no
+# rasterization, no A* state space at all.
+#
+# WHAT THIS TIER DOES, AND WHAT IT REFUSES TO DO. Same-layer connections only
+# (see `_direct_route_layer` — a connection with no layer common to both
+# endpoints is cross-layer and this tier is skipped entirely, no via-drop
+# heuristic here). Three candidates, tried in order: (a) one straight segment
+# from `from_xy` to `to_xy`; (b) an L-bend via the corner `(from_xy.x,
+# to_xy.y)`; (c) an L-bend via the corner `(to_xy.x, from_xy.y)`. Each is
+# proven against the EXACT SAME `_self_check` clearance rules as every other
+# tier — full netclass clearance against every real hard obstacle (pads,
+# tracks, vias, edges, zones), no via-transparency shortcut, no zone-soft
+# leniency (unlike 7.23, this tier is pure speed on already-legal geometry, not
+# about finding a new corridor). The first candidate that passes is accepted
+# immediately, in the same emit shape (`rec_updates`/`segments`/`vias`) every
+# other tier uses — this connection never touches `_route_attempts`'s grid/A*
+# pipeline. If none of the 3 candidates pass, this function returns None and
+# the caller falls through to the ordinary pipeline completely unchanged: this
+# tier can only ever turn an easy case into a cheaper route, never make a
+# connection worse or fail one the existing pipeline would have solved.
+#
+# Determinism: a pure function of (ctx, net, from_xy, to_xy, layer,
+# active_obstacles) — the same 3 candidates in the same fixed order every
+# call, so it is bit-identical regardless of worker count (it is reached
+# through the same `ctx`-carrying call path as every other tier, see
+# `_route_one`/`_worker_route_speculative`).
+# --------------------------------------------------------------------------- #
+
+def _direct_route_layer(
+    start_layers: list[str], goal_layers: "set[str]", home_layer: str | None,
+    routable_layers: list[str],
+) -> str | None:
+    """The single layer a Phase 7.24 tier-0 candidate would use, or None when
+    the connection is CROSS-LAYER (no layer both endpoints already reach) —
+    the tier is out of scope there (no via-drop heuristic) and must be skipped
+    entirely, falling straight through to the ordinary pipeline.
+
+    Deterministic: prefers the coarse stage's own `home_layer` when it is one
+    of the layers both endpoints reach (so tier 0 tries the same layer the
+    rest of the pipeline would have used first), otherwise the first common
+    layer in `routable_layers`' canonical order."""
+    common = [l for l in routable_layers if l in start_layers and l in goal_layers]
+    if not common:
+        return None
+    if home_layer is not None and home_layer in common:
+        return home_layer
+    return common[0]
+
+
+def _route_direct_first(
+    ctx: dict[str, Any], net: str, from_xy: tuple[float, float],
+    to_xy: tuple[float, float], layer: str, active_obstacles: list["_Obst"],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]] | None:
+    """Phase 7.24 TIER 0 itself — see the block comment above for the full
+    design. Tries the straight segment then both L-bend Manhattan candidates,
+    in that fixed order, against the given same-layer connection.
+
+    Returns None (the caller falls through unchanged to `_route_attempts`) if
+    every candidate collides with something at netclass clearance, or
+    `(rec_updates, segments, vias=[])` on the first candidate that clears
+    `_self_check` cleanly — never a via (same-layer only, by construction)."""
+    rules = ctx["rules"]
+    via_radius = ctx["via_radius"]
+    allow_via_in_pad = bool(ctx.get("allow_via_in_pad", False))
+    tw = ctx["tw"]
+
+    def _segs(points: list[tuple[float, float]]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for i in range(len(points) - 1):
+            (x1, y1), (x2, y2) = points[i], points[i + 1]
+            if math.hypot(x2 - x1, y2 - y1) <= _EMIT_EPS_MM:
+                continue  # degenerate leg (e.g. an L-bend whose corner already
+                          # coincides with an endpoint on an axis-aligned hop)
+            out.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "layer": layer})
+        return out
+
+    candidates: list[tuple[str, list[tuple[float, float]]]] = [
+        ("straight", [from_xy, to_xy]),
+        ("l_bend_from_x_to_y", [from_xy, (from_xy[0], to_xy[1]), to_xy]),
+        ("l_bend_to_x_from_y", [from_xy, (to_xy[0], from_xy[1]), to_xy]),
+    ]
+    for kind, pts in candidates:
+        segments = _segs(pts)
+        if not segments:
+            continue  # both endpoints coincide - nothing to route (shouldn't
+                      # happen for a real connection; skip rather than fake a pass
+        violations = _self_check(net, segments, [], active_obstacles, rules,
+                                 via_radius, allow_via_in_pad)
+        if violations:
+            continue
+        length = sum(math.hypot(s["x2"] - s["x1"], s["y2"] - s["y1"]) for s in segments)
+        est_cost = length * float(tw.get("length_mm", 1.0))
+        rec_updates = {
+            "routed": True, "length_mm": round(length, 4), "via_count": 0,
+            "layers": [layer], "segment_count": len(segments),
+            "est_phase6_cost": round(est_cost, 4),
+            "self_check": {"passed": True, "violation_count": 0},
+            "direct_route_first": {"kind": kind},
+        }
+        return rec_updates, segments, []
+    return None
+
+
 def _route_one(
     ctx: dict[str, Any], conn: dict[str, Any], active_obstacles: list["_Obst"],
     congestion: dict[tuple[int, int, str], int], use_corridor: bool = True,
@@ -7000,6 +7113,29 @@ def _route_one_candidate(
         "goal_layers": goal_layers, "home_layer": home_layer, "corridor": None,
         "plane_layers": plane_layers, "goal_planes": goal_planes,
     }
+
+    # Phase 7.24 TIER 0 — direct-line fast path, opt-in `direct_route_first`
+    # (default False = byte-identical to before this phase existed, the tier
+    # is never entered). Scoped to `candidate_index == 0` like 7.23's tier:
+    # the candidate geometry here is a pure function of (from_xy, to_xy,
+    # layer, active_obstacles) with no dependence on which coarse candidate is
+    # being tried, so re-attempting it for candidate_index > 0 (7.19.2's
+    # alternate-candidate fallback, only ever reached once index 0 has already
+    # failed outright) would just repeat the same negative result. Runs BEFORE
+    # any grid/window is built - `_route_attempts`, `_choose_grid` and
+    # `_FineWindow` are all untouched below this block, so a connection tier 0
+    # accepts never reaches them at all.
+    if candidate_index == 0 and ctx.get("direct_route_first"):
+        direct_layer = _direct_route_layer(start_layers, goal_layers, home_layer,
+                                           routable_layers)
+        if direct_layer is not None:
+            direct = _route_direct_first(ctx, net, from_xy, to_xy, direct_layer,
+                                         active_obstacles)
+            if direct is not None:
+                rec_updates, direct_segments, direct_vias = direct
+                result_rec.update(rec_updates)
+                out.update({"routed": True, "segments": direct_segments, "vias": direct_vias})
+                return out
 
     board_bbox = ctx["board_bbox"]
     board_min = ctx["board_min"]
@@ -8474,6 +8610,7 @@ def route_nets(
     refill_zones: bool = False,
     allow_hand_copper_ripup: bool = False,
     allow_zone_soft_route: bool = False,
+    direct_route_first: bool = False,
 ) -> dict[str, Any]:
     """Phase 7.3b detailed (fine, windowed) routing.
 
@@ -8589,6 +8726,26 @@ def route_nets(
     it is materially more speculative than ordinary routing, so permission is
     asked fresh every invocation. Default False means every existing
     caller/test gets byte-identical behavior - the tier is never even entered.
+
+    `direct_route_first` (default False, PHASE 7.24) opts in to a TIER 0 that
+    runs BEFORE any grid/window is built, for every same-layer connection (not
+    just failures): try a single straight segment from the exact `from`/`to`
+    points, then the two one-bend Manhattan L-shapes (corner at each of the
+    two possible waypoints), each proven against the SAME exact-clearance
+    `_self_check` every other tier uses (no leniency of any kind - unlike
+    7.23, this is a pure speed tier, not a new-corridor tier). The first
+    candidate that passes is accepted immediately and this connection never
+    touches the grid/A* pipeline at all - one to two orders of magnitude
+    cheaper than a windowed search for the common case where the direct
+    geometry is already legal. Cross-layer connections (no layer both
+    endpoints already reach) are out of scope for this tier's straight-
+    line/L-bend geometry (no via-drop heuristic here) and fall straight
+    through unchanged. On a miss (all 3 candidates collide with something)
+    the connection falls through completely to the ordinary `_route_attempts`
+    ladder - this tier can only ever turn an easy case into a cheaper route,
+    never make a connection worse or fail one the existing pipeline would
+    have solved. Default False means every existing caller/test gets
+    byte-identical behavior - see `_route_direct_first`/`_direct_route_layer`.
 
     Still simplified vs. the full spec (documented honestly): pad escape lands
     on the nearest free grid node rather than a pad-direction-aware exact stub.
@@ -8974,6 +9131,12 @@ def route_nets(
         # key), so an unflagged call is byte-identical to before it existed.
         # Small picklable bool, so a spawned worker gates identically.
         "allow_zone_soft_route": bool(allow_zone_soft_route),
+        # Phase 7.24 direct-line fast path. Default False = TIER 0 is never
+        # entered at all (`_route_one_candidate` short-circuits on this key
+        # before any grid/window is built), so an unflagged call is
+        # byte-identical to before it existed. Small picklable bool, so a
+        # spawned worker gates identically to the parent.
+        "direct_route_first": bool(direct_route_first),
         # Phase 7.22 bus-first directness. `frozenset()` / 0.0 at the shipped
         # default, which makes `_route_one_candidate`'s `direct_corridor_mm`
         # 0.0 for every connection and leaves the corridor choice on its
@@ -9636,6 +9799,7 @@ def route_nets(
         # how many refill rounds it took, and whether it was skipped entirely
         # (`reason: "kicad-cli not found"`).
         "zone_soft_route": zone_soft_report,
+        "direct_route_first": direct_route_first,
         "connections": out_conns,
         "summary": {
             "total_connections": len(out_conns),
@@ -9650,6 +9814,12 @@ def route_nets(
             "human_copper_ripped_count": len(human_copper_ripped),
             "human_copper_removed_from_board": hand_copper_removed,
             "zone_soft_routed_count": len(zone_soft_routed),
+            # PHASE 7.24: how many connections this call routed through the
+            # opt-in tier-0 direct/L-bend fast path - 0 whenever
+            # `direct_route_first` is off (the default), since the tier is
+            # never entered at all.
+            "direct_route_first_count": sum(
+                1 for c in out_conns if c.get("direct_route_first")),
         },
     }
     if progress_enabled:
@@ -9882,6 +10052,7 @@ def route_board(
     allow_while_open: bool = False,
     allow_hand_copper_ripup: bool = False,
     allow_zone_soft_route: bool = False,
+    direct_route_first: bool = False,
     optimize: bool = False,
 ) -> dict[str, Any]:
     """Phase 7.17 - the ONE command to route the board (CLI + MCP).
@@ -9946,6 +10117,17 @@ def route_board(
     `zone_soft_route_rejected` and the measured clearance gap. Left off, this
     call is byte-identical to before the flag existed - the tier is never
     entered.
+
+    `direct_route_first` (default False, PHASE 7.24) is likewise passed
+    straight through to `route_nets` - see its docstring for the full
+    contract. In one line: before spending anything on a grid/windowed A*
+    search, every same-layer connection first tries a straight segment (then
+    two one-bend Manhattan L-shapes) directly between its exact endpoints,
+    proven against the same exact-clearance self-check as any other tier;
+    a pass is accepted immediately at a fraction of the cost of the ordinary
+    pipeline, a miss falls through to it completely unchanged. Left off,
+    this call is byte-identical to before the flag existed - the tier is
+    never entered.
     """
     effort = (effort or "balanced").lower()
     if effort not in _EFFORT_RIPUP:
@@ -9967,6 +10149,7 @@ def route_board(
         max_ripup_iterations=max_ripup,
         allow_hand_copper_ripup=allow_hand_copper_ripup,
         allow_zone_soft_route=allow_zone_soft_route,
+        direct_route_first=direct_route_first,
     )
     d_summary = detailed.get("summary", {})
 
@@ -10013,6 +10196,8 @@ def route_board(
         "allow_zone_soft_route": allow_zone_soft_route,
         "zone_soft_routed": detailed.get("zone_soft_routed", []),
         "zone_soft_route": detailed.get("zone_soft_route"),
+        "direct_route_first": direct_route_first,
+        "direct_route_first_count": d_summary.get("direct_route_first_count", 0),
         "connections": detailed.get("connections", []),
         "detailed_result": detailed,   # full route_nets result for callers who want it
         "optimize": optimize,
@@ -10468,6 +10653,9 @@ def _cli_print_route_report(report: dict[str, Any]) -> None:
         if zs_report.get("skipped"):
             line += f"  SKIPPED ({zs_report.get('reason')})"
         print(line)
+    if report.get("direct_route_first"):
+        print(f"  direct-route-first: {report.get('direct_route_first_count', 0)} "
+              f"connection(s) routed via the tier-0 direct/L-bend fast path")
     for c in report.get("connections", []):
         if c.get("routed"):
             print(f"    [OK]   {c['net']}: {c.get('length_mm')} mm, "
@@ -10520,6 +10708,12 @@ def main(argv: list[str] | None = None) -> int:
                               "the ONLY blocker; every candidate is proven against a real "
                               "kicad-cli zone refill on a scratch board before it can be "
                               "written (see zone_soft_routed; refusals stay failed)")
+    p_route.add_argument("--direct-route-first", action="store_true",
+                         help="opt in (default off) to the Phase 7.24 tier-0 fast path: before "
+                              "any grid/window search, try a straight segment (then two one-bend "
+                              "Manhattan L-shapes) directly between each same-layer connection's "
+                              "exact endpoints, self-checked at full clearance; a pass is accepted "
+                              "immediately, a miss falls through to the ordinary pipeline unchanged")
     p_route.add_argument("--optimize", action="store_true",
                          help="opt in (default off) to running the Phase 7.6 whole-board "
                               "optimizer after detailed routing, driven to converged/"
@@ -10544,6 +10738,7 @@ def main(argv: list[str] | None = None) -> int:
             allow_while_open=args.allow_while_open,
             allow_hand_copper_ripup=args.allow_hand_copper_ripup,
             allow_zone_soft_route=args.allow_zone_soft_route,
+            direct_route_first=args.direct_route_first,
             optimize=args.optimize,
         )
         if args.json:
