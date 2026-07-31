@@ -61,17 +61,72 @@ and residuals; don't rely on this snapshot for that detail.
   "any same-net copper" termination bit, and reassessing whether 7.22's
   `bus_first_direct_corridor_mm` default should flip now that 7.6 is wired
   into `route_board` (see 7.22's anchor's honest tradeoff note).
-  **Phase 7.23 (zone-territory soft routing) LANDED 2026-07-30** — see its
-  anchor below for the full write-up; it closes the "zone-shape editing"
-  gap this bullet used to flag as the from-scratch board's dominant
-  blocker. **Not yet done: re-run `route_board` on `kilnCtl_AutoRouteTest`
-  with `allow_zone_soft_route=True`** to measure how much of the
-  273/278-unrouted gap it actually closes — ask the user before doing this
-  proactively, since it touches the shared scratch board and is the natural
-  next verification step, not yet requested.
+  **Phase 7.23 (zone-territory soft routing) and 7.24 (direct-line fast
+  path) LANDED 2026-07-30** — see their anchors below. 7.23 closes the
+  "zone-shape editing" gap this bullet used to flag as the from-scratch
+  board's dominant blocker; 7.24 is a pure speed win for the trivial-hop
+  case. `kilnCtl_AutoRouteTest` has also been stripped-and-rerouted once
+  already (416→318 unrouted, committed) as a capability test, independent
+  of these two phases landing.
+  **STANDING POLICY CHANGE (user, 2026-07-30): the byte-identical-when-
+  flag-off parity discipline that gated every phase through 7.24 is
+  RELAXED.** The user cares more about routing quality (completion %,
+  board score) and speed than preserving exact output geometry for
+  already-passing connections — new work does not need a parity test
+  proving default-off is byte-identical, and defaults MAY change emitted
+  geometry when it's an improvement. This does NOT relax the separate
+  auditability rationale behind `allow_zone_soft_route`/
+  `allow_hand_copper_ripup` staying opt-in (a human should still review
+  what a `write=True` touches before trusting it) — keep those opt-in
+  regardless. Still non-negotiable: `_self_check` exact-clearance
+  correctness, determinism across worker counts, and a green test suite
+  (parity tests specifically may be dropped/relaxed, not the whole suite).
+  **Phase 7.25 (cross-layer direct-route-first) queued next** — see its
+  anchor below.
 - Verify claims against the code (`kicad_pcb_tool.py`, `kicad_mcp_server.py`,
   `tests/`) rather than trusting this snapshot if they disagree — and then fix
   this file.
+
+## Phase 7.25 — Cross-layer direct-route-first (via-drop extension, user-requested 2026-07-30, IN PROGRESS)
+
+**Motivation:** 7.24's tier 0 explicitly skips any connection whose two
+endpoints don't share a common layer ("no via-drop heuristic here" was the
+deliberate 7.24 scope cut). On a from-scratch board a lot of connections ARE
+cross-layer (that's most of the point of vias), so this is the next-biggest
+easy win for the same reason 7.24 was: cheap geometry beats a grid+A* search
+whenever it's legal, and now that byte-identical parity is no longer a
+constraint (see the status-snapshot policy change above), this can be added
+more freely than 7.24 was.
+
+**Design — a second, slightly richer tier-0b, tried after 7.24's same-layer
+tier fails/is skipped, before the grid/A* pipeline:**
+- For a cross-layer connection, try: an escape via near the `from` endpoint
+  (drop straight down/up from `from_xy` to the layer nearest `to_xy`'s home
+  layer) + a same-layer direct/L-bend leg to `to_xy` on that layer; then the
+  symmetric candidate anchored at the `to` endpoint instead. Two candidates,
+  each reusing 7.24's existing straight/L-bend leg-building and `_self_check`
+  discipline for the trace portion, plus a via clearance/placement check
+  (reuse whatever via-placement clearance logic `_finalize_core`/`_self_check`
+  already apply elsewhere — do not reinvent via clearance math).
+- Same acceptance bar as 7.24: full netclass clearance against every real
+  hard obstacle, first candidate that passes wins, a miss falls through to
+  the existing pipeline unchanged (never makes a connection worse).
+- Opt-in flag, but per the relaxed policy this does NOT need a byte-identical
+  parity proof — a straightforward default-off-is-safe smoke test is enough
+  (prove the tier isn't silently mangling something when off), no need for
+  the exhaustive monkeypatch-style parity test 7.23/7.24 required. Still
+  needs: `_self_check` correctness tests, a determinism check, and a green
+  suite.
+- Consider (implementer's judgment, not mandated) whether this should
+  default to `True` on `route_board` specifically given the relaxed policy —
+  if so, note the reasoning in this file when landing.
+
+**Scope note:** builds directly on 7.24's helpers (`_direct_route_layer`,
+`_route_direct_first`'s candidate/self-check pattern) — moderate complexity,
+Sonnet-class subagent, worktree-isolated, coordinator reviews before
+merging, same process as 7.23/7.24.
+
+---
 
 ## Phase 7.24 — Direct-line fast path — LANDED 2026-07-30 (Sonnet subagent, worktree-isolated, coordinator independently re-ran the new test file and merged after review)
 
