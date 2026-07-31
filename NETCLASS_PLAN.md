@@ -73,7 +73,7 @@ and residuals; don't rely on this snapshot for that detail.
   `tests/`) rather than trusting this snapshot if they disagree — and then fix
   this file.
 
-## Phase 7.24 — Direct-line fast path (user-requested 2026-07-30, IN PROGRESS)
+## Phase 7.24 — Direct-line fast path — LANDED 2026-07-30 (Sonnet subagent, worktree-isolated, coordinator independently re-ran the new test file and merged after review)
 
 **Motivation:** the from-scratch benchmark above showed a lot of the router's
 time and complexity goes into building a full grid window + running A* for
@@ -124,10 +124,34 @@ no need for a kicad-cli round-trip — a straight legal trace at full clearance
 is just as legal as one the grid pipeline would have found, nothing about it
 is speculative.
 
-**Scope note:** moderate complexity (geometry + tier gating, not obstacle-
-model surgery) — delegate to a Sonnet-class subagent, worktree-isolated,
-coordinator reviews (diff read + independent test run) before merging, same
-process as every other landing in this file.
+**Landed as designed**, no deviations from spec. New opt-in flag
+`direct_route_first` (default `False`) threaded through `route_nets`/
+`route_kicad_nets` and `route_board`/`route_kicad_board` (signatures,
+docstrings, `ctx` dict, CLI `--direct-route-first`, both MCP schemas/
+handlers, `_cli_print_route_report`). Core: `_direct_route_layer` (picks the
+tier's single layer, or `None` to skip cross-layer connections entirely) and
+`_route_direct_first` (the 3 ordered candidates — straight, then both L-bend
+Manhattan corners — each proven against the same `_self_check` every other
+tier uses), hooked into `_route_one_candidate` before any grid/window code
+runs. Reports `direct_route_first_count` in the result summary. 0 new MCP
+tools. 13 new tests (`tests/test_direct_route.py`): open-straight accept,
+blocked-straight/open-L-bend accept, fully-blocked falls through identical
+to flag-off, cross-layer skips the tier entirely, `_direct_route_layer` unit
+tests, parity (flag off never calls the tier, byte-identical to explicit
+`False`), determinism across `workers=1` vs `4`, and CLI/MCP plumbing.
+Suite 529→542 passed (both counts independently confirmed from completed
+run output, not assumed), same 7 pre-existing real-kiln-board-drift
+failures, 9 skipped — zero regressions. Coordinator independently re-ran
+the new test file (13/13 passed) before merging (`e6dd63e`, fast-forward).
+
+**Process note:** an early background test run in the implementing
+subagent's worktree was flagged mid-session as possibly deadlocked (an
+8-second CPU-time sample showed no progress) and its process was killed:
+the subagent's own follow-up run completed normally, so that read was most
+likely a false positive from sampling during pytest-xdist's slower startup/
+collection phase rather than a real hang — worth remembering before killing
+a long-running test process on this suite again (it legitimately takes
+place 800s+ single pass).
 
 ---
 
