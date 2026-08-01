@@ -86,6 +86,7 @@ try:
     propose_netclass_from_nets,
     search_component_by_reference,
     set_schematic_property,
+    set_schematic_property_for_part,
     suggest_component_placement,
     )
 except Exception as exc:  # pragma: no cover - import safety
@@ -754,6 +755,31 @@ class KiCadMcpServer:
                     "required": ["project_path", "reference", "property_name", "value"],
                 },
                 "handler": self._tool_set_schematic_property,
+            },
+            "set_kicad_schematic_property_for_part": {
+                "description": (
+                    "Set one property across every schematic symbol that shares `reference`'s "
+                    "Value + Footprint - the same grouping list_kicad_schematic_parts uses for BOM "
+                    "rows - instead of calling set_kicad_schematic_property once per reference "
+                    "designator. Useful for fields that should be identical across every instance of "
+                    "a part, e.g. adding an alternate Mouser link to all placements of a 2.2uF/1206 "
+                    "cap by passing just one of its references. Defaults to write=false (dry run) - "
+                    "inspect `changes`, then call again with write=true to actually edit the "
+                    ".kicad_sch file(s)."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string", "description": "KiCad project directory, .kicad_pro, .kicad_pcb, or .kicad_sch path."},
+                        "reference": {"type": "string", "description": "Any one reference designator belonging to the part group to update."},
+                        "property_name": {"type": "string"},
+                        "value": {"type": "string"},
+                        "write": {"type": "boolean", "default": False},
+                        "allow_while_open": {"type": "boolean", "default": False, "description": "Skip the check that refuses to write while KiCad has a sheet open for editing."},
+                    },
+                    "required": ["project_path", "reference", "property_name", "value"],
+                },
+                "handler": self._tool_set_schematic_property_for_part,
             },
             "list_kicad_nets": {
                 "description": "List nets from the KiCad netlist.",
@@ -2830,6 +2856,16 @@ class KiCadMcpServer:
 
     def _tool_set_schematic_property(self, args: dict[str, Any]) -> dict[str, Any]:
         return set_schematic_property(
+            args["project_path"],
+            args["reference"],
+            args["property_name"],
+            args["value"],
+            write=bool(args.get("write", False)),
+            allow_while_open=bool(args.get("allow_while_open", False)),
+        )
+
+    def _tool_set_schematic_property_for_part(self, args: dict[str, Any]) -> dict[str, Any]:
+        return set_schematic_property_for_part(
             args["project_path"],
             args["reference"],
             args["property_name"],

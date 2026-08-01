@@ -4823,6 +4823,64 @@ def set_schematic_property(
     return {"write": write, "change": change}
 
 
+def set_schematic_property_for_part(
+    project_path: str | Path,
+    reference: str,
+    property_name: str,
+    value: str,
+    write: bool = False,
+    allow_while_open: bool = False,
+) -> dict[str, Any]:
+    """Set one property across every schematic symbol that shares `reference`'s
+    Value + Footprint - the same grouping list_schematic_parts uses for BOM
+    rows - instead of calling set_schematic_property once per reference
+    designator. Useful for fields that should be identical across every
+    instance of a part, e.g. adding an alternate Mouser link to all six
+    placements of a 2.2uF/1206 cap by passing just one of its references.
+
+    Defaults to a dry run (write=False) - inspect `changes`, then call again
+    with write=True to actually edit the .kicad_sch file(s). Refuses to write
+    to a sheet KiCad currently has open unless allow_while_open=True (same
+    per-file check set_schematic_property makes for each symbol touched).
+    """
+    directory = _resolve_schematic_dir(project_path)
+    components = _flatten_schematic_components(directory)
+    lowered_reference = reference.strip().upper()
+    anchor = next((c for c in components if c["reference"].strip().upper() == lowered_reference), None)
+    if anchor is None:
+        raise KeyError(f"Schematic symbol {reference} not found")
+
+    key = (anchor["value"], anchor["footprint"])
+    group_references: list[str] = []
+    seen: set[str] = set()
+    for component in components:
+        if component["lib_id"].startswith("power:") or component["reference"].startswith("#"):
+            continue
+        if (component["value"], component["footprint"]) != key:
+            continue
+        ref = component["reference"]
+        if ref in seen:
+            continue
+        seen.add(ref)
+        group_references.append(ref)
+
+    changes = [
+        set_schematic_property(
+            directory, ref, property_name, value, write=write, allow_while_open=allow_while_open
+        )["change"]
+        for ref in group_references
+    ]
+
+    return {
+        "write": write,
+        "value": key[0],
+        "footprint": key[1],
+        "reference_count": len(group_references),
+        "references": group_references,
+        "changes": changes,
+    }
+
+
 DEFAULT_PCB_SETTINGS: dict[str, Any] = {
     "version": 1,
     "trace_cost": {
