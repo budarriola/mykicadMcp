@@ -484,6 +484,7 @@ def _interpret_part(part: dict[str, Any]) -> dict[str, Any]:
         "availability_in_stock": part.get("AvailabilityInStock"),
         "lifecycle_status": part.get("LifecycleStatus") or None,
         "product_detail_url": part.get("ProductDetailUrl") or "",
+        "datasheet_url": part.get("DataSheetUrl") or None,
         "price_breaks": _price_breaks_from_part(part),
         "detected_type": detected_type,
         "capacitance": "unsupported",
