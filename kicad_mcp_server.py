@@ -152,6 +152,7 @@ except Exception as exc:  # pragma: no cover - optional dependency
 try:
     from kicad_mouser_tool import (
         audit_component_specs_against_mouser,
+        audit_duplicate_mouser_links,
         audit_manufacturer_part_numbers,
         audit_schematic_health,
         audit_stock_sufficiency,
@@ -722,6 +723,29 @@ class KiCadMcpServer:
                 },
                 "handler": self._tool_audit_schematic_integrity,
             },
+            "audit_kicad_duplicate_mouser_links": {
+                "description": (
+                    "Static, instant, no-API-key sanity check across every unique schematic part: flags "
+                    "any Manufacturer_Part_Number or Mouser link (Mouser Part Number/Mouser/Mouser Part "
+                    "Number Alt/etc) that's assigned to more than one genuinely different declared Value - "
+                    "the exact bug class behind the R94-R113 feedback-resistor issue in todo.md, where a "
+                    "stale Mouser link got copy-pasted across several distinct resistor values in the same "
+                    "divider network. Unlike audit_kicad_component_specs this never calls the Mouser API - "
+                    "it only compares what's already written in the schematic, so it's safe and fast to run "
+                    "after any bulk property edit as an immediate self-consistency check. Groups sharing the "
+                    "same Value+Footprint are one legitimate part and never flagged against each other. "
+                    "Also runs automatically as part of audit_kicad_schematic_health."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string", "description": "KiCad project directory, .kicad_pro, .kicad_pcb, or .kicad_sch path."},
+                        "references": {"type": "array", "items": {"type": "string"}, "description": "Specific reference designators to check instead of every unique part."},
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_audit_duplicate_mouser_links,
+            },
             "audit_kicad_component_specs": {
                 "description": (
                     "Cross-check every unique schematic part's Value/Footprint/Manufacturer_Part_Number "
@@ -778,16 +802,18 @@ class KiCadMcpServer:
                 "description": (
                     "One-call pre-fab/pre-order sanity pass across the whole schematic, combining every "
                     "error check this project has: (1) audit_kicad_schematic_integrity - duplicate "
-                    "reference designators, missing Value/Footprint; (2) audit_kicad_capacitor_voltages - "
-                    "every capacitor either states its own voltage or is assumed to use "
-                    "`default_capacitor_voltage`; (3) audit_kicad_component_specs - each part's "
-                    "Value/Footprint/MPN matches its linked Mouser product; (4) audit_kicad_stock_sufficiency "
-                    "- at least one candidate link per part covers `board_quantity` board(s). There is no "
-                    "universally-correct default capacitor voltage for this project - ASK THE USER what "
-                    "voltage rating this design assumes for capacitors that don't state one before calling "
-                    "this (Power.kicad_sch/Regulators.kicad_sch's rail voltages are a reasonable thing to "
-                    "bring up in that conversation, but the actual answer is a project decision). Steps 3-4 "
-                    "REQUIRE MOUSER_API_KEY and are the slow, rate-limited part of this call. Writes a "
+                    "reference designators, missing Value/Footprint; (2) audit_kicad_duplicate_mouser_links "
+                    "- the same Mouser link/MPN copy-pasted across two or more genuinely different declared "
+                    "Values, no API key needed; (3) audit_kicad_capacitor_voltages - every capacitor either "
+                    "states its own voltage or is assumed to use `default_capacitor_voltage`; "
+                    "(4) audit_kicad_component_specs - each part's Value/Footprint/MPN matches its linked "
+                    "Mouser product; (5) audit_kicad_stock_sufficiency - at least one candidate link per "
+                    "part covers `board_quantity` board(s). There is no universally-correct default "
+                    "capacitor voltage for this project - ASK THE USER what voltage rating this design "
+                    "assumes for capacitors that don't state one before calling this (Power.kicad_sch/"
+                    "Regulators.kicad_sch's rail voltages are a reasonable thing to bring up in that "
+                    "conversation, but the actual answer is a project decision). Steps 4-5 REQUIRE "
+                    "MOUSER_API_KEY and are the slow, rate-limited part of this call. Writes a "
                     "Markdown summary to `report_path` (defaults to 'schematic_health_report.md' at the "
                     "project root); full structured results are also returned as JSON."
                 ),
@@ -2933,6 +2959,12 @@ class KiCadMcpServer:
 
     def _tool_audit_schematic_integrity(self, args: dict[str, Any]) -> dict[str, Any]:
         return audit_schematic_integrity(args["project_path"])
+
+    def _tool_audit_duplicate_mouser_links(self, args: dict[str, Any]) -> dict[str, Any]:
+        return audit_duplicate_mouser_links(
+            args["project_path"],
+            references=args.get("references"),
+        )
 
     def _tool_audit_component_specs(self, args: dict[str, Any]) -> dict[str, Any]:
         return audit_component_specs_against_mouser(

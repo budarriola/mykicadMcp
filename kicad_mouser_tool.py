@@ -19,7 +19,15 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from kicad_pcb_tool import audit_capacitor_voltages, audit_schematic_integrity, get_schematic_part, list_schematic_parts
+from kicad_pcb_tool import (
+    audit_capacitor_voltages,
+    audit_schematic_integrity,
+    get_schematic_part,
+    list_schematic_parts,
+    _flatten_schematic_components,
+    _reference_sort_key,
+    _resolve_schematic_dir,
+)
 
 # Repo-root .env/.mouser_cache.json (both gitignored) - see .env.example for
 # the expected key name.
@@ -1482,6 +1490,91 @@ def _extract_package_code_from_footprint(footprint: str | None) -> str | None:
     return None
 
 
+def audit_duplicate_mouser_links(project_path: str | Path, references: list[str] | None = None) -> dict[str, Any]:
+    """Static, instant, no-API-key sanity check across every unique
+    schematic part: flags any Manufacturer_Part_Number or Mouser link
+    (Mouser Part Number/Mouser/Mouser Part Number Alt/etc) that's assigned
+    to more than one *different* declared Value - the exact bug class
+    behind the R94-R113 feedback-resistor issue in todo.md, where a single
+    stale Mouser link got copy-pasted across several distinct resistor
+    values in the same divider network. Unlike audit_component_specs_against_mouser
+    this never calls the Mouser API - it only compares what's already
+    written in the schematic, so it's safe (and fast) to run after any bulk
+    property edit as an immediate self-consistency check, before or instead
+    of the slower Mouser-verified audit.
+
+    Groups sharing the same Value+Footprint are one legitimate part and are
+    never flagged against each other, matching list_schematic_parts'
+    grouping. `references`, if given, restricts which schematic references
+    are considered (still compared for cross-value collisions against every
+    other unique part in the file, not just each other).
+    """
+    directory = _resolve_schematic_dir(project_path)
+    components = _flatten_schematic_components(directory)
+    if references is not None:
+        wanted = set(references)
+        components = [c for c in components if c["reference"] in wanted]
+
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    order: list[tuple[str, str]] = []
+    for component in components:
+        if component["lib_id"].startswith("power:") or component["reference"].startswith("#"):
+            continue
+        key = (component["value"], component["footprint"])
+        group = groups.get(key)
+        if group is None:
+            properties = component["properties"]
+            group = {
+                "value": component["value"],
+                "footprint": component["footprint"],
+                "references": [],
+                "manufacturer_part_number": _canonical_mpn_from_properties(properties),
+                "mouser_url": find_mouser_url(properties),
+            }
+            groups[key] = group
+            order.append(key)
+        group["references"].append(component["reference"])
+
+    # link_key identifies "the same external part" - prefer the canonical MPN
+    # (immune to which specific distributor link got pasted where), falling
+    # back to the raw Mouser URL when no MPN is recorded at all.
+    by_link: dict[str, list[dict[str, Any]]] = {}
+    for key in order:
+        group = groups[key]
+        group["references"].sort(key=_reference_sort_key)
+        mpn_norm = _normalize_mpn_for_compare(group["manufacturer_part_number"])
+        link_key = f"mpn:{mpn_norm}" if mpn_norm else (f"url:{group['mouser_url']}" if group["mouser_url"] else None)
+        if link_key is None:
+            continue
+        by_link.setdefault(link_key, []).append(group)
+
+    conflicts: list[dict[str, Any]] = []
+    for link_key, members in by_link.items():
+        distinct_values = {m["value"] for m in members}
+        if len(distinct_values) > 1:
+            conflicts.append(
+                {
+                    "linked_part": members[0]["manufacturer_part_number"] or members[0]["mouser_url"],
+                    "groups": [
+                        {
+                            "value": m["value"],
+                            "footprint": m["footprint"],
+                            "references": m["references"],
+                            "manufacturer_part_number": m["manufacturer_part_number"],
+                            "mouser_url": m["mouser_url"],
+                        }
+                        for m in members
+                    ],
+                }
+            )
+
+    return {
+        "checked_group_count": len(order),
+        "conflict_count": len(conflicts),
+        "conflicts": conflicts,
+    }
+
+
 def audit_component_specs_against_mouser(
     project_path: str | Path,
     references: list[str] | None = None,
@@ -1706,7 +1799,12 @@ def audit_schematic_health(
 
     1. audit_schematic_integrity (schematic-only, instant) - duplicate
        reference designators, symbols missing a Value or Footprint.
-    2. audit_capacitor_voltages - every capacitor either states its own
+    2. audit_duplicate_mouser_links (schematic-only, instant, no API calls) -
+       the same Manufacturer_Part_Number/Mouser link copy-pasted across two
+       or more genuinely different declared Values (the R94-R113 bug class
+       in todo.md). Runs before the API-backed steps so this class of error
+       is always caught even if Mouser lookups are rate-limited or skipped.
+    3. audit_capacitor_voltages - every capacitor either states its own
        voltage rating or is assumed to use `default_capacitor_voltage`.
        There is no universally-correct default for this project - ASK THE
        USER what voltage rating this design assumes for capacitors that
@@ -1714,14 +1812,14 @@ def audit_schematic_health(
        Regulators.kicad_sch's rail voltages are a reasonable thing to bring
        up in that conversation, but the actual answer is a project decision,
        not something to guess).
-    3. audit_component_specs_against_mouser - each part's Value/Footprint/
+    4. audit_component_specs_against_mouser - each part's Value/Footprint/
        Manufacturer_Part_Number matches what its linked Mouser product
        actually is (catches stale/wrong links like the R96/R103 issue in
        todo.md).
-    4. audit_stock_sufficiency - at least one of each part's candidate
+    5. audit_stock_sufficiency - at least one of each part's candidate
        Mouser links is in stock for `board_quantity` board(s) worth.
 
-    Steps 3-4 REQUIRE MOUSER_API_KEY and are the slow, rate-limited part of
+    Steps 4-5 REQUIRE MOUSER_API_KEY and are the slow, rate-limited part of
     this call - a full ~40-60 unique part schematic can take a couple of
     minutes. Writes a Markdown summary to `report_path` (defaults to
     `schematic_health_report.md` at the project root); full structured
@@ -1731,6 +1829,7 @@ def audit_schematic_health(
     output_path = Path(report_path) if report_path is not None else schematic_dir / "schematic_health_report.md"
 
     integrity = audit_schematic_integrity(project_path)
+    duplicate_links = audit_duplicate_mouser_links(project_path, references=references)
     voltages = audit_capacitor_voltages(project_path, default_voltage=default_capacitor_voltage)
     voltage_mismatches = [v for v in voltages["with_voltage"] if v["status"] == "differs_from_default"]
     specs = audit_component_specs_against_mouser(project_path, references=references, value_tolerance_pct=value_tolerance_pct)
@@ -1740,6 +1839,7 @@ def audit_schematic_health(
         integrity["duplicate_reference_count"]
         + integrity["missing_value_count"]
         + integrity["missing_footprint_count"]
+        + duplicate_links["conflict_count"]
         + voltages["missing_voltage_count"]
         + len(voltage_mismatches)
         + specs["mismatched_count"]
@@ -1776,7 +1876,28 @@ def audit_schematic_health(
             lines.append("")
 
     lines += [
-        "## 2. Capacitor Voltage Ratings",
+        "## 2. Duplicate Mouser Links (different Values, same linked part)",
+        "",
+        f"Checked {duplicate_links['checked_group_count']} unique part group(s), "
+        f"{duplicate_links['conflict_count']} conflict(s) found.",
+        "",
+    ]
+    if duplicate_links["conflicts"]:
+        lines.append("| Linked Part | Value | Footprint | References |")
+        lines.append("|---|---|---|---|")
+        for conflict in duplicate_links["conflicts"]:
+            for group in conflict["groups"]:
+                lines.append(
+                    f"| {conflict['linked_part']} | {group['value']} | {group['footprint']} | "
+                    f"{', '.join(group['references'])} |"
+                )
+        lines.append("")
+    else:
+        lines.append("None found.")
+        lines.append("")
+
+    lines += [
+        "## 3. Capacitor Voltage Ratings",
         "",
         f"Default assumed voltage: **{default_capacitor_voltage}**",
         f"- Missing a stated voltage (assumed default): {voltages['missing_voltage_count']}",
@@ -1791,7 +1912,7 @@ def audit_schematic_health(
         lines.append("")
 
     lines += [
-        "## 3. Part Specs vs. Mouser Link",
+        "## 4. Part Specs vs. Mouser Link",
         "",
         f"Checked {specs['checked_count']} part(s), {specs['mismatched_count']} mismatch(es) "
         f"({specs['skipped_count']} had no Mouser link, {specs['error_count']} failed to look up).",
@@ -1811,7 +1932,7 @@ def audit_schematic_health(
         lines.append("")
 
     lines += [
-        "## 4. Stock Sufficiency",
+        "## 5. Stock Sufficiency",
         "",
         f"Board quantity: {stock['board_quantity']}. Checked {stock['checked_count']} part(s), "
         f"{stock['insufficient_count']} without any candidate link that covers the need.",
@@ -1836,6 +1957,7 @@ def audit_schematic_health(
         "report_path": str(output_path),
         "total_issue_count": total_issue_count,
         "integrity": integrity,
+        "duplicate_mouser_links": duplicate_links,
         "capacitor_voltages": voltages,
         "capacitor_voltage_mismatches": voltage_mismatches,
         "component_specs": specs,
