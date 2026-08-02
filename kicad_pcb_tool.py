@@ -925,6 +925,32 @@ def _format_at_number(value: float) -> str:
     return text
 
 
+_PAD_AT_RE = re.compile(r'(\(pad\s+"[^"]+"[^\n]*\n\s*\(at\s+[-\d.]+\s+[-\d.]+)(\s+[-\d.]+)?(\))')
+
+
+def _rotate_pad_angles_in_block(block: str, delta: float) -> str:
+    """Shift every pad's stored angle within a footprint block by `delta` degrees.
+
+    Each `(pad ... (at x y angle))` line stores an absolute angle (pad's own
+    local orientation plus the footprint's placement rotation at authoring
+    time) - it is not automatically kept in sync when the footprint's
+    top-level `(at ...)` rotation is changed by `apply_layout_changes`. Pad
+    x/y offsets are relative to the footprint origin and stay untouched;
+    only the trailing angle needs shifting by the same delta the footprint
+    body just rotated by, or the copper pads end up rotated relative to the
+    silkscreen/courtyard (invisible in most 2D views, wrong in 3D/fab).
+    """
+
+    def repl(match: re.Match[str]) -> str:
+        old_angle = float(match.group(2)) if match.group(2) else 0.0
+        new_angle = round((old_angle + delta) % 360, 6)
+        if abs(new_angle) < 1e-9 or abs(new_angle - 360) < 1e-9:
+            return f"{match.group(1)}{match.group(3)}"
+        return f"{match.group(1)} {_format_at_number(new_angle)}{match.group(3)}"
+
+    return _PAD_AT_RE.sub(repl, block)
+
+
 def apply_layout_changes(
     project_path: str | Path,
     changes: list[dict[str, Any]],
@@ -995,9 +1021,18 @@ def apply_layout_changes(
         rotation = new_pos.get("rotation", 0.0) or 0.0
         new_at = f"(at {x} {y} {_format_at_number(rotation)})" if rotation else f"(at {x} {y})"
 
+        old_rot_m = re.match(r"\(at\s+[-\d.]+\s+[-\d.]+(?:\s+([-\d.]+))?\)", old_at)
+        old_rotation = float(old_rot_m.group(1)) if old_rot_m and old_rot_m.group(1) else 0.0
+        rotation_delta = round((rotation - old_rotation) % 360, 6)
+
         applied.append({"reference": change.get("reference"), "uuid": uuid, "old_at": old_at, "new_at": new_at})
         if write:
             text = text[:at_idx] + new_at + text[end_idx + 1 :]
+            if abs(rotation_delta) > 1e-9 and abs(rotation_delta - 360) > 1e-9:
+                block_start, block_end = _footprint_block_span(text, uuid)
+                block = text[block_start:block_end]
+                rotated_block = _rotate_pad_angles_in_block(block, rotation_delta)
+                text = text[:block_start] + rotated_block + text[block_end:]
 
     if write and applied:
         _check_not_locked_by_editor(board_path, allow_while_open)
@@ -1013,6 +1048,37 @@ def apply_layout_changes(
         "applied": applied,
         "missing": missing,
     }
+
+
+def set_component_position(
+    project_path: str | Path,
+    reference: str,
+    x: float,
+    y: float,
+    rotation: float = 0.0,
+    write: bool = False,
+    allow_while_open: bool = False,
+) -> dict[str, Any]:
+    """Set one footprint's absolute board position and rotation directly, by
+    reference designator - the single-part counterpart to `apply_layout_changes`
+    (which takes a batch of {reference/uuid, new_position} dicts).
+
+    Rewrites the footprint's own top-level `(at x y rotation)` line and, if
+    the rotation actually changes, also shifts every one of its pads' stored
+    `(at x y angle)` lines by the same delta so the copper stays aligned with
+    the new body rotation - a plain single-line edit here would otherwise
+    leave pads rotated relative to the footprint (correct in the 2D canvas,
+    silently wrong in the 3D viewer / on the fab pads).
+
+    Defaults to write=False (dry run) - always preview first, then call again
+    with write=True to commit.
+    """
+    return apply_layout_changes(
+        project_path,
+        [{"reference": reference, "new_position": {"x": x, "y": y, "rotation": rotation}}],
+        write=write,
+        allow_while_open=allow_while_open,
+    )
 
 
 def apply_layout_template(
@@ -4071,6 +4137,264 @@ def get_schematic_part(project_path: str | Path, reference: str) -> dict[str, An
         if component["reference"].strip().upper() == lowered:
             return component
     raise KeyError(f"Schematic symbol {reference} not found")
+
+
+def _parse_pin_node(pin_node: list[Any]) -> dict[str, Any]:
+    electrical_type = pin_node[1] if len(pin_node) > 1 and isinstance(pin_node[1], str) else ""
+    graphic_style = pin_node[2] if len(pin_node) > 2 and isinstance(pin_node[2], str) else ""
+    name = ""
+    number = ""
+    for entry in pin_node[3:]:
+        if not (isinstance(entry, list) and entry):
+            continue
+        if entry[0] == "name" and len(entry) > 1 and isinstance(entry[1], str):
+            name = entry[1]
+        elif entry[0] == "number" and len(entry) > 1 and isinstance(entry[1], str):
+            number = entry[1]
+    return {"number": number, "name": name, "electrical_type": electrical_type, "graphic_style": graphic_style}
+
+
+def _find_lib_symbol_definition(root: Any, lib_id: str) -> list[Any] | None:
+    """Find the `(symbol "<lib_id>" ...)` library definition inside a
+    schematic file's embedded `lib_symbols` cache - every `.kicad_sch` file
+    carries its own local copy of each symbol it places, so the definition
+    lives in the same file as the placed instance, not off in a separate
+    library file.
+    """
+    def walk(node: Any) -> list[Any] | None:
+        if isinstance(node, list):
+            if node and node[0] == "lib_symbols":
+                for child in node[1:]:
+                    if isinstance(child, list) and len(child) > 1 and child[0] == "symbol" and child[1] == lib_id:
+                        return child
+                return None
+            for child in node:
+                found = walk(child)
+                if found is not None:
+                    return found
+        return None
+    return walk(root)
+
+
+def _sub_symbol_unit(name: str) -> int | None:
+    """KiCad names a lib symbol's per-unit sub-blocks `{part}_{unit}_{style}`
+    (e.g. "C_1_1", "MAX31856_2_1"); unit 0 holds pins/graphics shared across
+    every unit. Returns None if `name` doesn't follow that convention.
+    """
+    parts = name.rsplit("_", 2)
+    if len(parts) == 3 and parts[1].isdigit():
+        return int(parts[1])
+    return None
+
+
+def _collect_symbol_pins(symbol_node: list[Any], unit: int | None = None) -> list[dict[str, Any]]:
+    """Collect every pin defined directly on `symbol_node` or on its nested
+    per-unit sub-symbols. Pass `unit` to restrict to that unit's own pins
+    plus the shared unit-0 ones, matching what's actually drawn for one
+    placed instance; omit it to return every pin defined anywhere under this
+    symbol across all units (deduplicated by pin number).
+    """
+    pins: list[dict[str, Any]] = []
+    seen_numbers: set[str] = set()
+
+    def add_pin(pin_node: list[Any]) -> None:
+        pin = _parse_pin_node(pin_node)
+        if pin["number"] and pin["number"] not in seen_numbers:
+            seen_numbers.add(pin["number"])
+            pins.append(pin)
+
+    for entry in symbol_node[1:]:
+        if not (isinstance(entry, list) and entry):
+            continue
+        if entry[0] == "pin":
+            add_pin(entry)
+        elif entry[0] == "symbol" and len(entry) > 1 and isinstance(entry[1], str):
+            sub_unit = _sub_symbol_unit(entry[1])
+            if unit is not None and sub_unit is not None and sub_unit not in (0, unit):
+                continue
+            for sub_entry in entry[1:]:
+                if isinstance(sub_entry, list) and sub_entry and sub_entry[0] == "pin":
+                    add_pin(sub_entry)
+
+    return pins
+
+
+def get_schematic_symbol_pins(project_path: str | Path, reference: str) -> dict[str, Any]:
+    """Get every pin's name, number, and electrical type for one placed
+    schematic symbol by reference designator - the pin table KiCad shows in
+    the symbol properties dialog, not just the bare pin *numbers*
+    get_schematic_part's `pins` field returns. Pulled from the symbol's
+    library definition embedded in its own schematic sheet file, restricted
+    to the reference's own unit plus any unit-0 (shared-across-units) pins,
+    so multi-unit parts (op-amps, gate arrays) only show the pins actually
+    drawn for that one placed instance.
+    """
+    directory = _resolve_schematic_dir(project_path)
+    component = get_schematic_part(directory, reference)
+    lib_id = component["lib_id"]
+    sheetfile = component["sheetfile"]
+    unit = component["unit"]
+
+    sch_path = next(
+        (path for path in _reachable_schematic_files(directory) if path.name == sheetfile),
+        None,
+    )
+    if sch_path is None:
+        raise KeyError(f"Schematic sheet file {sheetfile} not found under {directory}")
+
+    text = _read_text(sch_path)
+    root = SexprParser(text).parse()
+    symbol_node = _find_lib_symbol_definition(root, lib_id)
+    if symbol_node is None:
+        raise KeyError(f"Library symbol definition for {lib_id!r} not found in {sch_path.name}")
+
+    pins = _collect_symbol_pins(symbol_node, unit=unit)
+    pins.sort(key=lambda p: _reference_sort_key(p["number"]))
+
+    return {
+        "reference": reference,
+        "lib_id": lib_id,
+        "unit": unit,
+        "sheetfile": sheetfile,
+        "pin_count": len(pins),
+        "pins": pins,
+    }
+
+
+_PIN_ACTIVE_LOW_WRAP_RE = re.compile(r"^~\{(.+)\}$")
+_PIN_TRAILING_ACTIVE_LOW_RE = re.compile(r"(_N|-N|#|\*)$", re.IGNORECASE)
+_PIN_LEADING_ACTIVE_LOW_RE = re.compile(r"^[/#!]")
+_PIN_LEADING_N_ACTIVE_LOW_RE = re.compile(r"^N(?=[A-Z0-9])")
+
+
+def _normalize_pin_name(name: str) -> str:
+    """Fold a pin name to a comparable form so equivalent active-low notations
+    and formatting differences across sources don't read as mismatches: a
+    schematic's KiCad-style overbar `~{CS}`, a datasheet's `/CS`, `#CS`,
+    `nCS`/`NCS`, `CS#`, or `CS_N` all normalize to `CS`. Also case-folds and
+    strips whitespace, so `V+` / `v +` compare equal. Deliberately does NOT
+    strip a bare trailing `N` (only `_N`/`-N`/`#`/`*` suffixes) or treat every
+    leading `N` as active-low - too many real signal names end or start with
+    a literal N (`GEN`, `NRESET` is ambiguous but rare enough to accept as a
+    known limitation vs. false-stripping names like `NC` or `NTC`).
+    """
+    name = (name or "").strip()
+    match = _PIN_ACTIVE_LOW_WRAP_RE.match(name)
+    if match:
+        name = match.group(1).strip()
+    upper = name.upper()
+    upper = _PIN_LEADING_ACTIVE_LOW_RE.sub("", upper)
+    upper = _PIN_TRAILING_ACTIVE_LOW_RE.sub("", upper)
+    return upper
+
+
+# Datasheet pin tables commonly use one of these labels/synonyms for an
+# unconnected or reserved pin; schematic symbols usually spell the same
+# concept "NC" or "DNC". Both directions normalize into this one bucket so a
+# real datasheet's "No Connect" doesn't get flagged as a name mismatch
+# against a schematic's "NC".
+_PIN_NC_SYNONYMS = {"NC", "DNC", "NOCONNECT", "NOCONNECTION", "RESERVED", "N.C.", "DONOTCONNECT"}
+
+
+def _normalize_pin_name_for_nc(name: str) -> str:
+    normalized = _normalize_pin_name(name).replace(".", "").replace(" ", "")
+    return "NC" if normalized in _PIN_NC_SYNONYMS else normalized
+
+
+def compare_pin_names(
+    schematic_pins: list[dict[str, Any]],
+    datasheet_pins: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Diff a schematic symbol's pin table (get_schematic_symbol_pins' `pins`,
+    or any `[{"number":.., "name":..}, ...]` list in that shape) against a pin
+    table read out of the part's datasheet PDF - its "Pin Description" /
+    "Pin Configuration" / "Pin Functions" / "Terminal Assignments" section
+    (name varies by manufacturer; read the table with pdf-mcp's `pdf_search`
+    or `pdf_read_pages` and pass the resulting `{"number", "name"}` rows
+    here), keyed by pin number. Names are compared after `_normalize_pin_name`
+    folding so notation differences alone (KiCad `~{CS}` vs datasheet `/CS`,
+    case, whitespace, NC-vs-DNC) don't read as mismatches - only a genuine
+    disagreement about what a pin *is* does.
+    """
+    def index_by_number(pins: list[dict[str, Any]]) -> dict[str, str]:
+        indexed: dict[str, str] = {}
+        for pin in pins:
+            number = str(pin.get("number", "")).strip()
+            if number:
+                indexed[number] = str(pin.get("name", "") or "")
+        return indexed
+
+    schematic_by_number = index_by_number(schematic_pins)
+    datasheet_by_number = index_by_number(datasheet_pins)
+
+    all_numbers = sorted(
+        set(schematic_by_number) | set(datasheet_by_number),
+        key=_reference_sort_key,
+    )
+
+    matched: list[dict[str, Any]] = []
+    mismatched: list[dict[str, Any]] = []
+    schematic_only: list[dict[str, Any]] = []
+    datasheet_only: list[dict[str, Any]] = []
+
+    for number in all_numbers:
+        in_schematic = number in schematic_by_number
+        in_datasheet = number in datasheet_by_number
+        if in_schematic and not in_datasheet:
+            schematic_only.append({"number": number, "name": schematic_by_number[number]})
+            continue
+        if in_datasheet and not in_schematic:
+            datasheet_only.append({"number": number, "name": datasheet_by_number[number]})
+            continue
+
+        schematic_name = schematic_by_number[number]
+        datasheet_name = datasheet_by_number[number]
+        schematic_norm = _normalize_pin_name_for_nc(schematic_name)
+        datasheet_norm = _normalize_pin_name_for_nc(datasheet_name)
+        row = {
+            "number": number,
+            "schematic_name": schematic_name,
+            "datasheet_name": datasheet_name,
+        }
+        if schematic_norm == datasheet_norm:
+            row["match_type"] = "exact" if schematic_name.strip() == datasheet_name.strip() else "normalized"
+            matched.append(row)
+        else:
+            mismatched.append(row)
+
+    return {
+        "schematic_pin_count": len(schematic_by_number),
+        "datasheet_pin_count": len(datasheet_by_number),
+        "matched_count": len(matched),
+        "mismatched_count": len(mismatched),
+        "schematic_only_count": len(schematic_only),
+        "datasheet_only_count": len(datasheet_only),
+        "matched": matched,
+        "mismatched": mismatched,
+        "schematic_only": schematic_only,
+        "datasheet_only": datasheet_only,
+    }
+
+
+def audit_schematic_symbol_pin_names(
+    project_path: str | Path,
+    reference: str,
+    datasheet_pins: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Convenience wrapper: look up `reference`'s schematic pin table via
+    get_schematic_symbol_pins, then diff it against `datasheet_pins` (a
+    `[{"number", "name"}, ...]` list read out of the part's datasheet PDF's
+    pin description table via pdf-mcp) using compare_pin_names. See
+    compare_pin_names for the matching/normalization rules.
+    """
+    symbol = get_schematic_symbol_pins(project_path, reference)
+    diff = compare_pin_names(symbol["pins"], datasheet_pins)
+    return {
+        "reference": reference,
+        "lib_id": symbol["lib_id"],
+        "sheetfile": symbol["sheetfile"],
+        **diff,
+    }
 
 
 _CAPACITOR_REF_RE = re.compile(r"^C\d+$")

@@ -42,6 +42,7 @@ try:
     audit_capacitor_voltages,
     audit_netclass_conformance,
     audit_schematic_integrity,
+    audit_schematic_symbol_pin_names,
     classify_group_by_anchor_pin,
     create_group,
     create_netclass,
@@ -67,6 +68,7 @@ try:
     get_project_track_inventory,
     get_property_position,
     get_schematic_part,
+    get_schematic_symbol_pins,
     get_trace_cost,
     init_pcb_settings,
     inspect_project,
@@ -85,6 +87,7 @@ try:
     pin_distance,
     propose_netclass_from_nets,
     search_component_by_reference,
+    set_component_position,
     set_schematic_property,
     set_schematic_property_for_part,
     suggest_component_placement,
@@ -313,6 +316,71 @@ class KiCadMcpServer:
                 },
                 "handler": self._tool_get_schematic_part,
             },
+            "get_kicad_schematic_symbol_pins": {
+                "description": (
+                    "Get every pin's name, number, and electrical type for one placed schematic symbol "
+                    "by reference designator - the pin table KiCad shows in the symbol properties dialog "
+                    "(e.g. pin 1 named 'VCC', pin 2 named 'GND'), not just the bare pin *numbers* "
+                    "get_kicad_schematic_part's `pins` field returns. Pulled from the symbol's library "
+                    "definition embedded in its own schematic sheet file. Restricted to the reference's "
+                    "own unit plus any unit-0 (shared-across-units) pins, so multi-unit parts (op-amps, "
+                    "gate arrays) only show the pins actually drawn for that one placed instance."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string", "description": "KiCad project directory, .kicad_pro, .kicad_pcb, or .kicad_sch path."},
+                        "reference": {"type": "string"},
+                    },
+                    "required": ["project_path", "reference"],
+                },
+                "handler": self._tool_get_schematic_symbol_pins,
+            },
+            "audit_kicad_symbol_pin_names": {
+                "description": (
+                    "Cross-check one schematic symbol's pin names against the pin table read out of "
+                    "its datasheet PDF, to catch a schematic symbol whose pin names don't actually match "
+                    "what the manufacturer's datasheet says (wrong/stale library symbol, wrong part "
+                    "variant, hand-edited pin names). This tool does NOT read the PDF itself - the "
+                    "typical workflow is: (1) get_kicad_schematic_part or lookup_mouser_part to find the "
+                    "part's datasheet URL (prefer a real PDF link; lookup_mouser_part's `datasheet_url` "
+                    "resolves one even when the schematic's own 'Datasheet' property is actually a Mouser "
+                    "product-page link), (2) pdf-mcp's pdf_search or pdf_read_pages to locate the 'Pin "
+                    "Description' section (manufacturers name it differently - also try 'Pin "
+                    "Configuration', 'Pin Functions', 'Pin Assignments', 'Terminal Description/Assignments', "
+                    "'Pinout') and read its pin number/name table, (3) pass that table here as "
+                    "`datasheet_pins`. Pulls the schematic side itself via get_kicad_schematic_symbol_pins, "
+                    "then diffs by pin number after folding both sides' names through the same active-low "
+                    "notation (KiCad `~{CS}` / datasheet `/CS`, `#CS`, `nCS`, `CS#`, `CS_N` all treated as "
+                    "the same signal), case, and NC-vs-DNC-vs-'No Connect' normalization, so formatting "
+                    "differences alone don't get reported as mismatches - only a genuine disagreement "
+                    "about what a pin *is* does. Reports matched / mismatched / schematic-only / "
+                    "datasheet-only pins (the last two catch a pin *count* mismatch, e.g. a datasheet "
+                    "table row that didn't make it into the diff, or a schematic pin the datasheet doesn't "
+                    "have)."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string", "description": "KiCad project directory, .kicad_pro, .kicad_pcb, or .kicad_sch path."},
+                        "reference": {"type": "string"},
+                        "datasheet_pins": {
+                            "type": "array",
+                            "description": "Pin rows read out of the datasheet's Pin Description table.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "number": {"type": "string", "description": "Pin number as printed in the datasheet, e.g. '1', '9'."},
+                                    "name": {"type": "string", "description": "Pin name as printed in the datasheet, e.g. 'CS', '/CS', 'VDD'."},
+                                },
+                                "required": ["number", "name"],
+                            },
+                        },
+                    },
+                    "required": ["project_path", "reference", "datasheet_pins"],
+                },
+                "handler": self._tool_audit_schematic_symbol_pin_names,
+            },
             "audit_kicad_capacitor_voltages": {
                 "description": (
                     "Check every unique capacitor value in the schematic (identified by the 'C<n>' "
@@ -425,10 +493,14 @@ class KiCadMcpServer:
                     "via get_kicad_schematic_part (supports multiple Mouser fields). Detects capacitor "
                     "vs resistor vs other: capacitors get capacitance + voltage_rating, resistors get "
                     "resistance, and either an MLCC capacitor or SMT resistor additionally gets "
-                    "package_size_inch (e.g. '0402', '0805'). Fields that don't apply to the detected "
-                    "type come back 'unsupported'; fields that should apply but couldn't be found come "
-                    "back 'unknown'. `raw_specifications` has every spec Mouser listed, in case the "
-                    "field-name mapping misses one. REQUIRES MOUSER_API_KEY (repo-root .env) - raises "
+                    "package_size_inch (e.g. '0402', '0805'). `datasheet_url` is the manufacturer's own "
+                    "PDF datasheet link Mouser lists for the part (distinct from `product_detail_url`, "
+                    "the Mouser product page itself) - useful when a schematic's own 'Datasheet' property "
+                    "was actually filled with a Mouser link instead of a PDF, e.g. before feeding a part "
+                    "into pdf-mcp to check its pin description table. Fields that don't apply to the "
+                    "detected type come back 'unsupported'; fields that should apply but couldn't be "
+                    "found come back 'unknown'. `raw_specifications` has every spec Mouser listed, in "
+                    "case the field-name mapping misses one. REQUIRES MOUSER_API_KEY (repo-root .env) - raises "
                     "a clear error asking for one if missing; does not fall back to scraping the site. "
                     "For more than a couple of parts, use bulk_lookup_mouser_parts instead - it's a "
                     "single round trip."
@@ -1982,6 +2054,32 @@ class KiCadMcpServer:
                 },
                 "handler": self._tool_apply_layout_changes,
             },
+            "set_kicad_component_position": {
+                "description": (
+                    "Set one footprint's absolute board position and rotation directly, by reference "
+                    "designator - the simple single-part counterpart to apply_kicad_layout_changes (which "
+                    "takes a batch of {reference, new_position} dicts). Use this for a one-off 'move R33 to "
+                    "x,y at rotation r' instead of building a one-item changes list by hand. Correctly shifts "
+                    "the footprint's pads to match whenever rotation actually changes, so pads can't end up "
+                    "rotated relative to the footprint body (invisible in the 2D editor, wrong in the 3D "
+                    "viewer and on the fab pads) - the failure mode a raw single-line (at ...) edit would hit. "
+                    "Defaults to write=false to preview; call again with write=true to commit."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "reference": {"type": "string"},
+                        "x": {"type": "number"},
+                        "y": {"type": "number"},
+                        "rotation": {"type": "number", "default": 0.0},
+                        "write": {"type": "boolean", "default": False},
+                        "allow_while_open": {"type": "boolean", "default": False, "description": "Skip the check that refuses to write while KiCad has this board open for editing (see get_kicad_ipc_status)."},
+                    },
+                    "required": ["project_path", "reference", "x", "y"],
+                },
+                "handler": self._tool_set_component_position,
+            },
             "list_kicad_hierarchical_templates": {
                 "description": (
                     "Board-wide overview, in one call, of every schematic sheet stamped out more than once "
@@ -2765,6 +2863,12 @@ class KiCadMcpServer:
     def _tool_get_schematic_part(self, args: dict[str, Any]) -> dict[str, Any]:
         return get_schematic_part(args["project_path"], args["reference"])
 
+    def _tool_get_schematic_symbol_pins(self, args: dict[str, Any]) -> dict[str, Any]:
+        return get_schematic_symbol_pins(args["project_path"], args["reference"])
+
+    def _tool_audit_schematic_symbol_pin_names(self, args: dict[str, Any]) -> dict[str, Any]:
+        return audit_schematic_symbol_pin_names(args["project_path"], args["reference"], args["datasheet_pins"])
+
     def _tool_audit_capacitor_voltages(self, args: dict[str, Any]) -> dict[str, Any]:
         return audit_capacitor_voltages(args["project_path"], default_voltage=args.get("default_voltage"))
 
@@ -2902,6 +3006,17 @@ class KiCadMcpServer:
         return apply_layout_changes(
             args["project_path"],
             list(args["changes"]),
+            write=bool(args.get("write", False)),
+            allow_while_open=bool(args.get("allow_while_open", False)),
+        )
+
+    def _tool_set_component_position(self, args: dict[str, Any]) -> dict[str, Any]:
+        return set_component_position(
+            args["project_path"],
+            args["reference"],
+            float(args["x"]),
+            float(args["y"]),
+            rotation=float(args.get("rotation", 0.0)),
             write=bool(args.get("write", False)),
             allow_while_open=bool(args.get("allow_while_open", False)),
         )
