@@ -2195,11 +2195,13 @@ def _pad_local_rotations(project_path: str | Path, reference: str) -> dict[str, 
 
 
 def diff_flip_template(project_path: str | Path, template_reference: str, target_reference: str) -> dict[str, Any]:
-    """Find which members of `target_reference`'s hierarchical group either sit on the
+    """Find which members of `target_reference`'s hierarchical group - including
+    the group's own anchor part, not just its support parts - either sit on the
     wrong copper side, or have mismatched per-pad rotation, compared to their matching
     (by symbol_uuid) member in `template_reference`'s group - e.g. the template channel
     has 4 support parts deliberately flipped to the back to save front-side space, but
-    this target channel still has all of them on the front; or a non-square SMD pad
+    this target channel still has all of them on the front; or the anchor IC itself
+    was flipped to the wrong side while its whole support group was not; or a non-square SMD pad
     (e.g. a screw-terminal/jack footprint) carries an extra local rotation baked into
     its individual `pad ... (at x y <angle>)` line in one instance but not the other,
     even though both instances share the same layer and the same overall footprint
@@ -2213,15 +2215,12 @@ def diff_flip_template(project_path: str | Path, template_reference: str, target
     """
     template_group = get_hierarchical_group(project_path, template_reference, verbose=True)
     target_group = get_hierarchical_group(project_path, target_reference, verbose=True)
-    t_anchor = template_group["anchor"]
     target_by_role = {m["symbol_uuid"]: m for m in target_group["members"]}
 
     changes: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     for member in template_group["members"]:
         role = member["symbol_uuid"]
-        if role == t_anchor["symbol_uuid"]:
-            continue
         target_member = target_by_role.get(role)
         if target_member is None:
             skipped.append({"template_reference": member["reference"], "reason": "no matching symbol_uuid in target group"})
@@ -2281,8 +2280,9 @@ def apply_flip_template(
     write: bool = False,
     allow_while_open: bool = False,
 ) -> dict[str, Any]:
-    """Flip every part of `target_references`' hierarchical groups that needs it
-    to match `template_reference`'s group's front/back layer split (see
+    """Flip every part of `target_references`' hierarchical groups - including each
+    group's own anchor part - that needs it to match `template_reference`'s
+    group's front/back layer split (see
     `diff_flip_template`), by cloning the template member's already-correctly-
     flipped footprint block onto the target footprint - mirrored
     silkscreen/fab graphics, swapped F./B. layer names, `justify mirror` text
@@ -2411,6 +2411,352 @@ def apply_flip_template(
         "flipped": flipped,
         "failed_count": len(failed),
         "failed": failed,
+    }
+
+
+_REF_TOKEN_RE = re.compile(r"\b([A-Za-z]+\d+)([A-Za-z]?)\b")
+
+
+def _map_net_name(net_name: str, role_map: dict[str, str]) -> str:
+    """Substitute every group-member reference token found in `net_name` via
+    `role_map` (template reference -> target reference). KiCad's own
+    auto-generated net names embed the owning component's reference
+    (`Net-(D12-A)`, `unconnected-(J13-TIP_SWITCH-Pad10)`), so this is what
+    turns a template channel's net name into its target-channel counterpart.
+    A multi-unit symbol's own net names go one step further and fuse a
+    trailing unit letter directly onto the reference with no separator
+    (`Net-(U8B-+)` = ref `U8`, unit `B`, pin `+`) - the optional second group
+    captures that letter so it survives the substitution unmapped
+    (`Net-(U7B-+)`) instead of leaving the whole `U8B` token unmatched and
+    unmapped (word-boundary rules don't insert a break between a digit and
+    the letter immediately following it, so a plain `letters+digits` token
+    regex silently skips these entirely).
+    Tokens not present in `role_map` (pin-function words like `TIP`/`SWITCH`,
+    or a shared-rail name with no group-member reference in it at all) pass
+    through unchanged - safe by construction, since a wrong substitution
+    would just fail to resolve to a real net later rather than silently
+    landing on the wrong one.
+    """
+    return _REF_TOKEN_RE.sub(lambda m: role_map.get(m.group(1), m.group(1)) + m.group(2), net_name)
+
+
+def _local_group_nets(project_path: str | Path, group: dict[str, Any]) -> dict[str, list[str]]:
+    """net_name -> component_references, restricted to nets fully contained
+    within `group` - every component actually on that net (per the board's
+    own pad data) is itself a member of this hierarchical instance. This is
+    what separates a per-instance net (`Net-(D12-A)`, unique to one channel)
+    from a shared rail (`GND_Safty`, `12V_Main`, ...) that also reaches
+    components outside the group. `diff_route_template` only ever clones the
+    former - a shared rail's routing is a board-wide decision no single
+    channel's template gets to dictate by itself.
+
+    Membership is resolved from board pad nets (`_parse_footprint_pads_cached`,
+    the same ground truth `build_connectivity`/`get_ratsnest` use) rather than
+    `get_net()`, which reads a `.net` netlist export - a file that silently
+    drifts out of sync with the live schematic/board and was observed
+    returning a "not found" or a wrong, unrelated component list for nets
+    that plainly exist and are local on the board itself, causing every
+    local net to be dropped as unmapped/not-local.
+    """
+    board_path, _, _ = _resolve_project_path(project_path)
+    member_refs = {m["reference"] for m in group["members"]}
+    candidate_nets: set[str] = set()
+    for member in group["members"]:
+        try:
+            pads = get_footprint_pads(project_path, member["reference"])["pads"]
+        except KeyError:
+            continue
+        for pad in pads:
+            net_name = pad.get("net", "")
+            if net_name:
+                candidate_nets.add(net_name)
+
+    net_refs: dict[str, set[str]] = {}
+    for fp in _parse_footprint_pads_cached(board_path).values():
+        ref = fp.get("reference", "")
+        if not ref:
+            continue
+        for pad in fp["pads"]:
+            net_name = pad.get("net", "")
+            if net_name:
+                net_refs.setdefault(net_name, set()).add(ref)
+
+    local: dict[str, list[str]] = {}
+    for net_name in candidate_nets:
+        refs = net_refs.get(net_name, set())
+        if refs and refs.issubset(member_refs):
+            local[net_name] = sorted(refs)
+    return local
+
+
+def diff_route_template(
+    project_path: str | Path,
+    template_reference: str,
+    target_reference: str,
+    tolerance_mm: float = 0.05,
+) -> dict[str, Any]:
+    """Dry-run: find the copper (`segment`/`via`, any layer) belonging to
+    `template_reference`'s hierarchical group's own per-instance nets (see
+    `_local_group_nets` - shared rails like GND_Safty are deliberately out of
+    scope), and compute where each piece would land on `target_reference`'s
+    group - the same rigid translate+rotate transform `diff_layout_template`
+    uses (anchor-to-anchor offset, rotated by the delta between the two
+    anchors' own rotation), with the net renamed via the group's
+    `symbol_uuid` role map (e.g. template's `Net-(D12-A)` becomes target's
+    `Net-(D16-A)`).
+
+    Three buckets in the result:
+      - `to_add`: transformed geometry ready to hand to `apply_route_template`.
+      - `already_present`: a segment/via already sits at that transformed
+        location on the target (same net, same layer, endpoints within
+        `tolerance_mm`) - skipped so repeat calls stay idempotent.
+      - `unmapped_net`: the template net's mapped name isn't one of the
+        target group's own local nets - usually means the two instances'
+        schematics actually differ here (not just a naming coincidence),
+        worth a manual look rather than blindly forcing a net onto copper
+        that was never meant to carry it.
+
+    Only `segment`/`via` copper is considered - real KiCad copper arcs are
+    rare enough that `_parse_tracks` itself notes this board has none; if a
+    future board does, they will be silently skipped here rather than
+    causing an error. Nothing is written - pass `to_add` to
+    `apply_route_template`.
+    """
+    board_path, _, _ = _resolve_project_path(project_path)
+    template_group = get_hierarchical_group(project_path, template_reference)
+    target_group = get_hierarchical_group(project_path, target_reference)
+
+    t_anchor = template_group["anchor"]
+    x_anchor = target_group["anchor"]
+    delta_rot = (x_anchor["position"]["rotation"] - t_anchor["position"]["rotation"]) % 360
+
+    target_by_role = {m["symbol_uuid"]: m for m in target_group["members"]}
+    role_map: dict[str, str] = {}
+    for member in template_group["members"]:
+        target_member = target_by_role.get(member["symbol_uuid"])
+        if target_member:
+            role_map[member["reference"]] = target_member["reference"]
+
+    template_local_nets = _local_group_nets(project_path, template_group)
+    target_local_nets = _local_group_nets(project_path, target_group)
+    target_net_names = set(target_local_nets.keys())
+
+    def transform(x: float, y: float) -> tuple[float, float]:
+        dx = x - t_anchor["position"]["x"]
+        dy = y - t_anchor["position"]["y"]
+        ndx, ndy = _rotate_point(dx, dy, delta_rot)
+        return round(x_anchor["position"]["x"] + ndx, 6), round(x_anchor["position"]["y"] + ndy, 6)
+
+    def close(ax: float, ay: float, bx: float, by: float) -> bool:
+        return math.hypot(ax - bx, ay - by) <= tolerance_mm
+
+    tracks = _parse_tracks_cached(board_path)
+    target_segments = [s for s in tracks["segments"] if s["net"] in target_net_names]
+    target_vias = [v for v in tracks["vias"] if v["net"] in target_net_names]
+
+    to_add: list[dict[str, Any]] = []
+    already_present: list[dict[str, Any]] = []
+    unmapped_net: list[dict[str, Any]] = []
+
+    for seg in tracks["segments"]:
+        if seg["net"] not in template_local_nets:
+            continue
+        new_net = _map_net_name(seg["net"], role_map)
+        if new_net not in target_net_names:
+            unmapped_net.append(
+                {"kind": "segment", "template_net": seg["net"], "mapped_net": new_net, "layer": seg["layer"]}
+            )
+            continue
+        nsx, nsy = transform(seg["start"]["x"], seg["start"]["y"])
+        nex, ney = transform(seg["end"]["x"], seg["end"]["y"])
+        match = next(
+            (
+                t
+                for t in target_segments
+                if t["net"] == new_net
+                and t["layer"] == seg["layer"]
+                and (
+                    (close(nsx, nsy, t["start"]["x"], t["start"]["y"]) and close(nex, ney, t["end"]["x"], t["end"]["y"]))
+                    or (close(nsx, nsy, t["end"]["x"], t["end"]["y"]) and close(nex, ney, t["start"]["x"], t["start"]["y"]))
+                )
+            ),
+            None,
+        )
+        if match:
+            already_present.append({"kind": "segment", "net": new_net, "layer": seg["layer"], "existing_uuid": match["uuid"]})
+            continue
+        to_add.append(
+            {
+                "kind": "segment",
+                "template_net": seg["net"],
+                "net": new_net,
+                "layer": seg["layer"],
+                "width": seg["width"],
+                "start": {"x": nsx, "y": nsy},
+                "end": {"x": nex, "y": ney},
+            }
+        )
+
+    for via in tracks["vias"]:
+        if via["net"] not in template_local_nets:
+            continue
+        new_net = _map_net_name(via["net"], role_map)
+        if new_net not in target_net_names:
+            unmapped_net.append({"kind": "via", "template_net": via["net"], "mapped_net": new_net})
+            continue
+        nx, ny = transform(via["at"]["x"], via["at"]["y"])
+        match = next(
+            (v for v in target_vias if v["net"] == new_net and close(nx, ny, v["at"]["x"], v["at"]["y"])),
+            None,
+        )
+        if match:
+            already_present.append({"kind": "via", "net": new_net, "existing_uuid": match["uuid"]})
+            continue
+        to_add.append(
+            {
+                "kind": "via",
+                "template_net": via["net"],
+                "net": new_net,
+                "size": via["size"],
+                "drill": via["drill"],
+                "layers": via["layers"],
+                "at": {"x": nx, "y": ny},
+            }
+        )
+
+    return {
+        "template_reference": template_reference,
+        "target_reference": target_reference,
+        "delta_rotation": delta_rot,
+        "template_local_net_count": len(template_local_nets),
+        "target_local_net_count": len(target_local_nets),
+        "to_add_count": len(to_add),
+        "to_add": to_add,
+        "already_present_count": len(already_present),
+        "already_present": already_present,
+        "unmapped_net_count": len(unmapped_net),
+        "unmapped_net": unmapped_net,
+    }
+
+
+def apply_route_template(
+    project_path: str | Path,
+    template_reference: str,
+    target_references: list[str],
+    write: bool = False,
+    allow_while_open: bool = False,
+) -> dict[str, Any]:
+    """Clone `template_reference`'s hierarchical group's own routed copper
+    (see `diff_route_template`) onto every group in `target_references`, as
+    brand-new `segment`/`via` blocks with fresh uuids - transformed geometry
+    and remapped net name, nothing else copied from the template (no shared
+    identity the way `apply_flip_template` preserves, since these are new
+    copper objects, not edits to an existing footprint).
+
+    This ADDS copper; it never removes or reroutes anything already on the
+    target (see `already_present` in the diff) and never touches nets it
+    can't confidently map (see `unmapped_net`) - so a channel that's already
+    partially hand-routed keeps whatever it has, and a schematic difference
+    between channels doesn't get silently papered over. Run `unroute_nets` /
+    `remove_stitching_vias` first if you actually want to replace existing
+    copper rather than add alongside it.
+
+    Defaults to a dry run (write=False) - inspect `diffs`/`added`, then call
+    again with write=True to commit.
+    """
+    board_path, _, _ = _resolve_project_path(project_path)
+
+    diffs = []
+    all_to_add: list[dict[str, Any]] = []
+    for target_reference in target_references:
+        diff = diff_route_template(project_path, template_reference, target_reference)
+        diffs.append(diff)
+        all_to_add.extend(diff["to_add"])
+
+    text = _read_text(board_path)
+    blocks: list[str] = []
+    for item in all_to_add:
+        new_uuid = str(_uuid.uuid4())
+        item["new_uuid"] = new_uuid
+        if item["kind"] == "segment":
+            block = (
+                f'\t(segment\n'
+                f'\t\t(start {_format_at_number(item["start"]["x"])} {_format_at_number(item["start"]["y"])})\n'
+                f'\t\t(end {_format_at_number(item["end"]["x"])} {_format_at_number(item["end"]["y"])})\n'
+                f'\t\t(width {_format_at_number(item["width"])})\n'
+                f'\t\t(layer "{item["layer"]}")\n'
+                f'\t\t(net "{item["net"]}")\n'
+                f'\t\t(uuid "{new_uuid}")\n'
+                f'\t)'
+            )
+        else:
+            layers_str = " ".join(f'"{layer}"' for layer in item["layers"])
+            block = (
+                f'\t(via\n'
+                f'\t\t(at {_format_at_number(item["at"]["x"])} {_format_at_number(item["at"]["y"])})\n'
+                f'\t\t(size {_format_at_number(item["size"])})\n'
+                f'\t\t(drill {_format_at_number(item["drill"])})\n'
+                f'\t\t(layers {layers_str})\n'
+                f'\t\t(net "{item["net"]}")\n'
+                f'\t\t(uuid "{new_uuid}")\n'
+                f'\t)'
+            )
+        blocks.append(block)
+
+    if write and blocks:
+        _check_not_locked_by_editor(board_path, allow_while_open)
+        for block in blocks:
+            text = _append_top_level_block(text, block)
+        with board_path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        _invalidate_board_cache(board_path)
+
+    return {
+        "board_path": str(board_path),
+        "write": write,
+        "template_reference": template_reference,
+        "target_references": target_references,
+        "diffs": diffs,
+        "added_count": len(blocks),
+        "added": all_to_add,
+    }
+
+
+def copy_component_routing(
+    project_path: str | Path,
+    template_reference: str,
+    target_reference: str,
+    write: bool = False,
+    allow_while_open: bool = False,
+) -> dict[str, Any]:
+    """Copy `template_reference`'s own routed copper onto `target_reference`,
+    by reference designator - the simple single-pair counterpart to
+    `apply_route_template` (which takes a batch `target_references` list),
+    the same relationship `set_component_position` has to
+    `apply_layout_changes`. Use this for a one-off 'route U7 like U8' instead
+    of building a one-item `target_references` list by hand.
+
+    Delegates entirely to `apply_route_template` - see it and
+    `diff_route_template` for exactly what gets cloned (each group's own
+    per-instance nets, not shared rails) and what's skipped
+    (`already_present`/`unmapped_net`). Defaults to a dry run (write=False) -
+    inspect `to_add`/`added`, then call again with write=True to commit.
+    """
+    result = apply_route_template(project_path, template_reference, [target_reference], write=write, allow_while_open=allow_while_open)
+    diff = result["diffs"][0]
+    return {
+        "board_path": result["board_path"],
+        "write": result["write"],
+        "template_reference": template_reference,
+        "target_reference": target_reference,
+        "delta_rotation": diff["delta_rotation"],
+        "to_add_count": diff["to_add_count"],
+        "already_present_count": diff["already_present_count"],
+        "already_present": diff["already_present"],
+        "unmapped_net_count": diff["unmapped_net_count"],
+        "unmapped_net": diff["unmapped_net"],
+        "added_count": result["added_count"],
+        "added": result["added"],
     }
 
 

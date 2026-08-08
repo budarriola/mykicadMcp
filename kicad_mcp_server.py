@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os as _os
 import sys
+import threading as _threading
 import time
 import traceback
 from datetime import datetime
@@ -37,6 +39,8 @@ try:
     apply_layout_template,
     apply_property_position_changes,
     apply_property_position_template,
+    apply_route_template,
+    copy_component_routing,
     audit_capacitor_net_voltages,
     classify_critical_nets,
     audit_capacitor_voltages,
@@ -52,6 +56,7 @@ try:
     diff_layout_by_role,
     diff_layout_template,
     diff_property_position_template,
+    diff_route_template,
     estimate_footprint_radius,
     find_components_by_net,
     find_components_by_pin_connection,
@@ -2514,11 +2519,13 @@ class KiCadMcpServer:
             },
             "diff_kicad_flip_template": {
                 "description": (
-                    "Dry-run: find which members of target_reference's hierarchical group either sit on the wrong "
+                    "Dry-run: find which members of target_reference's hierarchical group - including the "
+                    "group's own anchor part, not just its support parts - either sit on the wrong "
                     "copper side (front/back) or have mismatched per-pad rotation, compared to their matching "
                     "member (by symbol_uuid) in template_reference's group - e.g. the template channel has some "
                     "support parts deliberately flipped to the back to save front-side space, and this target "
-                    "channel doesn't yet; or a non-square SMD pad (screw terminal, jack) has an extra local "
+                    "channel doesn't yet; or the anchor IC itself was flipped to the wrong side while its whole "
+                    "support group was not; or a non-square SMD pad (screw terminal, jack) has an extra local "
                     "rotation baked into one instance's pad geometry but not the other's, even though both sit on "
                     "the same layer with the same overall footprint rotation - invisible to a position/layer diff, "
                     "but visibly wrong in the 2D editor on elongated pad shapes. Rotation mismatches between a "
@@ -2538,7 +2545,8 @@ class KiCadMcpServer:
             },
             "apply_kicad_flip_template": {
                 "description": (
-                    "Flip every part of target_references' hierarchical groups that needs it to match "
+                    "Flip every part of target_references' hierarchical groups - including each group's own "
+                    "anchor part - that needs it to match "
                     "template_reference's group's front/back layer split, by CLONING the template member's "
                     "already-correctly-flipped footprint block (mirrored silkscreen/fab graphics, swapped F./B. "
                     "layer names, 'justify mirror' text flags, adjusted pad angles - everything KiCad's own Flip "
@@ -2563,6 +2571,99 @@ class KiCadMcpServer:
                     "required": ["project_path", "template_reference", "target_references"],
                 },
                 "handler": self._tool_apply_flip_template,
+            },
+            "diff_kicad_route_template": {
+                "description": (
+                    "Dry-run: find the copper (segment/via, any layer) belonging to template_reference's "
+                    "hierarchical group's own per-instance nets (nets fully contained within that group, like "
+                    "Net-(D12-A) - NOT shared rails like GND_Safty/12V_Main that also reach components outside the "
+                    "group, which are deliberately out of scope), and compute where each piece would land on "
+                    "target_reference's group - same rigid translate+rotate transform diff_kicad_layout_template "
+                    "uses, with the net renamed via the group's symbol_uuid role map (template's Net-(D12-A) "
+                    "becomes target's Net-(D16-A)). Three result buckets: to_add (ready for "
+                    "apply_kicad_route_template), already_present (a matching segment/via already sits there - "
+                    "skipped, so repeat calls stay idempotent), and unmapped_net (the mapped net isn't one of the "
+                    "target's own local nets - usually a real schematic difference between the two instances, "
+                    "worth a manual look rather than forcing it). Nothing is written."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "template_reference": {"type": "string"},
+                        "target_reference": {"type": "string"},
+                        "tolerance_mm": {"type": "number", "default": 0.05, "description": "How close (mm) an existing target segment/via's endpoints must be to the transformed template geometry to count as already_present instead of to_add."},
+                    },
+                    "required": ["project_path", "template_reference", "target_reference"],
+                },
+                "handler": self._tool_diff_route_template,
+            },
+            "apply_kicad_route_template": {
+                "description": (
+                    "Clone template_reference's hierarchical group's own routed copper (see "
+                    "diff_kicad_route_template) onto every group in target_references, as brand-new segment/via "
+                    "blocks with fresh uuids - transformed geometry and remapped net name, nothing else copied "
+                    "from the template (these are new copper objects, not edits to an existing footprint the way "
+                    "apply_kicad_flip_template clones one). This ADDS copper; it never removes or reroutes "
+                    "anything already on the target (see already_present in the diff) and never touches a net it "
+                    "can't confidently map (see unmapped_net) - so a partially hand-routed channel keeps what it "
+                    "has, and a schematic difference between channels doesn't get silently papered over. Run "
+                    "unroute_kicad_nets / remove_kicad_stitching_vias first if you actually want to replace "
+                    "existing copper rather than add alongside it. Defaults to write=false (dry run) - inspect "
+                    "diffs/added, then call again with write=true to commit."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "template_reference": {"type": "string"},
+                        "target_references": {"type": "array", "items": {"type": "string"}},
+                        "write": {"type": "boolean", "default": False},
+                        "allow_while_open": {"type": "boolean", "default": False, "description": "Skip the check that refuses to write while KiCad has this board open for editing (see get_kicad_ipc_status)."},
+                    },
+                    "required": ["project_path", "template_reference", "target_references"],
+                },
+                "handler": self._tool_apply_route_template,
+            },
+            "copy_kicad_component_routing": {
+                "description": (
+                    "Copy template_reference's own routed copper onto target_reference, by reference "
+                    "designator - the simple single-pair counterpart to apply_kicad_route_template (which takes a "
+                    "batch target_references list), the same relationship set_kicad_component_position has to "
+                    "apply_kicad_layout_changes. Use this for a one-off 'route U7 like U8' instead of building a "
+                    "one-item target_references list by hand. Delegates entirely to apply_kicad_route_template - "
+                    "see it and diff_kicad_route_template for exactly what gets cloned (each group's own "
+                    "per-instance nets, not shared rails) and what's skipped (already_present/unmapped_net). "
+                    "Defaults to write=false (dry run) - inspect to_add/added, then call again with write=true to "
+                    "commit."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string"},
+                        "template_reference": {"type": "string"},
+                        "target_reference": {"type": "string"},
+                        "write": {"type": "boolean", "default": False},
+                        "allow_while_open": {"type": "boolean", "default": False, "description": "Skip the check that refuses to write while KiCad has this board open for editing (see get_kicad_ipc_status)."},
+                    },
+                    "required": ["project_path", "template_reference", "target_reference"],
+                },
+                "handler": self._tool_copy_component_routing,
+            },
+            "restart_kicad_mcp_server": {
+                "description": (
+                    "Exit this server process (after a short delay so the response reaches the client first), so "
+                    "an editor/tool file change (e.g. to kicad_pcb_tool.py or kicad_mcp_server.py) takes effect. "
+                    "Whether this actually restarts the server depends on the host: a client that respawns its "
+                    "stdio subprocess when the pipe closes will relaunch with the edited code on the next tool "
+                    "call; one that doesn't will just see the connection drop and need a manual reconnect. Use "
+                    "this instead of asking the user to restart by hand, when the host is known to auto-respawn."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                },
+                "handler": self._tool_restart_server,
             },
         }
         if _IPC_AVAILABLE:
@@ -3214,6 +3315,45 @@ class KiCadMcpServer:
             write=bool(args.get("write", False)),
             allow_while_open=bool(args.get("allow_while_open", False)),
         )
+
+    def _tool_diff_route_template(self, args: dict[str, Any]) -> dict[str, Any]:
+        return diff_route_template(
+            args["project_path"],
+            args["template_reference"],
+            args["target_reference"],
+            tolerance_mm=float(args.get("tolerance_mm", 0.05)),
+        )
+
+    def _tool_apply_route_template(self, args: dict[str, Any]) -> dict[str, Any]:
+        return apply_route_template(
+            args["project_path"],
+            args["template_reference"],
+            list(args["target_references"]),
+            write=bool(args.get("write", False)),
+            allow_while_open=bool(args.get("allow_while_open", False)),
+        )
+
+    def _tool_copy_component_routing(self, args: dict[str, Any]) -> dict[str, Any]:
+        return copy_component_routing(
+            args["project_path"],
+            args["template_reference"],
+            args["target_reference"],
+            write=bool(args.get("write", False)),
+            allow_while_open=bool(args.get("allow_while_open", False)),
+        )
+
+    def _tool_restart_server(self, args: dict[str, Any]) -> dict[str, Any]:
+        log_message("[kicad-mcp] restart requested via tool call - exiting process")
+        # Exit on a short delay so this response's _write_message() flush (done
+        # by the caller right after handle() returns) lands on stdout before
+        # the process dies - os._exit skips atexit/cleanup on purpose, since
+        # this needs to be unconditional even mid-write on another thread.
+        # Whether this actually "restarts" the server depends on the host:
+        # a client that respawns its stdio subprocess on pipe-close will pick
+        # up any edited .py files on the next launch; one that doesn't will
+        # just see the connection drop and needs a manual reconnect.
+        _threading.Timer(0.3, _os._exit, args=(0,)).start()
+        return {"restarting": True, "note": "process exiting in ~0.3s; host must relaunch/reconnect to pick up code changes"}
 
     def _tool_get_ipc_status(self, args: dict[str, Any]) -> dict[str, Any]:
         return get_ipc_status()

@@ -59,8 +59,16 @@ channels (U7/U9) match." One `template_reference` (the already-correct instance)
    now match the reference exactly. Don't just trust a clean apply result; a `skipped` rotation
    mismatch in step 3 or 4 means a target's footprint rotation itself differs from the reference
    and needs a look before it's safe to force through.
+6. Once placement/flip are settled, `diff_kicad_route_template` / `apply_kicad_route_template`
+   (dry-run first, then `write: true`) - clones the reference channel's own hand-routed copper
+   (per-instance nets only; shared rails are out of scope) onto each sibling using the same
+   transform. See [05-layout-and-placement.md](05-layout-and-placement.md). Do this step last,
+   after 3-5 have already settled each target's final position/rotation/layer - the route
+   template's transform is derived from the *current* anchor positions, so routing first and
+   repositioning after would leave the cloned copper pointing at where the parts used to be.
 
-This is the exact sequence that surfaced the pad-rotation bug this tool now catches: layout and
-flip diffs both came back clean by the old (layer-only) check, but the board still looked wrong
-because the actual defect - one instance's jack connector had its pads individually rotated 90°
-off from the other two - lived one level below what either diff compared.
+This is the exact sequence that surfaced the pad-rotation bug `diff_kicad_flip_template` now
+catches: layout and flip diffs both came back clean by the old (layer-only) check, but the board
+still looked wrong because the actual defect - one instance's jack connector had its pads
+individually rotated 90° off from the other two - lived one level below what either diff
+compared.

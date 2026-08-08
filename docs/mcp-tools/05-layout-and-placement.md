@@ -90,6 +90,36 @@ built by the caller. Read-only.
 **Args:** `project_path`, `references`, `extra_search_radius` (default 25.0mm - how far to look
 for outside obstacles), `margin` (default 0.4mm - required clearance between envelopes)
 
+## `diff_kicad_route_template`
+Dry-run: find the copper (`segment`/`via`, any layer) belonging to `template_reference`'s
+hierarchical group's own **per-instance** nets - nets fully contained within that group, like
+`Net-(D12-A)` - and compute where each piece would land on `target_reference`'s group, using the
+same rigid translate+rotate transform as `diff_kicad_layout_template`. The net is renamed via the
+group's `symbol_uuid` role map (template's `Net-(D12-A)` becomes target's `Net-(D16-A)`). Shared
+rails (`GND_Safty`, `12V_Main`, ...) that also reach components outside the group are
+deliberately **out of scope** - a shared rail's routing is a board-wide decision, not one a
+single channel's template gets to make. Three result buckets: `to_add` (ready for
+`apply_kicad_route_template`), `already_present` (a matching segment/via already sits there -
+skipped, repeat calls stay idempotent), `unmapped_net` (the mapped net isn't one of the target's
+own local nets - usually a real schematic difference between the two channels, not just a naming
+coincidence). Nothing is written.
+**Args:** `project_path`, `template_reference`, `target_reference`, `tolerance_mm` (default
+0.05mm - how close an existing target segment/via must be to count as `already_present`)
+
+## `apply_kicad_route_template`
+Clone `template_reference`'s hierarchical group's own routed copper (see
+`diff_kicad_route_template`) onto every group in `target_references`, as brand-new `segment`/
+`via` blocks with fresh uuids - transformed geometry and remapped net name; nothing else is
+copied from the template, since these are new copper objects rather than edits to an existing
+footprint. This **adds** copper; it never removes or reroutes anything already on the target
+(see `already_present`) and never touches a net it can't confidently map (see `unmapped_net`) -
+so a partially hand-routed channel keeps what it has, and a real schematic difference between
+channels doesn't get silently forced through. Run `unroute_kicad_nets`/
+`remove_kicad_stitching_vias` first if the goal is to *replace* existing copper rather than add
+alongside it.
+**Args:** `project_path`, `template_reference`, `target_references`, `write` (default false),
+`allow_while_open` (default false)
+
 ## `nudge_kicad_to_clear`
 Move a component the minimum distance needed to clear a collision, searching outward in a ring
 from its *current* position so it stays as close as possible to wherever it already was
