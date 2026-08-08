@@ -4809,9 +4809,12 @@ def audit_schematic_integrity(project_path: str | Path) -> dict[str, Any]:
     """Cheap, netlist-independent sanity checks across every placed schematic
     symbol (power symbols and other "#"-prefixed auto-references excluded,
     same as list_schematic_parts): duplicate reference designators (two
-    distinct placed instances annotated with the exact same reference - a
-    real KiCad ERC "duplicate reference" error, not just two instances of the
-    same hierarchical block which get their own distinct references), and
+    distinct placed instances annotated with the exact same reference AND
+    the same unit - a real KiCad ERC "duplicate reference" error, not just
+    separate units (A/B/power, etc.) of the same multi-unit symbol - e.g. a
+    dual op-amp's two gate units plus its power unit all share one reference
+    by design and are not duplicates - nor two instances of the same
+    hierarchical block which get their own distinct references), and
     symbols missing a Value or Footprint altogether. Pure text/structure
     checks - no Mouser data involved, so this always works even without an
     API key and is a fast first pass before the slower Mouser-backed audits.
@@ -4822,16 +4825,18 @@ def audit_schematic_integrity(project_path: str | Path) -> dict[str, Any]:
         if not c["lib_id"].startswith("power:") and not c["reference"].startswith("#")
     ]
 
-    by_reference: dict[str, list[dict[str, Any]]] = {}
+    by_reference_unit: dict[tuple[str, Any], list[dict[str, Any]]] = {}
     for component in components:
-        by_reference.setdefault(component["reference"].strip().upper(), []).append(component)
+        key = (component["reference"].strip().upper(), component["unit"])
+        by_reference_unit.setdefault(key, []).append(component)
 
     duplicate_references: list[dict[str, Any]] = []
-    for reference, instances in sorted(by_reference.items()):
+    for (reference, unit), instances in sorted(by_reference_unit.items(), key=lambda kv: kv[0]):
         if len(instances) > 1:
             duplicate_references.append(
                 {
                     "reference": reference,
+                    "unit": unit,
                     "instance_count": len(instances),
                     "values": [i["value"] for i in instances],
                     "sheetfiles": [i["sheetfile"] for i in instances],
