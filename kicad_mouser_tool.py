@@ -957,11 +957,14 @@ def bulk_optimize_component_mouser_alternates(
 # a handful of cents).
 # ---------------------------------------------------------------------------
 
-# "Under $0.05 at our quantity" -> buy 10 extra; "under $0.10" -> buy 5 extra.
-# Ranges are mutually exclusive (checked narrowest-first) - a part isn't both.
+# "Under $0.05 at our quantity" -> buy 10 extra; "under $0.10" -> buy 5 extra;
+# "$0.25 or under" -> buy 5 extra. Ranges are mutually exclusive (checked
+# narrowest-first) - a part isn't padded twice. Threshold is exclusive (`<`)
+# except where noted inclusive (`<=`).
 _CHEAP_PART_PADDING = (
-    (0.05, 10),
-    (0.10, 5),
+    (0.05, 10, False),
+    (0.10, 5, False),
+    (0.25, 5, True),
 )
 
 
@@ -990,10 +993,12 @@ def _optimize_buy_quantity(price_breaks: list[dict[str, Any]], quantity_needed: 
     padding = 0
     padding_reason = None
     if base_unit_price is not None:
-        for threshold, extra in _CHEAP_PART_PADDING:
-            if base_unit_price < threshold:
+        for threshold, extra, inclusive in _CHEAP_PART_PADDING:
+            hit = base_unit_price <= threshold if inclusive else base_unit_price < threshold
+            if hit:
                 padding = extra
-                padding_reason = f"unit price ${base_unit_price:.4f} at required qty {quantity_needed} is under ${threshold:.2f} - padded by {extra}"
+                cmp = "at or under" if inclusive else "under"
+                padding_reason = f"unit price ${base_unit_price:.4f} at required qty {quantity_needed} is {cmp} ${threshold:.2f} - padded by {extra}"
                 break
     padded_qty = quantity_needed + padding
 
@@ -1053,8 +1058,8 @@ def generate_mouser_buy_list(
     ranked via optimize_component_mouser_alternates, same as
     bulk_optimize_kicad_mouser_alternates) and how many units to actually buy
     per _optimize_buy_quantity - the board's required quantity, padded for
-    very cheap parts (10 extra under $0.05/unit, 5 extra under $0.10/unit),
-    then bumped further if a higher price-break tier's total cost undercuts
+    very cheap parts (10 extra under $0.05/unit, 5 extra under $0.10/unit,
+    5 extra at $0.25/unit or under), then bumped further if a higher price-break tier's total cost undercuts
     that padded quantity's total cost. Writes a Markdown table to
     `buy_list_path` (defaults to 'buy_list.md' at the project root) with the
     link, quantities, per-line cost, and the reason behind any extra units,
@@ -1147,7 +1152,8 @@ def generate_mouser_buy_list(
     lines += [
         "",
         "---",
-        "Note: extra units are padded for very cheap parts (10 extra under $0.05/unit, 5 extra under $0.10/unit) "
+        "Note: extra units are padded for very cheap parts (10 extra under $0.05/unit, 5 extra under $0.10/unit, "
+        "5 extra at $0.25/unit or under) "
         "and bumped further only when a higher Mouser price-break tier's total cost undercuts the padded "
         "quantity's total cost.",
         "",
