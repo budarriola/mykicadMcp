@@ -1841,7 +1841,6 @@ def audit_schematic_health(
         + integrity["missing_footprint_count"]
         + duplicate_links["conflict_count"]
         + voltages["missing_voltage_count"]
-        + len(voltage_mismatches)
         + specs["mismatched_count"]
         + stock["insufficient_count"]
     )
@@ -1901,7 +1900,8 @@ def audit_schematic_health(
         "",
         f"Default assumed voltage: **{default_capacitor_voltage}**",
         f"- Missing a stated voltage (assumed default): {voltages['missing_voltage_count']}",
-        f"- States a voltage that differs from the default: {len(voltage_mismatches)}",
+        f"- Explicitly states a voltage other than the default (informational, not an issue "
+        f"- an intentional override for that net's needs): {len(voltage_mismatches)}",
         "",
     ]
     if voltage_mismatches:
