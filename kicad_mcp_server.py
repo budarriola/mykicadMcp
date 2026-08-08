@@ -2514,10 +2514,14 @@ class KiCadMcpServer:
             },
             "diff_kicad_flip_template": {
                 "description": (
-                    "Dry-run: find which members of target_reference's hierarchical group sit on the wrong copper "
-                    "side (front/back) compared to their matching member (by symbol_uuid) in template_reference's "
-                    "group - e.g. the template channel has some support parts deliberately flipped to the back to "
-                    "save front-side space, and this target channel doesn't yet. Rotation mismatches between a "
+                    "Dry-run: find which members of target_reference's hierarchical group either sit on the wrong "
+                    "copper side (front/back) or have mismatched per-pad rotation, compared to their matching "
+                    "member (by symbol_uuid) in template_reference's group - e.g. the template channel has some "
+                    "support parts deliberately flipped to the back to save front-side space, and this target "
+                    "channel doesn't yet; or a non-square SMD pad (screw terminal, jack) has an extra local "
+                    "rotation baked into one instance's pad geometry but not the other's, even though both sit on "
+                    "the same layer with the same overall footprint rotation - invisible to a position/layer diff, "
+                    "but visibly wrong in the 2D editor on elongated pad shapes. Rotation mismatches between a "
                     "matched pair are reported under `skipped` rather than attempted. Returns `changes`; nothing "
                     "is written - pass to apply_kicad_flip_template."
                 ),

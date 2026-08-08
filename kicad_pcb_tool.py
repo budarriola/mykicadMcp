@@ -2176,14 +2176,37 @@ def _footprint_block_meta(block: str) -> dict[str, Any]:
     }
 
 
-def diff_flip_template(project_path: str | Path, template_reference: str, target_reference: str) -> dict[str, Any]:
-    """Find which members of `target_reference`'s hierarchical group sit on the
-    wrong copper side compared to their matching (by symbol_uuid) member in
-    `template_reference`'s group - e.g. the template channel has 4 support
-    parts deliberately flipped to the back to save front-side space, but this
-    target channel still has all of them on the front.
+def _pad_local_rotations(project_path: str | Path, reference: str) -> dict[str, float]:
+    """Per-pad-number local rotation (degrees, mod 180) as stored in `reference`'s own
+    footprint block, independent of the footprint's overall position/rotation. Two
+    instances of the same library footprint can share identical `position`/`layer` and
+    still disagree here - e.g. one instance was mirrored-and-back at some point in its
+    history, permanently baking an extra rotation into each individual `pad ... (at x y
+    <angle>)` line, which only shows up visually on non-square (elongated) pads. Used by
+    `diff_flip_template` to catch that case, which a pure layer/position diff misses.
 
-    Read-only; pass `changes` to `apply_flip_template` to actually flip them.
+    Compared mod 180, not 360: rect/roundrect/oval/circle pads (everything this sees in
+    practice) are point-symmetric, so a 180`-apart pair (e.g. 0 vs 180) draws identically
+    and must NOT be flagged - only a mismatch that survives mod 180 (e.g. 0 vs 90) changes
+    which way an elongated pad's long axis actually points.
+    """
+    pads = get_footprint_pads(project_path, reference)["pads"]
+    return {p["number"]: round(p["local_position"]["rotation"] % 180, 3) for p in pads if p["number"]}
+
+
+def diff_flip_template(project_path: str | Path, template_reference: str, target_reference: str) -> dict[str, Any]:
+    """Find which members of `target_reference`'s hierarchical group either sit on the
+    wrong copper side, or have mismatched per-pad rotation, compared to their matching
+    (by symbol_uuid) member in `template_reference`'s group - e.g. the template channel
+    has 4 support parts deliberately flipped to the back to save front-side space, but
+    this target channel still has all of them on the front; or a non-square SMD pad
+    (e.g. a screw-terminal/jack footprint) carries an extra local rotation baked into
+    its individual `pad ... (at x y <angle>)` line in one instance but not the other,
+    even though both instances share the same layer and the same overall footprint
+    rotation - invisible in `position`/`layer` diffs, but visibly wrong in the 2D
+    editor since it only shows up on elongated pad shapes.
+
+    Read-only; pass `changes` to `apply_flip_template` to actually flip/reclone them.
     Rotation mismatches between a matched pair are reported under `skipped`
     rather than attempted - see `apply_flip_template` for why that transform
     isn't safe to guess at.
@@ -2205,7 +2228,18 @@ def diff_flip_template(project_path: str | Path, template_reference: str, target
             continue
         template_layer = member.get("properties", {}).get("layer", "")
         target_layer = target_member.get("properties", {}).get("layer", "")
-        if template_layer == target_layer:
+        layer_mismatch = template_layer != target_layer
+
+        pad_mismatch = False
+        if not layer_mismatch:
+            try:
+                pad_mismatch = _pad_local_rotations(project_path, member["reference"]) != _pad_local_rotations(
+                    project_path, target_member["reference"]
+                )
+            except KeyError:
+                pad_mismatch = False
+
+        if not layer_mismatch and not pad_mismatch:
             continue
         if round(member["position"]["rotation"] % 360, 3) != round(target_member["position"]["rotation"] % 360, 3):
             skipped.append(
@@ -2227,6 +2261,7 @@ def diff_flip_template(project_path: str | Path, template_reference: str, target
                 "template_uuid": member["uuid"],
                 "from_layer": target_layer,
                 "to_layer": template_layer,
+                "pad_geometry_mismatch": pad_mismatch,
             }
         )
 
