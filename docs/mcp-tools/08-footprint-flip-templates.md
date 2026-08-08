@@ -10,11 +10,19 @@ same treatment - e.g. a template channel has some support parts deliberately fli
 back to save front-side space, and other channel instances don't yet.
 
 ## `diff_kicad_flip_template`
-Dry-run: find which members of `target_reference`'s hierarchical group sit on the wrong copper
-side (front/back) compared to their matching member (by `symbol_uuid`) in
-`template_reference`'s group. Rotation mismatches between a matched pair are reported under
-`skipped` rather than attempted. Returns `changes`; nothing is written - pass to
-`apply_kicad_flip_template`.
+Dry-run: find which members of `target_reference`'s hierarchical group either sit on the wrong
+copper side (front/back) or have mismatched per-pad rotation, compared to their matching member
+(by `symbol_uuid`) in `template_reference`'s group. The pad-rotation check catches a case the
+layer check alone misses: a non-square SMD pad (screw terminal, jack, anything rectangular/
+elongated) can have an extra local rotation baked into its own `pad ... (at x y <angle>)` line
+in one instance but not another, even though both instances sit on the same layer with the same
+overall footprint rotation - invisible to `diff_kicad_layout_template`/`get_kicad_component`
+(both only report the footprint's own `at`, not per-pad angles), but visibly wrong in the 2D
+editor since it flips which way the pad's long axis points. Compared mod 180, not mod 360 -
+rect/roundrect/oval/circle pads are point-symmetric, so a 180°-apart pair (e.g. 0 vs 180) draws
+identically and is correctly *not* flagged; only a mismatch that survives mod 180 is real.
+Rotation mismatches between a matched pair are reported under `skipped` rather than attempted.
+Returns `changes`; nothing is written - pass to `apply_kicad_flip_template`.
 **Args:** `project_path`, `template_reference`, `target_reference`
 
 ## `apply_kicad_flip_template`
@@ -29,3 +37,30 @@ like" is an instance KiCad itself already flipped. `template_reference`'s group 
 contain one for every role that needs flipping.
 **Args:** `project_path`, `template_reference`, `target_references`, `write` (default false),
 `allow_while_open` (default false)
+
+## Workflow: make sibling channels' layout match a reference
+
+Common request: "I arranged the parts around U8 the way I want, make the other CurrentSense
+channels (U7/U9) match." One `template_reference` (the already-correct instance) plus a list of
+`target_references` (the siblings), always in this order:
+
+1. `get_kicad_hierarchical_group` on the reference anchor (e.g. `U8`) - confirms its member list.
+2. `list_kicad_sibling_instances` on the reference anchor - finds every other instance of the
+   same stamped sheet (e.g. `U7`, `U9`) and their own anchor references.
+3. `diff_kicad_layout_template` / `apply_kicad_layout_template` (dry-run first, then
+   `write: true`) - copies position *and* rotation for every matched-by-`symbol_uuid` member.
+   See [05-layout-and-placement.md](05-layout-and-placement.md).
+4. `diff_kicad_flip_template` / `apply_kicad_flip_template` (dry-run first, then `write: true`)
+   - catches what step 3 can't: front/back layer differences *and* the same-layer per-pad
+     rotation quirk described above. Run this even when you don't expect any flips - the
+     pad-geometry check is cheap and easy to forget when the visible symptom (front/back layer)
+     doesn't apply.
+5. Re-run both diffs one more time after applying - `change_count: 0` on both means the siblings
+   now match the reference exactly. Don't just trust a clean apply result; a `skipped` rotation
+   mismatch in step 3 or 4 means a target's footprint rotation itself differs from the reference
+   and needs a look before it's safe to force through.
+
+This is the exact sequence that surfaced the pad-rotation bug this tool now catches: layout and
+flip diffs both came back clean by the old (layer-only) check, but the board still looked wrong
+because the actual defect - one instance's jack connector had its pads individually rotated 90°
+off from the other two - lived one level below what either diff compared.
