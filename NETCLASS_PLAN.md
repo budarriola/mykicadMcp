@@ -7,21 +7,34 @@ verifying every bus and choosing widths/via sizes from values already used in th
 project.
 
 **Module layout** — `kicad_pcb_tool.py` is already ~3,200 lines; the analysis
-phases extend it, but the autorouter does not get stuffed in on top:
+phases extend it:
 - **`kicad_pcb_tool.py`** — Phases 1–6 and 8 (parsers, inventory, bus detection,
   net classes, cost model, audits): parser/audit-shaped code that reuses its
-  `SexprParser`, caches, and write discipline in place.
-- **`kicad_router_tool.py`** (new) — Phase 7 core: ratsnest, global/detailed
-  routing, plane engine, optimizer, sessions, warm start. Imports the parsers
-  and helpers from `kicad_pcb_tool` — no duplicated parsing.
-- **`kicad_router_accel.py`** (new) — 7.8 backends (cpu/numpy/gpu kernels,
-  memory planner, hybrid scheduler) behind the one backend interface.
-- **`kicad_route_viewer.py`** (new) — 7.9 tkinter viewer, runs as its own
-  process; knows only the JSONL event format.
+  `SexprParser`, caches, and write discipline in place. Also owns all
+  reference-based copy/template functionality (layout/route/flip/property-
+  position templates, groups, sibling-instance listing) used for propagating a
+  hand-finished instance's placement/routing/flip state onto its siblings.
 
 Everything is exposed through `kicad_mcp_server.py` following the existing
 `self.tools[name] = {description, inputSchema, handler}` + `_tool_*` wrapper
 pattern (handlers import from whichever module owns the function).
+
+> **REMOVED (2026-08-08):** the autorouter engine described throughout the
+> "Phase 7" sections below (`kicad_router_tool.py`, `kicad_router_accel.py`,
+> `kicad_route_viewer.py`, `kicad_optimizer_tool.py`, and every MCP tool they
+> backed — `route_kicad_board`, `route_kicad_nets`, `unroute_kicad_nets`,
+> `get_kicad_drc_constraints`, `get_kicad_ratsnest`, `list_kicad_zones`,
+> `create_kicad_plane`, `modify_kicad_plane`, `propose_kicad_plane`,
+> `audit_kicad_plane_islands`, `audit_kicad_crosstalk`,
+> `benchmark_kicad_autoroute`, `open_kicad_route_viewer`, `decide_kicad_route`,
+> `get_kicad_route_session`, `optimize_kicad_board`,
+> `remove_kicad_stitching_vias`, `run_kicad_stitching_pass`, and
+> `get_kicad_system_resources`) — has been deleted from this codebase along
+> with `docs/mcp-tools/11-autorouter.md` and its test files under `tests/`.
+> The "Phase 7" history below is kept as an archival record of that removed
+> work; it no longer describes anything present in the repo. The net-class/bus
+> tooling (Phases 1–6, 8) and the copy/template tooling above are unaffected
+> and remain fully supported.
 
 ---
 

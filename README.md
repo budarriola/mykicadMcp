@@ -83,7 +83,6 @@ editing (to avoid racing the GUI's own unsaved state); see
 | 8. Footprint Flip Templates | [08-footprint-flip-templates.md](docs/mcp-tools/08-footprint-flip-templates.md) | Copying a correctly front/back-flipped footprint's full flip state onto siblings that need the same treatment. |
 | 9. Live KiCad IPC Tools | [09-live-ipc-tools.md](docs/mcp-tools/09-live-ipc-tools.md) | Tools that talk to a *running* KiCad instance (real geometry, GUI selection/highlighting) instead of parsing files on disk. |
 | 10. Net Classes & Buses | [10-netclasses-and-buses.md](docs/mcp-tools/10-netclasses-and-buses.md) | Bus detection from schematic net names, net class proposal/creation, trace-cost scoring (with live deviation measurement), bus corridor-area measurement, capacitor voltage auditing, critical-net classification, connector detection, and pcb_settings.json management for routing policy. |
-| 11. Autorouter & Detailed Routing | [11-autorouter.md](docs/mcp-tools/11-autorouter.md) | Phase 7.3b windowed A* detailed routing (fine-grained exact copper generation), ratsnest calculation, layer/constraint querying, and undo (unrouting). Includes the core autorouter pipeline as implemented today (connectivity, ratsnest, detailed route, self-check, emit). |
 
 ### Picking the right group
 
@@ -102,10 +101,6 @@ editing (to avoid racing the GUI's own unsaved state); see
   GUI instead of typing its reference? **Group 9** - but it needs KiCad open with the IPC API
   enabled (Preferences > Plugins > Enable IPC API); everything else works from the files on disk
   alone.
-- Ready to autoroute your board? **Group 11** — calculate the unrouted ratsnest, query board layers
-  and DRC constraints, and run the windowed A* detailed router. Includes undo (unrouting) and
-  honest documentation of what's not yet implemented (rip-up negotiation, plane-aware routing,
-  neck-down).
 
 ## Reorganizing a repeated sub-circuit's layout
 
