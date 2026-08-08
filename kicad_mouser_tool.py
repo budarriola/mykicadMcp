@@ -250,6 +250,219 @@ def find_mouser_url(properties: dict[str, str]) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Datasheet PDF fetching
+# ---------------------------------------------------------------------------
+
+_DATASHEETS_DIR = _REPO_ROOT / "datasheets"
+
+
+def _safe_path_component(name: str, default: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_.")
+    return cleaned or default
+
+
+def _safe_datasheet_filename(name: str) -> str:
+    cleaned = _safe_path_component(name, "datasheet")
+    if not cleaned.lower().endswith(".pdf"):
+        cleaned += ".pdf"
+    return cleaned
+
+
+def fetch_datasheet(
+    url: str,
+    filename: str,
+    subfolder: str | None = None,
+    overwrite: bool = False,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """Download one PDF datasheet from `url` into the repo-root `datasheets/`
+    folder (organized/datasheets/adcThermo/*.pdf is the existing convention -
+    pass `subfolder` to group parts the same way, e.g. by subsystem or
+    library), saved as `filename` (`.pdf` appended if missing; both
+    `filename` and `subfolder` are sanitized to a safe path component each -
+    no path traversal, no writing outside `datasheets/`).
+
+    Skips the download and returns `skipped: true` if the destination file
+    already exists, unless `overwrite=True` - safe to call repeatedly over a
+    whole BOM without re-fetching what's already on disk. Verifies the
+    downloaded bytes actually start with the PDF magic number (`%PDF`) before
+    writing, so a login wall/redirect/HTML error page served instead of the
+    real file is caught as an error rather than silently saved with a `.pdf`
+    extension.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Refusing to fetch non-http(s) URL: {url!r}")
+
+    dest_dir = _DATASHEETS_DIR
+    if subfolder:
+        dest_dir = dest_dir / _safe_path_component(subfolder, "misc")
+    dest_path = dest_dir / _safe_datasheet_filename(filename)
+
+    if dest_path.exists() and not overwrite:
+        return {
+            "url": url,
+            "path": str(dest_path.relative_to(_REPO_ROOT)),
+            "skipped": True,
+            "reason": "already exists (pass overwrite=True to re-download)",
+            "size_bytes": dest_path.stat().st_size,
+        }
+
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0 (compatible; kilnCtl-datasheet-fetch/1.0)"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = response.read()
+            content_type = response.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"HTTP {exc.code} fetching datasheet from {url}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not reach {url}: {exc.reason}") from exc
+
+    if not data.startswith(b"%PDF"):
+        raise RuntimeError(
+            f"Response from {url} doesn't look like a PDF (Content-Type={content_type!r}, "
+            f"first bytes={data[:16]!r}) - likely a login/redirect/HTML page, not a direct PDF link."
+        )
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path.write_bytes(data)
+    return {
+        "url": url,
+        "path": str(dest_path.relative_to(_REPO_ROOT)),
+        "skipped": False,
+        "size_bytes": len(data),
+    }
+
+
+def bulk_fetch_datasheets(
+    project_path: str | Path,
+    references: list[str] | None = None,
+    subfolder: str | None = None,
+    organize_by_library: bool = True,
+    overwrite: bool = False,
+    use_mouser_fallback: bool = True,
+) -> dict[str, Any]:
+    """Fetch datasheet PDFs for a whole schematic's worth of parts in one
+    call, into the repo-root `datasheets/` folder. Defaults to one
+    representative reference per unique part from `list_schematic_parts`
+    (i.e. every distinct Value+Footprint group once); pass `references` for a
+    specific subset instead.
+
+    For each part, tries its own schematic `Datasheet` property first when
+    that property is already a direct `.pdf` link. When it isn't (e.g. the
+    property actually holds a Mouser product-page link, or is empty) and
+    `use_mouser_fallback` is true, resolves a real PDF link via
+    `lookup_mouser_part`'s `datasheet_url` instead (REQUIRES MOUSER_API_KEY -
+    parts that need the fallback are reported under `failed` with a clear
+    reason if the key isn't configured, rather than aborting the whole
+    batch).
+
+    Saved as `datasheets/<subfolder>/<manufacturer_part_number>.pdf` -
+    `subfolder` groups everything under one folder name; leave it unset with
+    `organize_by_library=True` (the default) to instead bucket each part
+    under its own KiCad library name (the part before the `:` in `lib_id`,
+    e.g. `MCU_Module`, `Interface`) mirroring how the parts are organized in
+    the schematic; set `organize_by_library=False` too for one flat
+    `datasheets/` folder. Already-downloaded files are skipped unless
+    `overwrite=True`, so this is safe to re-run after adding new parts.
+    """
+    representative_to_group: dict[str, dict[str, Any]] = {}
+    if references is None:
+        parts = list_schematic_parts(project_path)["parts"]
+        references = []
+        for part in parts:
+            if not part["references"]:
+                continue
+            representative = part["references"][0]
+            references.append(representative)
+            representative_to_group[representative] = part
+
+    fetched: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+
+    for reference in references:
+        group = representative_to_group.get(reference)
+        if group is None:
+            try:
+                component = get_schematic_part(project_path, reference)
+            except KeyError as exc:
+                failed.append({"reference": reference, "error": str(exc)})
+                continue
+            properties = component.get("properties", {})
+            group = {
+                "lib_id": component.get("lib_id", ""),
+                "manufacturer_part_number": properties.get("Manufacturer_Part_Number", ""),
+                "value": component.get("value", ""),
+                "datasheet": properties.get("Datasheet", ""),
+            }
+
+        mpn = group.get("manufacturer_part_number") or group.get("value") or reference
+        lib_id = group.get("lib_id", "")
+        part_subfolder = subfolder
+        if part_subfolder is None and organize_by_library:
+            part_subfolder = lib_id.split(":", 1)[0] if lib_id else None
+
+        datasheet_property = (group.get("datasheet") or "").strip()
+        pdf_url = datasheet_property if datasheet_property.lower().endswith(".pdf") else None
+        resolution = "schematic_datasheet_property"
+
+        if pdf_url is None and use_mouser_fallback:
+            mouser_url = None
+            if datasheet_property and "mouser" in datasheet_property.lower():
+                try:
+                    mouser_url = _validate_mouser_url(datasheet_property)
+                except ValueError:
+                    mouser_url = None
+            if mouser_url is None:
+                component = get_schematic_part(project_path, reference)
+                mouser_url = find_mouser_url(component.get("properties", {}))
+            if mouser_url:
+                try:
+                    mouser_result = lookup_mouser_part(mouser_url)
+                    pdf_url = mouser_result.get("datasheet_url")
+                    resolution = "mouser_lookup"
+                except Exception as exc:
+                    failed.append(
+                        {"reference": reference, "manufacturer_part_number": mpn, "error": f"Mouser lookup failed: {exc}"}
+                    )
+                    continue
+
+        if not pdf_url:
+            failed.append(
+                {
+                    "reference": reference,
+                    "manufacturer_part_number": mpn,
+                    "error": "no direct PDF datasheet link found on the schematic property or via Mouser",
+                }
+            )
+            continue
+
+        try:
+            result = fetch_datasheet(pdf_url, mpn, subfolder=part_subfolder, overwrite=overwrite)
+        except Exception as exc:
+            failed.append({"reference": reference, "manufacturer_part_number": mpn, "url": pdf_url, "error": str(exc)})
+            continue
+
+        result["reference"] = reference
+        result["manufacturer_part_number"] = mpn
+        result["resolution"] = resolution
+        (skipped if result["skipped"] else fetched).append(result)
+
+    return {
+        "checked_count": len(references),
+        "fetched_count": len(fetched),
+        "skipped_count": len(skipped),
+        "failed_count": len(failed),
+        "fetched": fetched,
+        "skipped": skipped,
+        "failed": failed,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Mouser Search API
 # ---------------------------------------------------------------------------
 

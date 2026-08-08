@@ -161,9 +161,11 @@ try:
         audit_manufacturer_part_numbers,
         audit_schematic_health,
         audit_stock_sufficiency,
+        bulk_fetch_datasheets,
         bulk_list_component_mouser_urls,
         bulk_lookup_mouser_parts,
         bulk_optimize_component_mouser_alternates,
+        fetch_datasheet,
         generate_mouser_buy_list,
         generate_mouser_stock_report,
         list_component_mouser_urls,
@@ -538,6 +540,65 @@ class KiCadMcpServer:
                     "required": ["project_path"],
                 },
                 "handler": self._tool_bulk_lookup_mouser_parts,
+            },
+            "fetch_kicad_datasheet": {
+                "description": (
+                    "Download one PDF datasheet from a direct URL into the repo-root `datasheets/` "
+                    "folder (not inside mainBoard/ or ThermocoupleBoard/ - one shared folder for both "
+                    "boards). Saved as `filename` (`.pdf` appended if missing) inside an optional "
+                    "`subfolder`. Skips re-downloading if the destination file already exists unless "
+                    "`overwrite=True`. Verifies the response actually starts with the PDF magic bytes "
+                    "before saving, so a login/redirect HTML page doesn't get silently saved as a "
+                    "'.pdf'. For a whole schematic's worth of parts in one call, use "
+                    "bulk_fetch_kicad_datasheets instead - it also resolves each part's real PDF link "
+                    "via Mouser when the schematic's own 'Datasheet' property isn't a direct PDF."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "Direct URL to the PDF datasheet."},
+                        "filename": {"type": "string", "description": "Destination filename, e.g. the manufacturer part number ('.pdf' appended if missing)."},
+                        "subfolder": {"type": "string", "description": "Optional subfolder under datasheets/ to save into (e.g. a subsystem or library name)."},
+                        "overwrite": {"type": "boolean", "description": "Re-download even if the destination file already exists. Default false."},
+                    },
+                    "required": ["url", "filename"],
+                },
+                "handler": self._tool_fetch_datasheet,
+            },
+            "bulk_fetch_kicad_datasheets": {
+                "description": (
+                    "Fetch datasheet PDFs for a whole schematic's worth of parts in one call, into the "
+                    "repo-root `datasheets/` folder - the fast path for 'go get all the datasheets for "
+                    "this board'. Defaults to one representative reference per unique part from "
+                    "list_kicad_schematic_parts; pass `references` for a specific subset. For each part, "
+                    "uses its schematic 'Datasheet' property directly when that's already a real PDF "
+                    "link; otherwise (property is a Mouser product page, or empty) resolves a real PDF "
+                    "link via lookup_mouser_part's `datasheet_url` when `use_mouser_fallback` is true "
+                    "(REQUIRES MOUSER_API_KEY - parts needing the fallback without a key configured come "
+                    "back under `failed`, not aborting the batch). Saved as "
+                    "`datasheets/<subfolder>/<manufacturer_part_number>.pdf`; by default "
+                    "(`organize_by_library=True`, no explicit `subfolder`) each part is bucketed under "
+                    "its own KiCad library name (the text before ':' in lib_id, e.g. 'MCU_Module', "
+                    "'Interface') - pass an explicit `subfolder` to force everything into one folder "
+                    "instead, or `organize_by_library=False` with no `subfolder` for one flat "
+                    "datasheets/ folder. Already-downloaded files are skipped unless `overwrite=True`, "
+                    "so safe to re-run after adding new parts. Follow up with "
+                    "audit_kicad_symbol_pin_names per part to cross-check pin tables once the PDFs are "
+                    "on disk."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_path": {"type": "string", "description": "KiCad project directory, .kicad_pro, .kicad_pcb, or .kicad_sch path."},
+                        "references": {"type": "array", "items": {"type": "string"}, "description": "Specific reference designators to fetch instead of every unique part."},
+                        "subfolder": {"type": "string", "description": "Force every fetched datasheet into this one subfolder under datasheets/, overriding organize_by_library."},
+                        "organize_by_library": {"type": "boolean", "description": "Bucket each part's PDF under its KiCad library name when subfolder isn't set. Default true."},
+                        "overwrite": {"type": "boolean", "description": "Re-download even if the destination file already exists. Default false."},
+                        "use_mouser_fallback": {"type": "boolean", "description": "Resolve a real PDF link via Mouser when the schematic's own Datasheet property isn't a direct PDF. Default true."},
+                    },
+                    "required": ["project_path"],
+                },
+                "handler": self._tool_bulk_fetch_datasheets,
             },
             "normalize_kicad_manufacturer_part_number_properties": {
                 "description": (
@@ -3019,6 +3080,24 @@ class KiCadMcpServer:
 
     def _tool_bulk_lookup_mouser_parts(self, args: dict[str, Any]) -> dict[str, Any]:
         return bulk_lookup_mouser_parts(args["project_path"], references=args.get("references"))
+
+    def _tool_fetch_datasheet(self, args: dict[str, Any]) -> dict[str, Any]:
+        return fetch_datasheet(
+            args["url"],
+            args["filename"],
+            subfolder=args.get("subfolder"),
+            overwrite=bool(args.get("overwrite", False)),
+        )
+
+    def _tool_bulk_fetch_datasheets(self, args: dict[str, Any]) -> dict[str, Any]:
+        return bulk_fetch_datasheets(
+            args["project_path"],
+            references=args.get("references"),
+            subfolder=args.get("subfolder"),
+            organize_by_library=bool(args.get("organize_by_library", True)),
+            overwrite=bool(args.get("overwrite", False)),
+            use_mouser_fallback=bool(args.get("use_mouser_fallback", True)),
+        )
 
     def _tool_normalize_manufacturer_part_number_properties(self, args: dict[str, Any]) -> dict[str, Any]:
         return normalize_manufacturer_part_number_properties(
