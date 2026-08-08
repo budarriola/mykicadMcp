@@ -692,6 +692,7 @@ class KiCadMcpServer:
                     "bulk_optimize_kicad_mouser_alternates) and how many units to actually buy. Buy "
                     "quantity starts at the board's required quantity, then: parts under $0.05/unit get "
                     "10 extra, parts under $0.10/unit get 5 extra, parts $0.25/unit or under get 5 extra, "
+                    "parts $0.50/unit or under get 2 extra, parts $1.00/unit or under get 1 extra, "
                     "and on top of that any part is bumped "
                     "further whenever a higher Mouser price-break tier's total cost is cheaper overall "
                     "than the padded quantity's total cost (never bumped below the padded quantity). "
