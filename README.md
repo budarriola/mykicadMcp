@@ -5,6 +5,28 @@ netlist files directly, without requiring a full KiCad runtime. It's exposed as 
 server (`kicad_mcp_server.py`) so any MCP-capable AI assistant (Claude Code, VS Code, etc.) can
 query and edit the board.
 
+## Search facade, not 92 published tools
+
+The server registers around 92 tools internally, but publishes only **six**: `kicad_help`,
+`kicad_find`, `kicad_describe`, `kicad_call`, `kicad_batch`, plus `inspect_kicad_project` and
+`get_kicad_ipc_status` (kept directly published because they're the two calls that make sense
+before you've searched for anything else). Publishing all 92 schemas up front would cost roughly
+20,000 tokens in every context window before a client has read a word of the request; the facade
+cuts that to a few hundred.
+
+Every other tool below - everything in the group tables and per-group docs - still exists,
+still works, and is reached through `kicad_call(name=..., args={...})` (or `kicad_batch` for a
+sequence of calls in one round trip). Nothing was removed, only un-advertised. The two entry
+points are:
+
+- `kicad_help()` - groups with tool counts, plus the recipes actually used against this project.
+- `kicad_find(query="capacitor voltage")` - ranked signatures for a plain-language query, each
+  with a paste-ready `kicad_call(...)` line. A misspelled or unknown tool name passed to
+  `kicad_call` gets the same ranked-suggestion treatment instead of a bare error.
+
+See [docs/MCP_SERVERS.md](../docs/MCP_SERVERS.md) in the parent repo for the full rationale
+(shared with the `kilnctrl`/`kilnsim` servers, which use the same pattern).
+
 ## Files
 
 - [kicad_pcb_tool.py](kicad_pcb_tool.py) - parses `.kicad_pcb` layout and netlist data into
@@ -13,13 +35,23 @@ query and edit the board.
   lookups. Requires a free `MOUSER_API_KEY` in the repo-root `.env` (see `.env.example`).
 - [kicad_ipc_tool.py](kicad_ipc_tool.py) - talks to a *running* KiCad instance over its IPC API
   (via `kicad-python`) instead of parsing files on disk; backs the live tools in Group 9 below.
-- [kicad_mcp_server.py](kicad_mcp_server.py) - the MCP server itself; registers all 94 tools and
-  serves them over stdio or HTTP transport.
+- [kicad_mcp_server.py](kicad_mcp_server.py) - the MCP server itself; registers all ~92 tools,
+  then collapses them behind the six-tool search facade (see above) and serves the result over
+  stdio or HTTP transport.
+- [kicad_facade.py](kicad_facade.py) - the taxonomy the facade searches: which group each tool
+  belongs to, extra search keywords/synonyms, and the paste-ready recipes `kicad_help()` prints.
+  Edit this file (not `mcpkit_registry.py`) to make a new or renamed tool findable.
+- [mcpkit_registry.py](mcpkit_registry.py) - the search/dispatch engine itself (scoring, argument
+  coercion, suggestion ranking). **Vendored byte-for-byte from the parent repo's
+  `tools/PcTools/src/mcpkit/registry.py`** - this file is a git submodule, so do not edit this
+  copy directly; edit the parent copy and re-vendor it here.
 - [requirements-mcp.txt](requirements-mcp.txt) - Python dependencies (`mcp>=1.0.0` required;
   `kicad-python>=0.7.0` optional - enables the live IPC tools, otherwise they're just left
   unregistered).
 - [.vscode/mcp.json](.vscode/mcp.json) - example MCP client config (HTTP transport).
 - [docs/mcp-tools/](docs/mcp-tools/) - full per-tool reference, one file per group (see below).
+  This is exactly the content `kicad_find`/`kicad_help` search over - it stays accurate and
+  useful even though the tools it documents are no longer directly published.
 
 ## Setup
 
@@ -34,17 +66,29 @@ query and edit the board.
    ```
 4. Run the server:
    ```powershell
-   # stdio (default) - point your MCP client's command at this
+   # HTTP (default) - port 8766, matches the example in .vscode/mcp.json. The server
+   # outlives any single client, so multiple editors/sessions can share one connection
+   # to a running KiCad instance for the live IPC tools.
    python kicad_mcp_server.py
 
-   # HTTP - matches the example in .vscode/mcp.json
-   python kicad_mcp_server.py --transport http --port 8765
+   # stdio - for headless/CI use, or a client that wants a private, disposable server
+   python kicad_mcp_server.py --transport stdio
    ```
+   From the parent kilnCtl repo, the usual way to manage the running server is:
+   ```powershell
+   tools\PcTools\scripts\mcp_servers.ps1 start   -Server kicad
+   tools\PcTools\scripts\mcp_servers.ps1 status  -Server kicad
+   tools\PcTools\scripts\mcp_servers.ps1 restart -Server kicad   # after editing server code
+   tools\PcTools\scripts\mcp_servers.ps1 stop    -Server kicad
+   ```
+   Two plain HTTP routes also sit beside the MCP endpoint: `GET /health` (liveness, pid, port,
+   published tool names) and `POST /shutdown` (graceful stop - releases any open KiCad IPC
+   session first). Both are loopback-only and unauthenticated.
 5. Point your MCP client at it, e.g. `.vscode/mcp.json`:
    ```json
    {
      "servers": {
-       "kiln-kicad": { "type": "http", "url": "http://127.0.0.1:8765" }
+       "kiln-kicad": { "type": "http", "url": "http://127.0.0.1:8766" }
      }
    }
    ```
@@ -60,6 +104,10 @@ query and edit the board.
 - "Make the thermocouple channel layouts match the locked reference instance"
 
 ## Tool reference
+
+Every tool named below is reached through `kicad_call(name="<tool>", args={...})` (or
+`kicad_describe(names=[...])` for its full schema first) - see "Search facade" above. `args` is
+exactly the argument object the tool would have taken if it were still published directly.
 
 Most tools take a `project_path` (a KiCad project directory, `.kicad_pro`, `.kicad_pcb`, or
 `.kicad_sch` path - any of these resolve to the same project). Anything that edits a file

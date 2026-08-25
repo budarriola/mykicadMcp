@@ -15,8 +15,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, cast
 
+import kicad_facade
+from mcpkit_registry import collapse_table
+
 LOG_PATH = Path(__file__).resolve().with_name("kicad_mcp_server.log")
 SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26"}
+
+#: 8765 belongs to kilnCtl's link_hub and 8767/8768 to its kilnctrl/kilnsim MCP
+#: servers, so this server's own port is 8766. It used to default to 8765,
+#: which collided with link_hub whenever both were started.
+DEFAULT_HTTP_PORT = 8766
 
 
 def log_message(message: str) -> None:
@@ -1843,10 +1851,10 @@ class KiCadMcpServer:
                 "description": (
                     "Exit this server process (after a short delay so the response reaches the client first), so "
                     "an editor/tool file change (e.g. to kicad_pcb_tool.py or kicad_mcp_server.py) takes effect. "
-                    "Whether this actually restarts the server depends on the host: a client that respawns its "
-                    "stdio subprocess when the pipe closes will relaunch with the edited code on the next tool "
-                    "call; one that doesn't will just see the connection drop and need a manual reconnect. Use "
-                    "this instead of asking the user to restart by hand, when the host is known to auto-respawn."
+                    "This server runs over HTTP by default, so exiting leaves nothing listening on its port and "
+                    "no host will respawn it: follow this with the editor's MCP Restart button, or "
+                    "tools/PcTools/scripts/mcp_servers.ps1 restart -Server kicad. Under --transport stdio a host "
+                    "that respawns its subprocess on pipe-close will relaunch with the edited code by itself."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -1857,6 +1865,30 @@ class KiCadMcpServer:
         }
         if _IPC_AVAILABLE:
             self.tools.update(self._ipc_tools())
+
+        # Everything above is registered but no longer *advertised*: this
+        # server's ~92 schemas cost on the order of 20k tokens in every context
+        # window, spent before the client has read a word of the request. The
+        # facade replaces them with six tools -- kicad_help / kicad_find /
+        # kicad_describe / kicad_call / kicad_batch, plus whatever
+        # kicad_facade.KEEP names -- and reaches the rest by name. Nothing is
+        # lost: every tool above stays callable through kicad_call.
+        #
+        # `self.registry` is kept because the facade searches it; `self.tools`
+        # is what tools/list and tools/call see, so the replacement table is
+        # assigned over it wholesale.
+        self.tools, self.registry, self.instructions = collapse_table(
+            self.tools,
+            prefix=kicad_facade.PREFIX,
+            label=kicad_facade.LABEL,
+            title=kicad_facade.TITLE,
+            group_prefixes=kicad_facade.GROUP_PREFIXES,
+            group_overrides=kicad_facade.GROUP_OVERRIDES,
+            keywords=kicad_facade.KEYWORDS,
+            synonyms=kicad_facade.SYNONYMS,
+            keep=kicad_facade.KEEP,
+            recipes=kicad_facade.RECIPES,
+        )
 
     def _ipc_tools(self) -> dict[str, dict[str, Any]]:
         """Tools that talk to a *running* KiCad instance over the IPC API
@@ -2455,6 +2487,10 @@ class KiCadMcpServer:
                     "protocolVersion": protocol_version,
                     "capabilities": {"tools": {"listChanged": False}},
                     "serverInfo": {"name": "kiln-kicad-mcp", "version": "1.0.0"},
+                    # The only channel that reaches a client before it has
+                    # called anything -- which is exactly when "the tool you
+                    # want is behind kicad_find, keep looking" has to land.
+                    "instructions": self.instructions,
                 },
             }
 
@@ -2493,16 +2529,16 @@ class KiCadMcpServer:
                     "id": message.get("id"),
                     "error": {"code": -2, "message": str(exc)},
                 }
+            # The facade tools return finished text; every other handler here
+            # returns a Python object. Re-encoding a string would ship it as a
+            # JSON string literal, so the client would read escaped quotes and
+            # \n instead of the listing it asked for.
+            text = result if isinstance(result, str) else json.dumps(result, indent=2, ensure_ascii=False)
             return {
                 "jsonrpc": "2.0",
                 "id": message.get("id"),
                 "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": json.dumps(result, indent=2, ensure_ascii=False),
-                        }
-                    ],
+                    "content": [{"type": "text", "text": text}],
                     "isError": False,
                 },
             }
@@ -2557,6 +2593,18 @@ class MCPHTTPRequestHandler(BaseHTTPRequestHandler):
             self.send_error(411, "Content-Length required")
             return
 
+        server = cast("KicadMcpHTTPServer", self.server)
+
+        if self.path.rstrip("/") == "/shutdown":
+            # Graceful stop, for the operator's stop button. shutdown() blocks
+            # until serve_forever() returns and must therefore never be called
+            # from the serving thread -- hence the timer. The response goes out
+            # first, so the caller sees confirmation instead of a dropped
+            # connection.
+            self._send_json({"ok": True, "server": "kicad", "pid": _os.getpid(), "stopping": True})
+            _threading.Timer(0.2, server.shutdown).start()
+            return
+
         body = self.rfile.read(length)
         try:
             message = json.loads(body.decode("utf-8"))
@@ -2571,7 +2619,6 @@ class MCPHTTPRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        server = cast("KicadMcpHTTPServer", self.server)
         response = server.kicad_mcp.handle(message)
         if response is None:
             self.send_response(204)
@@ -2596,6 +2643,19 @@ class MCPHTTPRequestHandler(BaseHTTPRequestHandler):
                 return
             except ConnectionResetError:
                 return
+        elif self.path.rstrip("/") == "/health":
+            # Same shape the kilnctrl/kilnsim servers answer with, so one
+            # operator script can poll all three (tools/PcTools/scripts/
+            # mcp_servers.ps1).
+            server = cast("KicadMcpHTTPServer", self.server)
+            self._send_json({
+                "ok": True,
+                "server": "kicad",
+                "pid": _os.getpid(),
+                "port": server.server_address[1],
+                "endpoint": "/",
+                "published_tools": sorted(server.kicad_mcp.tools),
+            })
         else:
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -2616,9 +2676,13 @@ class KicadMcpHTTPServer(ThreadingHTTPServer):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="KiCad MCP server supporting stdio and HTTP transports")
-    parser.add_argument("--transport", choices=["stdio", "http"], default="stdio", help="Transport to use for MCP communication")
-    parser.add_argument("--host", default="127.0.0.1", help="HTTP host to bind when using HTTP transport")
-    parser.add_argument("--port", type=int, default=8765, help="HTTP port to bind when using HTTP transport")
+    # HTTP by default: a stdio server dies with whichever client launched it,
+    # so reconnecting a client drops the IPC session to a running KiCad. Over
+    # HTTP the server outlives its clients and they all share one. stdio stays
+    # available for headless and CI use.
+    parser.add_argument("--transport", choices=["stdio", "http"], default="http", help="Transport to use for MCP communication")
+    parser.add_argument("--host", default="127.0.0.1", help="HTTP host to bind when using HTTP transport (loopback only)")
+    parser.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT, help=f"HTTP port to bind when using HTTP transport (default {DEFAULT_HTTP_PORT})")
     return parser.parse_args()
 
 
@@ -2643,6 +2707,11 @@ def main() -> None:
         try:
             http_server.serve_forever()
         except KeyboardInterrupt:
+            log_message("[kicad-mcp] HTTP server interrupted")
+        finally:
+            # Also reached when POST /shutdown makes serve_forever() return
+            # normally; the listening socket has to be closed either way or the
+            # port stays bound until this process is reaped.
             log_message("[kicad-mcp] HTTP server shutting down")
             http_server.server_close()
     else:
