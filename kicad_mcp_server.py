@@ -2615,6 +2615,13 @@ class MCPHTTPRequestHandler(BaseHTTPRequestHandler):
         method = message.get("method")
         if method == "notifications/initialized":
             self.send_response(202)
+            # Content-Length is not optional here. 202 is not one of the
+            # bodyless statuses, so on a keep-alive HTTP/1.1 connection with
+            # neither Content-Length nor chunked encoding the client has no way
+            # to know the (empty) body has ended, and waits for a close that
+            # never comes. That is what left this server stuck at "connecting"
+            # after a successful initialize.
+            self.send_header("Content-Length", "0")
             self.send_header("Connection", "keep-alive")
             self.end_headers()
             return
@@ -2657,13 +2664,9 @@ class MCPHTTPRequestHandler(BaseHTTPRequestHandler):
                 "published_tools": sorted(server.kicad_mcp.tools),
             })
         else:
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
-            self.wfile.write(b'{"status":"ok"}')
-            self.wfile.flush()
+            # Through _send_json, which sets Content-Length -- the same reason
+            # the 202 above needs one.
+            self._send_json({"status": "ok"})
 
 
 class KicadMcpHTTPServer(ThreadingHTTPServer):
