@@ -1888,6 +1888,11 @@ class KiCadMcpServer:
             synonyms=kicad_facade.SYNONYMS,
             keep=kicad_facade.KEEP,
             recipes=kicad_facade.RECIPES,
+            # This submodule's own directory -- an edit here (or to the
+            # vendored mcpkit_registry.py itself) shows up as staleness in
+            # kicad_help() once this process has started serving it. See
+            # mcpkit_registry.py's "staleness / freshness" section.
+            source_root=_os.path.dirname(_os.path.abspath(__file__)),
         )
 
     def _ipc_tools(self) -> dict[str, dict[str, Any]]:
@@ -2655,14 +2660,23 @@ class MCPHTTPRequestHandler(BaseHTTPRequestHandler):
             # operator script can poll all three (tools/PcTools/scripts/
             # mcp_servers.ps1).
             server = cast("KicadMcpHTTPServer", self.server)
-            self._send_json({
+            payload = {
                 "ok": True,
                 "server": "kicad",
                 "pid": _os.getpid(),
                 "port": server.server_address[1],
                 "endpoint": "/",
                 "published_tools": sorted(server.kicad_mcp.tools),
-            })
+            }
+            freshness = server.kicad_mcp.registry.freshness
+            if freshness is not None:
+                from mcpkit_registry import check_staleness
+                stale, changed = check_staleness(freshness)
+                payload["fresh"] = not stale
+                payload["changed_files"] = changed
+                payload["started_at"] = freshness.started_at_human()
+                payload["commit"] = freshness.commit
+            self._send_json(payload)
         else:
             # Through _send_json, which sets Content-Length -- the same reason
             # the 202 above needs one.

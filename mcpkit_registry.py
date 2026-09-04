@@ -35,8 +35,12 @@ from __future__ import annotations
 import inspect
 import json
 import math
+import os
 import re
+import subprocess
+import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Callable, Iterable, Optional, Sequence
 
 #: Rendered instead of the JSON Schema spelling. Every character here is paid
@@ -193,6 +197,130 @@ def _example_call(prefix: str, name: str, schema: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# staleness / freshness
+# ---------------------------------------------------------------------------
+# These servers are long-running HTTP processes an editor button starts and
+# stops (tools/PcTools/scripts/mcp_servers.ps1) -- a source edit made while one
+# is up does not reach it until the next restart. That has twice cost a real
+# debugging session: a fix landed on disk, the server kept answering with the
+# old in-memory code, and the still-present symptom read as "the fix didn't
+# work" rather than "the process serving it is stale". A snapshot taken once
+# at startup, re-checked cheaply against the same file list, makes the process
+# say so itself instead.
+_STALE_EXCLUDE_DIRS = frozenset({
+    "__pycache__", ".venv", "venv", ".git", "logs", "node_modules", ".pytest_cache",
+})
+_STALE_SOURCE_EXTS = (".py", ".html", ".css", ".js")
+
+
+def _iter_source_files(root: str, *, exclude_dirs: "Iterable[str]" = _STALE_EXCLUDE_DIRS,
+                       extensions: "Sequence[str]" = _STALE_SOURCE_EXTS) -> "Iterable[str]":
+    exclude = set(exclude_dirs)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in exclude]
+        for filename in filenames:
+            if extensions and not filename.endswith(tuple(extensions)):
+                continue
+            yield os.path.join(dirpath, filename)
+
+
+def _git_head_short(root: str) -> str:
+    """``git rev-parse --short HEAD`` at ``root``, with a graceful fallback --
+    a server whose /health someone is staring at mid-incident must never
+    crash on this."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=root,
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:  # noqa: BLE001 - git missing/unavailable is not fatal here
+        return "unknown (git unavailable)"
+    if out.returncode != 0 or not out.stdout.strip():
+        return "unknown (git unavailable)"
+    return out.stdout.strip()
+
+
+@dataclass
+class SourceSnapshot:
+    """What the server's own source tree looked like the moment it started
+    serving -- what staleness is measured against for the life of the process."""
+
+    root: str
+    started_at: float
+    commit: str
+    #: path -> mtime at snapshot time. Cached once at startup; re-stat'd on
+    #: demand at check time rather than re-walking the tree on every call.
+    files: "dict[str, float]" = field(default_factory=dict)
+
+    def started_at_human(self) -> str:
+        return datetime.fromtimestamp(self.started_at).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def take_snapshot(root: str, *, mtime_provider: "Optional[Callable[[str], float]]" = None,
+                  commit: "Optional[str]" = None) -> SourceSnapshot:
+    """Record the newest-mtime baseline for ``root`` at server startup.
+
+    ``mtime_provider`` defaults to ``os.path.getmtime`` and exists so tests
+    can inject a fake clock instead of depending on real filesystem timing.
+    """
+    getmtime = mtime_provider or os.path.getmtime
+    files: "dict[str, float]" = {}
+    for path in _iter_source_files(root):
+        try:
+            files[path] = getmtime(path)
+        except OSError:
+            continue
+    return SourceSnapshot(
+        root=root, started_at=time.time(),
+        commit=commit if commit is not None else _git_head_short(root),
+        files=files,
+    )
+
+
+def check_staleness(snapshot: SourceSnapshot, *,
+                    mtime_provider: "Optional[Callable[[str], float]]" = None) -> "tuple[bool, int]":
+    """Re-stat the snapshot's cached file list. Returns ``(stale, changed_count)``.
+
+    A file is "changed" if its current mtime is newer than what was recorded
+    at snapshot time, or if it has been deleted out from under the snapshot
+    (a rename/move counts as both a deletion and, for the new path, a file
+    the snapshot never knew about -- either way the server's in-memory code no
+    longer matches what's on disk). Nothing here rescans the tree for files
+    added *since* startup: a brand-new file cannot itself be why an existing
+    process's behaviour is stale, since it never imported it.
+    """
+    getmtime = mtime_provider or os.path.getmtime
+    changed = 0
+    for path, recorded_mtime in snapshot.files.items():
+        try:
+            current_mtime = getmtime(path)
+        except OSError:
+            changed += 1  # deleted (or otherwise unreadable) since startup
+            continue
+        if current_mtime > recorded_mtime:
+            changed += 1
+    return changed > 0, changed
+
+
+def freshness_line(snapshot: "Optional[SourceSnapshot]", *,
+                   mtime_provider: "Optional[Callable[[str], float]]" = None) -> str:
+    """The one line surfaced in ``*_help()`` output -- loud when stale, quiet
+    when not, so freshness is checkable at a glance either way."""
+    if snapshot is None:
+        return ""
+    stale, changed = check_staleness(snapshot, mtime_provider=mtime_provider)
+    started = snapshot.started_at_human()
+    if stale:
+        plural = "" if changed == 1 else "s"
+        return (
+            f"SERVER CODE IS STALE: {changed} file{plural} changed since this process "
+            f"started (started {started}, at commit {snapshot.commit}). "
+            "Restart via mcp_servers.ps1 restart."
+        )
+    return f"server code fresh: started {started}, at commit {snapshot.commit}"
+
+
+# ---------------------------------------------------------------------------
 # registry
 # ---------------------------------------------------------------------------
 @dataclass
@@ -265,6 +393,11 @@ class ToolRegistry:
                 counts[token] = counts.get(token, 0) + 1
         self._idf = {token: math.log(1.0 + total / count) for token, count in counts.items()}
         self._default_idf = math.log(1.0 + total)
+        #: Set by ``collapse``/``collapse_table`` when a ``source_root`` is
+        #: given; ``None`` means "freshness not tracked" (e.g. in tests that
+        #: build a registry directly), and ``facade_help`` treats that as
+        #: nothing to say rather than an error.
+        self.freshness: "Optional[SourceSnapshot]" = None
 
     # -- search ------------------------------------------------------------
     def _expand(self, query: str) -> "list[str]":
@@ -473,8 +606,15 @@ def collapse(
     synonyms: "Optional[dict[str, Sequence[str]]]" = None,
     keep: "Sequence[str]" = (),
     recipes: str = "",
+    source_root: "Optional[str]" = None,
 ) -> ToolRegistry:
     """Withdraw every registered tool from the wire and publish the facade.
+
+    ``source_root`` -- when given, a startup :class:`SourceSnapshot` of that
+    directory is taken and attached to the registry, and ``{prefix}help()``
+    prepends a freshness line (loud when the running process has drifted from
+    the source on disk, quiet when it hasn't). Omit it for servers that don't
+    need this (or in tests building a registry directly).
 
     Called once, after the module's ``@_tool()`` definitions have run. The tool
     functions themselves are untouched -- they stay importable module globals
@@ -509,6 +649,8 @@ def collapse(
         entries.append(entry)
 
     registry = ToolRegistry(prefix, entries, dict(synonyms or {}))
+    if source_root is not None:
+        registry.freshness = take_snapshot(source_root)
 
     kept = sorted(set(keep) & set(published))
     for name in published:
@@ -544,6 +686,7 @@ def collapse(
 def facade_help(registry: "ToolRegistry", *, label: str, recipes: str, kept: "Sequence[str]",
                 topic: "Optional[str]" = None) -> str:
     prefix = registry.prefix
+    fresh_line = freshness_line(registry.freshness)
     if topic:
         group = topic.strip().lower()
         entries = registry.groups.get(group)
@@ -551,7 +694,8 @@ def facade_help(registry: "ToolRegistry", *, label: str, recipes: str, kept: "Se
             known = ", ".join(sorted(registry.groups))
             return f"error: no group {topic!r}. Groups: {known}"
         body = "\n".join(e.brief() for e in sorted(entries, key=lambda e: e.name))
-        return f"group {group} ({len(entries)} tools)\n{body}"
+        prefix_lines = f"{fresh_line}\n\n" if fresh_line else ""
+        return f"{prefix_lines}group {group} ({len(entries)} tools)\n{body}"
 
     rows = sorted(registry.groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))
     table = "\n".join(
@@ -560,7 +704,10 @@ def facade_help(registry: "ToolRegistry", *, label: str, recipes: str, kept: "Se
         + (" ..." if len(items) > 4 else "")
         for name, items in rows
     )
-    parts = [
+    parts = []
+    if fresh_line:
+        parts += [fresh_line, ""]
+    parts += [
         f"{label}: {len(registry.entries)} tools in {len(registry.groups)} groups, reached "
         f"via {prefix}find / {prefix}call / {prefix}batch. A trailing '!' marks a tool that "
         f"takes a confirm flag.",
@@ -785,6 +932,7 @@ def collapse_table(
     keep: "Sequence[str]" = (),
     recipes: str = "",
     handler_key: str = "handler",
+    source_root: "Optional[str]" = None,
 ) -> "tuple[dict[str, dict], ToolRegistry, str]":
     """:func:`collapse` for a server that keeps its tools in a plain dict.
 
@@ -793,6 +941,10 @@ def collapse_table(
     the shape ``mykicadMcp``'s hand-rolled JSON-RPC server uses. Returns the
     replacement table, the registry the facade searches, and the ``instructions``
     string to hand back on ``initialize``.
+
+    ``source_root`` -- see :func:`collapse`: when given, a startup
+    :class:`SourceSnapshot` is attached to the registry and surfaced in
+    ``{prefix}help()``.
 
     Nothing is mutated: the caller assigns the returned table over its own.
     """
@@ -821,6 +973,8 @@ def collapse_table(
         entries.append(entry)
 
     registry = ToolRegistry(prefix, entries, dict(synonyms or {}))
+    if source_root is not None:
+        registry.freshness = take_snapshot(source_root)
     kept = sorted(set(keep) & set(tools))
     described = facade_descriptions(prefix, label)
 
