@@ -22,7 +22,7 @@ def test_create_group_write_true_roundtrips(scratch_board: Path) -> None:
     before_groups = k.list_groups(scratch_board)["groups"]
     before_group_count = len(before_groups)
 
-    refs = ["R1", "U10"]
+    refs = ["R1", "R2"]
 
     # Dry run first: must not touch the file.
     dry = k.create_group(scratch_board, "roundtrip_test_group", refs, write=False)
@@ -48,13 +48,13 @@ def test_create_group_write_true_roundtrips(scratch_board: Path) -> None:
     assert after_refs == before_refs
 
     # The board file must still fully parse (pads too, for a known ref).
-    fp = k.get_footprint_pads(scratch_board, "U10")
-    assert fp["reference"] == "U10"
+    fp = k.get_footprint_pads(scratch_board, "R2")
+    assert fp["reference"] == "R2"
     assert len(fp["pads"]) > 0
 
 
 def test_delete_group_write_true_removes_block(scratch_board: Path) -> None:
-    refs = ["R1", "U10"]
+    refs = ["R1", "R2"]
     k.create_group(scratch_board, "roundtrip_test_group_2", refs, write=True)
     before_count = len(k.list_components(scratch_board, limit=10_000))
 

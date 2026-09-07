@@ -86,14 +86,15 @@ def _build_mixed_board(tmp_path: Path) -> Path:
 # --------------------------------------------------------------------------- #
 
 def test_kiln_detects_real_connectors(kiln_project_path: Path) -> None:
-    """Golden test against the real board: 24 J-prefixed connectors, with J2
-    (the JST header) matched by both signals since it's both J-prefixed AND
-    carries a connector-token footprint name."""
+    """Golden test against the real board: 22 J-prefixed connectors (re-counted
+    2026-09-06; J5/J9/J22 are no longer on the board), with J2 (the JST
+    header) matched by both signals since it's both J-prefixed AND carries a
+    connector-token footprint name."""
     result = pcb.detect_connectors(kiln_project_path)
 
     assert result["ref_prefixes_used"] == ["J", "P", "CN", "X"]
-    assert result["candidate_count"] == 24
-    assert len(result["candidates"]) == 24
+    assert result["candidate_count"] == 22
+    assert len(result["candidates"]) == 22
 
     refs = [c["ref"] for c in result["candidates"]]
     assert refs == sorted(refs), "candidates should be sorted by ref"

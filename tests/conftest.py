@@ -28,17 +28,23 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-# The real kilnCtl KiCad project normally lives one directory above mykicadMcp/.
-# When mykicadMcp is checked out as an isolated agent worktree (e.g.
-# `mykicadMcp/.claude/worktrees/agent-<id>/`), the submodule's own repo root is
-# nested several levels below the real kilnCtl checkout instead of exactly one
-# level below it. Walk upward looking for the kilnCtl project marker
-# (`kiln.kicad_pro`, which only ever lives at the real project root) instead of
-# assuming a fixed nesting depth, so this resolves correctly in both layouts.
+# The real kilnCtl KiCad project lives at `hardware/mainBoard/` under the
+# kilnCtl repo root (since the 2026-08-28 hardware/firmware/tools split; it
+# used to sit one directory above mykicadMcp/). When mykicadMcp is checked out
+# as an isolated agent worktree (e.g. `mykicadMcp/.claude/worktrees/agent-<id>/`),
+# the submodule's own repo root is nested several levels below the real
+# kilnCtl checkout instead of exactly one level below it. Walk upward looking
+# for the kilnCtl project marker (`hardware/mainBoard/kiln.kicad_pro`, which
+# only ever lives at the real project root) instead of assuming a fixed
+# nesting depth, so this resolves correctly in both layouts.
 def _find_kiln_project_dir(start: Path) -> Path:
     for candidate in (start, *start.parents):
-        if (candidate / "kiln.kicad_pro").exists():
+        direct = candidate / "kiln.kicad_pro"
+        if direct.exists():
             return candidate
+        nested = candidate / "hardware" / "mainBoard" / "kiln.kicad_pro"
+        if nested.exists():
+            return nested.parent
     return start.parent  # fallback: preserve old (non-worktree) behavior
 
 
@@ -75,7 +81,7 @@ def _materialize_committed_board(dest: Path) -> bool:
     for name in _COMMITTED_FILES:
         try:
             res = subprocess.run(
-                ["git", "-C", str(_KILN_PROJECT_DIR), "show", f"HEAD:{name}"],
+                ["git", "-C", str(_KILN_PROJECT_DIR), "show", f"HEAD:./{name}"],
                 capture_output=True, timeout=60,
             )
         except Exception:
@@ -100,14 +106,27 @@ def kiln_project_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
     live_board = _KILN_PROJECT_DIR / "kiln.kicad_pcb"
     if os.environ.get("KILN_USE_LIVE_BOARD") == "1":
         if not live_board.exists():
-            pytest.skip(f"Live kiln board not found at {live_board}.")
+            msg = f"LIVE KILN BOARD NOT FOUND at {live_board} (resolved kiln project dir: {_KILN_PROJECT_DIR})."
+            print(f"\n!!! {msg} !!!\n")
+            pytest.fail(msg)
         return _KILN_PROJECT_DIR
     snapshot = tmp_path_factory.mktemp("kiln_committed")
     if _materialize_committed_board(snapshot):
         return snapshot
-    # Fallback: no git snapshot available -> use the live board if present.
+    # No git snapshot available and no live board either: this used to be a
+    # silent `pytest.skip`, which let the entire golden suite (component/net
+    # counts, footprint pads, ...) go vacuous without anyone noticing after
+    # the 2026-08-28 hardware/mainBoard split moved the project directory.
+    # Treat it as a hard failure instead - a missing board is a broken
+    # environment, not something to quietly skip past.
     if not live_board.exists():
-        pytest.skip("Neither a committed nor a live kiln board is available.")
+        msg = (
+            "NEITHER a committed nor a live kiln board is available "
+            f"(resolved kiln project dir: {_KILN_PROJECT_DIR}, "
+            f"_REPO_ROOT: {_REPO_ROOT}). The golden test suite cannot run."
+        )
+        print(f"\n!!! {msg} !!!\n")
+        pytest.fail(msg)
     return _KILN_PROJECT_DIR
 
 
