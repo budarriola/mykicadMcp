@@ -5638,8 +5638,10 @@ DEFAULT_PCB_SETTINGS: dict[str, Any] = {
         # Phase 7.3d: OFF by default - `nearest_free` is called unconditionally
         # for every connection's pad escape, so flipping its tie-break changes
         # board-wide routing geometry, not just new cases. Only flip after a
-        # deliberate before/after `benchmark_kicad_autoroute` comparison (see
-        # NETCLASS_PLAN.md's 7.3d section) - never as a casual default change.
+        # deliberate before/after benchmark comparison (see
+        # docs/ROUTER_PHASE_HISTORY.md's 7.3d section, archived - the
+        # autorouter itself was removed in 403fad7) - never as a casual
+        # default change.
         "pad_escape_direction_aware": False,
         # Phase 7.21: a via may never land inside a footprint pad (same-net or
         # foreign) unless this is turned on. Via-in-pad is a deliberate
