@@ -24,6 +24,8 @@ So every affordance here exists to pay the token saving back in reliability:
   the parameter list, so the retry has what it needs.
 * Arguments are coerced, not rejected: ``"3"`` for an int, ``"true"`` for a
   bool, a JSON string for an object. The CLI's forgiveness is the point.
+  The one exception is a safety-gate flag (``confirm``, ``force``, ``allow_*``):
+  those are never coerced and anything but a real JSON boolean is refused.
 
 Output is shaped for a reader, not a parser: one line per tool, no wrapper
 objects, nulls and empty fields omitted. A 200-tool index costs about the same
@@ -505,6 +507,12 @@ class ToolRegistry:
                 f"error: bad arguments for {name}: " + "; ".join(problems) + "\n"
                 f"signature: {name}{entry.signature()}"
             )
+        gate_problem = _gate_flag_problem(entry, args)
+        if gate_problem:
+            return (
+                f"error: refused {name}: {gate_problem}\n"
+                f"signature: {name}{entry.signature()}"
+            )
         try:
             coerced = self.coerce(entry, args)
         except (TypeError, ValueError) as exc:
@@ -516,6 +524,36 @@ class ToolRegistry:
         if inspect.isawaitable(result):  # pragma: no cover - no async tools today
             raise TypeError(f"{name} is async; the facade only dispatches sync tools")
         return result if isinstance(result, str) else json.dumps(result, default=str)
+
+
+def _is_gate_flag_name(key: str) -> bool:
+    return key in ("confirm", "force") or key.startswith("allow_")
+
+
+def _gate_flag_problem(entry: "ToolEntry", args: "dict[str, Any]") -> str:
+    """Name any safety-gate flag that is not the JSON boolean ``true``/``false``.
+
+    Per-tool gates check ``confirm is True`` and document "exactly True";
+    ``_coerce_value`` would otherwise turn "yes"/"1"/"true" into True first and
+    silently defeat them. Gate flags are never coerced: anything but a real
+    bool is refused before the tool runs.
+    """
+    props = entry.schema.get("properties") or {}
+    bad = []
+    for key, value in args.items():
+        spec = props.get(key)
+        if spec is None or not _is_gate_flag_name(key):
+            continue
+        if "boolean" not in _type_names(spec, entry.schema):
+            continue
+        if not isinstance(value, bool):
+            bad.append(f"{key} (got {type(value).__name__} {value!r})")
+    if not bad:
+        return ""
+    return (
+        "safety-gate flag(s) must be the JSON boolean true or false, not coerced: "
+        + ", ".join(bad)
+    )
 
 
 _TRUE = {"true", "1", "yes", "on", "high"}
