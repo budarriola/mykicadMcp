@@ -527,8 +527,9 @@ class ToolRegistry:
 
 
 def _is_gate_flag_name(key: str) -> bool:
-    return (key in ("confirm", "force")
-            or key.startswith(("confirm", "force", "allow_", "ack_")))
+    return (key in ("confirm", "force", "attended", "skip_backup",
+                    "lcd_stop_heat", "lcd_edit_heat")
+            or key.startswith(("confirm", "force", "allow_", "ota_allow_", "ack_")))
 
 
 def _gate_flag_problem(entry: "ToolEntry", args: "dict[str, Any]") -> str:
